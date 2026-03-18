@@ -73,14 +73,55 @@ Ensure the virtual environment is set up and `fastmcp` is installed:
 ```bash
 uv pip install fastmcp
 ```
-
 ### Run MCP Server
 ```bash
 python waveform_mcp.py
 ```
 
+## Integration with AI Agents (MCP)
+
+To use this tool with MCP-compatible clients like `gemini-cli` or `Claude Desktop`, add the following configuration to your client's settings file.
+
+### 1. Configuration for `gemini-cli`
+Add this to your `mcpServers` section in `~/.gemini/config.json` (or your specific config path):
+
+```json
+{
+  "mcpServers": {
+    "waveform-explorer": {
+      "command": "/home/qsun/AI_PROJ/auto_waveform_debugger/.venv/bin/python",
+      "args": [
+        "/home/qsun/AI_PROJ/auto_waveform_debugger/waveform_explorer/waveform_mcp.py"
+      ]
+    }
+  }
+}
+```
+
+### 2. Configuration for Claude Desktop
+Edit your `claude_desktop_config.json` to include:
+
+```json
+{
+  "mcpServers": {
+    "waveform_explorer": {
+      "command": "/home/qsun/AI_PROJ/auto_waveform_debugger/.venv/bin/python",
+      "args": [
+        "/home/qsun/AI_PROJ/auto_waveform_debugger/waveform_explorer/waveform_mcp.py"
+      ]
+    }
+  }
+}
+```
+
+### Verification
+Once configured, restart your agent and try asking:
+> "List all signals in /home/qsun/AI_PROJ/auto_waveform_debugger/waveform_explorer/timer_tb.vcd"
+
 ### Exposed Tools
 - `list_signals(vcd_path)`
+...
+
 - `get_signal_info(vcd_path, path)`
 - `get_snapshot(vcd_path, signals, time)`
 - `find_edge(vcd_path, path, edge_type, start_time, direction)`
