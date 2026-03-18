@@ -64,3 +64,26 @@ Find the first timestamp where a logical condition is met.
 - **Binary Search:** Signal state retrieval uses `std::upper_bound` for $O(\log N)$ performance on large datasets.
 - **Memory Efficient:** VCD is parsed into optimized transition arrays per signal.
 - **Third-party:** Uses `nlohmann/json` for robust JSON handling.
+
+## MCP Service
+The tool can be run as an MCP (Model Context Protocol) service, allowing AI Agents to interact with it directly via tools.
+
+### Setup MCP
+Ensure the virtual environment is set up and `fastmcp` is installed:
+```bash
+uv pip install fastmcp
+```
+
+### Run MCP Server
+```bash
+python waveform_mcp.py
+```
+
+### Exposed Tools
+- `list_signals(vcd_path)`
+- `get_signal_info(vcd_path, path)`
+- `get_snapshot(vcd_path, signals, time)`
+- `find_edge(vcd_path, path, edge_type, start_time, direction)`
+- `find_condition(vcd_path, expression, start_time, direction)`
+- `get_transitions(vcd_path, path, start_time, end_time, max_limit)`
+- `analyze_pattern(vcd_path, path, start_time, end_time)`
