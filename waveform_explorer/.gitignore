@@ -1,0 +1,6 @@
+build/
+*.o
+wave_agent_cli
+*.pyc
+__pycache__/
+.README.md.swp
