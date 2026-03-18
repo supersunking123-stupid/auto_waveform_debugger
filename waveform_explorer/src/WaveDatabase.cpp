@@ -3,6 +3,7 @@
 #include <sstream>
 #include <iostream>
 #include <algorithm>
+#include <cstring>
 
 WaveDatabase::WaveDatabase() {}
 
@@ -15,7 +16,6 @@ bool WaveDatabase::load_vcd(const std::string& filepath) {
 
     std::string line;
     std::vector<std::string> current_scope;
-    std::unordered_map<std::string, std::vector<std::string>> id_to_paths;
     uint64_t current_time = 0;
     
     // To track glitches (multiple changes at the same time)
@@ -24,14 +24,13 @@ bool WaveDatabase::load_vcd(const std::string& filepath) {
     while (std::getline(file, line)) {
         if (line.empty()) continue;
 
-        // Strip leading whitespace
-        size_t start = line.find_first_not_of(" \t\r\n");
-        if (start == std::string::npos) continue;
-        line = line.substr(start);
+        const char* p = line.c_str();
+        while (*p == ' ' || *p == '\t' || *p == '\r') p++;
+        if (*p == '\0') continue;
 
-        if (line[0] == '$') {
-            std::istringstream iss(line);
+        if (*p == '$') {
             std::string token;
+            std::istringstream iss(line); 
             iss >> token;
 
             if (token == "$timescale") {
@@ -46,9 +45,7 @@ bool WaveDatabase::load_vcd(const std::string& filepath) {
                 iss >> type >> name;
                 current_scope.push_back(name);
             } else if (token == "$upscope") {
-                if (!current_scope.empty()) {
-                    current_scope.pop_back();
-                }
+                if (!current_scope.empty()) current_scope.pop_back();
             } else if (token == "$var") {
                 std::string type, width_str, id, name;
                 iss >> type >> width_str >> id >> name;
@@ -56,11 +53,9 @@ bool WaveDatabase::load_vcd(const std::string& filepath) {
                 std::string path = "";
                 for (size_t i = 0; i < current_scope.size(); ++i) {
                     path += current_scope[i];
-                    if (i < current_scope.size() - 1 || !name.empty()) path += ".";
+                    path += ".";
                 }
                 path += name;
-                
-                id_to_paths[id].push_back(path);
                 
                 SignalInfo info;
                 info.name = name;
@@ -71,51 +66,49 @@ bool WaveDatabase::load_vcd(const std::string& filepath) {
                     info.width = 1;
                 }
                 info.type = type;
+                info.signal_id = id;
                 
                 signal_info[path] = info;
-                transitions[path] = std::vector<Transition>();
-            } else if (token == "$enddefinitions") {
-                // Done parsing header
+                if (id_transitions.find(id) == id_transitions.end()) {
+                    id_transitions[id] = std::vector<Transition>();
+                }
             }
-        } else if (line[0] == '#') {
-            try {
-                current_time = std::stoull(line.substr(1));
-            } catch(...) {
-                std::cerr << "Error parsing time: " << line << std::endl;
-            }
+        } else if (*p == '#') {
+            current_time = std::stoull(p + 1);
         } else {
             // Value change
             std::string value;
             std::string id;
             
-            if (line[0] == '0' || line[0] == '1' || line[0] == 'x' || line[0] == 'X' || line[0] == 'z' || line[0] == 'Z') {
-                value = line.substr(0, 1);
-                id = line.substr(1);
+            if (*p == '0' || *p == '1' || *p == 'x' || *p == 'X' || *p == 'z' || *p == 'Z') {
+                value = *p;
+                id = (p + 1);
                 // remove trailing whitespace from id
                 size_t end = id.find_last_not_of(" \t\r\n");
                 if (end != std::string::npos) id = id.substr(0, end + 1);
-            } else if (line[0] == 'b' || line[0] == 'B' || line[0] == 'r' || line[0] == 'R') {
-                std::istringstream iss(line);
-                iss >> value >> id;
+            } else if (*p == 'b' || *p == 'B' || *p == 'r' || *p == 'R') {
+                const char* space = strchr(p, ' ');
+                if (space) {
+                    value = std::string(p, space - p);
+                    id = space + 1;
+                    size_t end = id.find_last_not_of(" \t\r\n");
+                    if (end != std::string::npos) id = id.substr(0, end + 1);
+                }
             } else {
-                continue; // ignore unhandled or malformed lines
+                continue;
             }
 
-            if (id_to_paths.find(id) != id_to_paths.end()) {
-                for (const auto& path : id_to_paths[id]) {
-                    bool is_glitch = false;
-                    
-                    if (last_change_time.find(path) != last_change_time.end() && last_change_time[path] == current_time) {
-                        is_glitch = true;
-                        // Mark the previous one at this time as a glitch too if it wasn't
-                        if (!transitions[path].empty() && transitions[path].back().timestamp == current_time) {
-                            transitions[path].back().is_glitch = true;
-                        }
+            auto it_trans = id_transitions.find(id);
+            if (it_trans != id_transitions.end()) {
+                bool is_glitch = false;
+                if (last_change_time.count(id) && last_change_time[id] == current_time) {
+                    is_glitch = true;
+                    if (!it_trans->second.empty() && it_trans->second.back().timestamp == current_time) {
+                        it_trans->second.back().is_glitch = true;
                     }
-                    
-                    transitions[path].push_back({current_time, value, is_glitch});
-                    last_change_time[path] = current_time;
                 }
+                it_trans->second.push_back({current_time, value, is_glitch});
+                last_change_time[id] = current_time;
             }
         }
     }
@@ -132,31 +125,28 @@ const SignalInfo& WaveDatabase::get_signal_info(const std::string& path) const {
 }
 
 const std::vector<Transition>& WaveDatabase::get_transitions(const std::string& path) const {
-    return transitions.at(path);
+    if (!has_signal(path)) {
+        static const std::vector<Transition> empty;
+        return empty;
+    }
+    const std::string& id = signal_info.at(path).signal_id;
+    return id_transitions.at(id);
 }
 
 std::string WaveDatabase::get_value_at_time(const std::string& path, uint64_t time) const {
-    if (!has_signal(path)) return "U"; // Unknown signal
+    if (!has_signal(path)) return "U"; 
     
-    const auto& trans = transitions.at(path);
+    const std::string& id = signal_info.at(path).signal_id;
+    const auto& trans = id_transitions.at(id);
     if (trans.empty()) return "U";
-    if (time < trans.front().timestamp) return "U"; // Before first transition
+    if (time < trans.front().timestamp) return "U"; 
     
-    // Binary search for the last transition <= time
     auto it = std::upper_bound(trans.begin(), trans.end(), time,
         [](uint64_t t, const Transition& tr) {
             return t < tr.timestamp;
         });
         
-    // it points to the first transition strictly greater than time.
-    // So the previous transition is the one we want.
-    if (it == trans.begin()) {
-        return "U";
-    }
+    if (it == trans.begin()) return "U";
     --it;
-    
-    // If there's a glitch at this exact time, we want the *last* settled value at this time.
-    // upper_bound followed by --it already gives us the last transition <= time, 
-    // which in case of identical timestamps, points to the last one inserted (the settled value).
     return it->value;
 }

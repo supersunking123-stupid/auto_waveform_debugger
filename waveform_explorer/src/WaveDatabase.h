@@ -16,6 +16,7 @@ struct SignalInfo {
     std::string path;
     uint32_t width;
     std::string type;
+    std::string signal_id; // Added to point to shared transitions
 };
 
 class WaveDatabase {
@@ -42,6 +43,6 @@ private:
     // Map from full hierarchical path to signal details
     std::unordered_map<std::string, SignalInfo> signal_info;
     
-    // Map from full hierarchical path to transitions
-    std::unordered_map<std::string, std::vector<Transition>> transitions;
+    // Map from Signal ID (from VCD) to transitions
+    std::unordered_map<std::string, std::vector<Transition>> id_transitions;
 };
