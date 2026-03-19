@@ -24,6 +24,7 @@ public:
     WaveDatabase();
     bool load_vcd(const std::string& filepath);
     bool load_fst(const std::string& filepath);
+    bool load_fsdb(const std::string& filepath);
     bool load(const std::string& filepath); // Auto-detect format
 
     std::string get_timescale() const { return timescale; }
@@ -40,6 +41,8 @@ public:
     const std::unordered_map<std::string, SignalInfo>& get_all_signals() const { return signal_info; }
 
 private:
+    void clear();
+
     std::string timescale;
     
     // Map from full hierarchical path to signal details

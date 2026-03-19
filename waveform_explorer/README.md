@@ -1,6 +1,6 @@
 # Waveform Explorer (AI-Centric Debugger)
 
-`wave_agent_cli` is a high-performance, C++ based waveform analysis engine designed specifically for AI Agents. It acts as a **Temporal Database Query Engine**, providing structured, high-signal-to-noise ratio data from VCD files, avoiding the token overhead of raw waveform logs.
+`wave_agent_cli` is a high-performance, C++ based waveform analysis engine designed specifically for AI Agents. It acts as a **Temporal Database Query Engine**, providing structured, high-signal-to-noise ratio data from VCD/FST/FSDB files, avoiding the token overhead of raw waveform logs.
 
 ## Core Philosophies
 - **AI-Native:** Returns structured JSON, not visual waves.
@@ -26,13 +26,29 @@ The executable `wave_agent_cli` will be generated in the `build` directory.
 
 ### Command Format
 ```bash
-./wave_agent_cli <vcd_file> '<json_query>'
+./wave_agent_cli <waveform_file> '<json_query>'
 ```
+
+Supported file types are `.vcd`, `.fst`, and `.fsdb`.
+
+### FSDB Build Requirement
+FSDB support requires Synopsys Verdi FsdbReader SDK (`ffrAPI.h`, `libnffr.so`, `libnsys.so`).
+By default, `CMakeLists.txt` looks under:
+`/home/qsun/synopsys_apps/verdi/V-2023.12-SP2`.
+
+You can override this path:
+```bash
+cmake -B build -DVERDI_HOME=/path/to/verdi -DENABLE_FSDB=ON .
+```
+
+### FSDB Runtime Output
+Some Verdi FSDB builds print informational banners (for example `FSDB Reader...` or `logDir = ...`).
+`wave_agent_cli` filters those lines so stdout remains JSON-only for MCP/client parsing.
 
 ### Supported Commands
 
 #### 1. `list_signals`
-List all hierarchical signal paths found in the VCD.
+List all hierarchical signal paths found in the waveform file.
 - **Query:** `{"cmd": "list_signals"}`
 - **Response:** `{"status": "success", "data": ["TOP.clk", "TOP.dut.rst_n", ...]}`
 
