@@ -7,6 +7,7 @@ import os
 CLI_PATH = os.path.join(os.path.dirname(__file__), "build", "wave_agent_cli")
 VCD_PATH = os.path.join(os.path.dirname(__file__), "timer_tb.vcd")
 LARGE_VCD_PATH = "/home/qsun/AI_PROJ/auto_waveform_debugger/Cores-VeeR-EH1/sim.vcd"
+FST_PATH = "/home/qsun/AI_PROJ/auto_waveform_debugger/Cores-VeeR-EH1/sim.fst"
 
 class WaveformDaemon:
     def __init__(self, vcd_path: str):
@@ -32,9 +33,9 @@ class WaveformDaemon:
         self.process.terminate()
 
 def test_performance(vcd_path):
-    print(f"--- Benchmarking VCD (Daemon Mode): {vcd_path} ---")
+    print(f"--- Benchmarking (Daemon Mode): {vcd_path} ---")
     if not os.path.exists(vcd_path):
-        print("VCD file not found, skipping.")
+        print("File not found, skipping.")
         return
 
     # 1. Start Daemon (Includes initial load time)
@@ -46,11 +47,15 @@ def test_performance(vcd_path):
     print(f"Initial Load + First Query: {end_load - start_load:.4f}s")
 
     # 2. Measure subsequent commands (Pure query latency)
+    # Note: sim.fst paths are slightly different based on FST's hierarchy handling
+    is_veer = "sim.vcd" in vcd_path or "sim.fst" in vcd_path
+    clk_path = "TOP.tb_top.core_clk" if is_veer else "TOP.timer_tb.clk"
+
     cmds = [
         ("list_signals", {}),
-        ("get_snapshot", {"signals": ["TOP.core_clk" if "sim.vcd" in vcd_path else "TOP.timer_tb.clk"], "time": 10000}),
-        ("analyze_pattern", {"path": "TOP.core_clk" if "sim.vcd" in vcd_path else "TOP.timer_tb.clk", "start_time": 0, "end_time": 100000}),
-        ("get_transitions", {"path": "TOP.core_clk" if "sim.vcd" in vcd_path else "TOP.timer_tb.clk", "start_time": 0, "end_time": 50000})
+        ("get_snapshot", {"signals": [clk_path], "time": 10000}),
+        ("analyze_pattern", {"path": clk_path, "start_time": 0, "end_time": 100000}),
+        ("get_transitions", {"path": clk_path, "start_time": 0, "end_time": 50000})
     ]
 
     total_query_time = 0
@@ -68,3 +73,4 @@ def test_performance(vcd_path):
 if __name__ == "__main__":
     test_performance(VCD_PATH)
     test_performance(LARGE_VCD_PATH)
+    test_performance(FST_PATH)

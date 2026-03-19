@@ -18,8 +18,8 @@ int main(int argc, char* argv[]) {
 
     std::string vcd_path = argv[1];
     WaveDatabase db;
-    if (!db.load_vcd(vcd_path)) {
-        std::cout << json({{"status", "error"}, {"message", "Failed to load VCD"}}) << std::endl;
+    if (!db.load(vcd_path)) {
+        std::cout << json({{"status", "error"}, {"message", "Failed to load waveform file"}}) << std::endl;
         return 1;
     }
 

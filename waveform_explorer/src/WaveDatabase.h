@@ -23,6 +23,8 @@ class WaveDatabase {
 public:
     WaveDatabase();
     bool load_vcd(const std::string& filepath);
+    bool load_fst(const std::string& filepath);
+    bool load(const std::string& filepath); // Auto-detect format
 
     std::string get_timescale() const { return timescale; }
     
