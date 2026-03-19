@@ -46,7 +46,13 @@ bool WaveDatabase::load_fst(const std::string& filepath) {
                 if (!scope_stack.empty()) scope_stack.pop_back();
                 break;
             case FST_HT_VAR: {
-                std::string var_name(h->u.var.name, h->u.var.name_length);
+                std::string full_name(h->u.var.name, h->u.var.name_length);
+                std::string var_name = full_name;
+                size_t space_pos = full_name.find(' ');
+                if (space_pos != std::string::npos) {
+                    var_name = full_name.substr(0, space_pos);
+                }
+
                 std::string path = "";
                 for (const auto& s : scope_stack) {
                     path += s + ".";
