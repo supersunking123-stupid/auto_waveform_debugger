@@ -31,6 +31,12 @@ bool ends_with_case_insensitive(const std::string& s, const std::string& suffix)
     return true;
 }
 
+std::string strip_top_prefix(const std::string& path) {
+    static const std::string kTop = "TOP.";
+    if (path.rfind(kTop, 0) == 0) return path.substr(kTop.size());
+    return path;
+}
+
 #ifdef WAVE_HAS_FSDB
 uint64_t fsdb_xtag_to_u64(const fsdbXTag& xtag) {
     return (static_cast<uint64_t>(xtag.hltag.H) << 32) | static_cast<uint64_t>(xtag.hltag.L);
@@ -94,6 +100,7 @@ struct FSDBTreeContext {
     std::unordered_map<std::string, std::vector<Transition>>* id_transitions = nullptr;
     std::vector<std::string> scope_stack;
     std::unordered_map<fsdbVarIdcode, std::string> id_to_path;
+    bool normalize_top_prefix = true;
 };
 
 class ScopedStdIOSilencer {
@@ -148,6 +155,7 @@ bool_T fsdb_tree_cb(fsdbTreeCBType cb_type, void* client_data, void* tree_cb_dat
                 path.push_back('.');
             }
             path += var->name;
+            if (ctx->normalize_top_prefix) path = strip_top_prefix(path);
 
             SignalInfo info;
             info.name = var->name;
@@ -236,6 +244,7 @@ bool WaveDatabase::load_fst(const std::string& filepath) {
                     path += s + ".";
                 }
                 path += var_name;
+                path = normalize_loaded_path(path);
 
                 SignalInfo info;
                 info.name = var_name;
@@ -440,6 +449,7 @@ bool WaveDatabase::load_vcd(const std::string& filepath) {
                     path += ".";
                 }
                 path += name;
+                path = normalize_loaded_path(path);
                 
                 SignalInfo info;
                 info.name = name;
@@ -501,26 +511,28 @@ bool WaveDatabase::load_vcd(const std::string& filepath) {
 }
 
 bool WaveDatabase::has_signal(const std::string& path) const {
-    return signal_info.find(path) != signal_info.end();
+    return signal_info.find(resolve_query_path(path)) != signal_info.end();
 }
 
 const SignalInfo& WaveDatabase::get_signal_info(const std::string& path) const {
-    return signal_info.at(path);
+    return signal_info.at(resolve_query_path(path));
 }
 
 const std::vector<Transition>& WaveDatabase::get_transitions(const std::string& path) const {
-    if (!has_signal(path)) {
+    const std::string resolved = resolve_query_path(path);
+    if (signal_info.find(resolved) == signal_info.end()) {
         static const std::vector<Transition> empty;
         return empty;
     }
-    const std::string& id = signal_info.at(path).signal_id;
+    const std::string& id = signal_info.at(resolved).signal_id;
     return id_transitions.at(id);
 }
 
 std::string WaveDatabase::get_value_at_time(const std::string& path, uint64_t time) const {
-    if (!has_signal(path)) return "U"; 
+    const std::string resolved = resolve_query_path(path);
+    if (signal_info.find(resolved) == signal_info.end()) return "U";
     
-    const std::string& id = signal_info.at(path).signal_id;
+    const std::string& id = signal_info.at(resolved).signal_id;
     const auto& trans = id_transitions.at(id);
     if (trans.empty()) return "U";
     if (time < trans.front().timestamp) return "U"; 
@@ -533,4 +545,20 @@ std::string WaveDatabase::get_value_at_time(const std::string& path, uint64_t ti
     if (it == trans.begin()) return "U";
     --it;
     return it->value;
+}
+
+std::string WaveDatabase::normalize_loaded_path(const std::string& path) const {
+    return strip_top_prefix(path);
+}
+
+std::string WaveDatabase::resolve_query_path(const std::string& path) const {
+    if (signal_info.find(path) != signal_info.end()) return path;
+
+    const std::string no_top = strip_top_prefix(path);
+    if (signal_info.find(no_top) != signal_info.end()) return no_top;
+
+    const std::string with_top = "TOP." + path;
+    if (signal_info.find(with_top) != signal_info.end()) return with_top;
+
+    return path;
 }

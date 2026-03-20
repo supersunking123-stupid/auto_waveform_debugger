@@ -30,6 +30,8 @@ The executable `wave_agent_cli` will be generated in the `build` directory.
 ```
 
 Supported file types are `.vcd`, `.fst`, and `.fsdb`.
+Hierarchical paths are normalized to remove a leading `TOP.` for consistency.
+Queries accept both styles (`tb_top.sig` and `TOP.tb_top.sig`).
 
 ### FSDB Build Requirement
 FSDB support requires Synopsys Verdi FsdbReader SDK (`ffrAPI.h`, `libnffr.so`, `libnsys.so`).

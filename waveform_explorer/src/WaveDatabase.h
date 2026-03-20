@@ -41,6 +41,8 @@ public:
     const std::unordered_map<std::string, SignalInfo>& get_all_signals() const { return signal_info; }
 
 private:
+    std::string normalize_loaded_path(const std::string& path) const;
+    std::string resolve_query_path(const std::string& path) const;
     void clear();
 
     std::string timescale;
