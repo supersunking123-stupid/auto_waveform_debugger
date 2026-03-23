@@ -8,6 +8,10 @@ description: Use for RTL signal tracing with rtl_trace. Trigger when debugging s
 Use this skill to run `rtl_trace` for common RTL debug workflows.
 Assume `rtl_trace` is already available in `$PATH`.
 
+Current default behavior:
+- `compile` writes the binary graph DB format by default.
+- For repeated queries on a large design, prefer `rtl_trace serve` so the DB stays loaded.
+
 ## Workflow
 
 1. Compile or refresh trace DB from RTL sources:
@@ -34,6 +38,11 @@ rtl_trace trace --db <db_path> --mode <drivers|loads> --signal <hier.path> \
 rtl_trace hier --db <db_path> [--root <hier.path>] [--depth N] [--max-nodes N] [--format text|json]
 ```
 
+5. Reuse one loaded DB for repeated queries:
+```bash
+rtl_trace serve [--db <db_path>]
+```
+
 ## Query Patterns
 
 - Single signal:
@@ -44,6 +53,15 @@ rtl_trace trace --db <db_path> --mode drivers --signal top.u0.sig
 - Compile with timing log:
 ```bash
 rtl_trace compile --db rtl_trace.db --top top --compile-log compile.log -f rtl.f
+```
+
+- Repeated interactive queries on a large DB:
+```bash
+rtl_trace serve --db rtl_trace.db
+# then issue:
+#   find --query timeout --limit 5
+#   trace --mode drivers --signal top.u0.sig --format json
+#   hier --root top.u0 --depth 2
 ```
 
 - Bit or slice query:
@@ -84,6 +102,7 @@ rtl_trace trace --db <db_path> --mode drivers --signal top.u0.sig \
 - For bit-slice results, include `bit_map` and `bit_map_approximate`.
 - For hierarchy results, include `root`, `node_count`, `truncated`, and tree summary.
 - If signal is not found, run `find` and report top suggestions.
+- When using `serve`, report whether the result came from a persistent loaded session.
 
 ## Practical Rules
 
@@ -91,9 +110,11 @@ rtl_trace trace --db <db_path> --mode drivers --signal top.u0.sig \
 - Prefer `--incremental` for repeated DB compile on unchanged inputs.
 - Use `--relax-defparam` when the design has unresolved cross-hier `defparam` issues but you still need a usable DB.
 - Use `--mfcu` when the source flow expects grouped compilation units from filelists.
-- Use `--compile-log <file>` when profiling compile time; it records major compile steps plus `save_db_streaming` substeps such as `collect_strings`, `write_header_tables`, `emit_signals`, `write_hierarchy`, and `write_global_nets`.
+- Use `--compile-log <file>` when profiling compile time; for the current graph DB path it records major compile steps plus `save_graph_db` substeps such as `build_graph` and `write_file`.
 - Use `--partition-budget N` only when you explicitly want partitioned DB emission.
 - Recompile DB after RTL/filelist/define/include changes.
+- The compiled DB is now a binary graph DB by default; this is expected and should be preferred for large designs.
+- Prefer `serve` for large-design interactive work; it avoids repeated DB reload and keeps query latency low.
 - If output includes `depth_limit` / `node_limit`, rerun with larger limits.
 - If hierarchy output is too large, rerun with `--root` and smaller `--depth`.
 - Use `--cone-level N` to expand logic cone automatically:
@@ -102,3 +123,4 @@ rtl_trace trace --db <db_path> --mode drivers --signal top.u0.sig \
 - Use `--prefer-port-hop` when the first hit is a port-connection expression and you want traversal to continue across the instance boundary.
 - Re-run `compile` after trace-engine changes if you need updated cross-port recursion or `loads`-side `lhs` information in the DB.
 - Treat `bit_map_approximate=true` as unresolved static range and report it explicitly.
+- No MCP configuration is required for normal use. Only change Codex MCP settings if you later add a separate wrapper server around `rtl_trace serve`.

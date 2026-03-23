@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cctype>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -40,12 +41,13 @@
 
 namespace {
 
+using SymbolRefList = std::vector<const slang::ast::Symbol *>;
+
 struct ExprTraceResult {
   const slang::ast::NamedValueExpression *expr = nullptr;
   const slang::ast::AssignmentExpression *assignment = nullptr;
   std::vector<const slang::ast::Expression *> selectors;
-  std::vector<std::string> context_lhs_signals;
-  std::string context_instance_port_signal;
+  SymbolRefList context_lhs_signals;
   bool context_from_instance_port = false;
   const slang::ast::InstanceSymbol *context_instance = nullptr;
   const slang::ast::PortSymbol *context_port = nullptr;
@@ -98,10 +100,93 @@ struct TraceDb {
   std::string db_dir;
 };
 
+struct GraphSignalRecord {
+  uint32_t name_str_id = std::numeric_limits<uint32_t>::max();
+  uint32_t driver_begin = 0;
+  uint32_t driver_count = 0;
+  uint32_t load_begin = 0;
+  uint32_t load_count = 0;
+};
+
+struct GraphEndpointRecord {
+  uint32_t path_str_id = std::numeric_limits<uint32_t>::max();
+  uint32_t file_str_id = std::numeric_limits<uint32_t>::max();
+  uint32_t direction_str_id = std::numeric_limits<uint32_t>::max();
+  uint32_t bit_map_str_id = std::numeric_limits<uint32_t>::max();
+  uint32_t line = 0;
+  uint32_t assignment_start = 0;
+  uint32_t assignment_end = 0;
+  uint32_t lhs_begin = 0;
+  uint32_t lhs_count = 0;
+  uint32_t rhs_begin = 0;
+  uint32_t rhs_count = 0;
+  uint8_t kind = 0;
+  uint8_t bit_map_approximate = 0;
+  uint8_t has_assignment_range = 0;
+  uint8_t reserved = 0;
+};
+
+struct GraphPathRefRange {
+  uint32_t path_str_id = std::numeric_limits<uint32_t>::max();
+  uint32_t begin = 0;
+  uint32_t count = 0;
+};
+
+struct GraphHierarchyRecord {
+  uint32_t path_str_id = std::numeric_limits<uint32_t>::max();
+  uint32_t module_str_id = std::numeric_limits<uint32_t>::max();
+  uint32_t child_begin = 0;
+  uint32_t child_count = 0;
+};
+
+struct GraphGlobalNetRecord {
+  uint32_t source_path_str_id = std::numeric_limits<uint32_t>::max();
+  uint32_t category_str_id = std::numeric_limits<uint32_t>::max();
+  uint32_t sink_begin = 0;
+  uint32_t sink_count = 0;
+};
+
+struct GraphDb {
+  std::vector<std::string> strings;
+  std::vector<GraphSignalRecord> signals;
+  std::vector<GraphEndpointRecord> endpoints;
+  std::vector<uint32_t> signal_refs;
+  std::vector<GraphPathRefRange> load_ref_ranges;
+  std::vector<uint32_t> load_ref_signal_ids;
+  std::vector<GraphPathRefRange> driver_ref_ranges;
+  std::vector<uint32_t> driver_ref_signal_ids;
+  std::vector<GraphHierarchyRecord> hierarchy;
+  std::vector<uint32_t> hierarchy_children;
+  std::vector<GraphGlobalNetRecord> global_nets;
+  std::vector<uint32_t> global_sinks;
+  std::unordered_map<uint32_t, size_t> load_ref_index;
+  std::unordered_map<uint32_t, size_t> driver_ref_index;
+};
+
+struct TraceSession {
+  TraceDb db;
+  std::optional<GraphDb> graph;
+  std::string db_path;
+  std::string db_mtime;
+  std::unordered_map<std::string_view, uint32_t> signal_name_to_id;
+  std::vector<const std::string *> signal_names_by_id;
+  std::unordered_map<uint32_t, SignalRecord> materialized_signal_records;
+  std::unordered_map<std::string, std::string> source_file_cache;
+  bool signal_index_ready = false;
+  bool reverse_refs_ready = false;
+  bool hierarchy_ready = false;
+};
+
 struct PartitionRecord {
   std::string root;
   size_t signal_count = 0;
   size_t depth = 0;
+};
+
+enum SessionBuildFlags : uint32_t {
+  kSessionSignals = 1u << 0,
+  kSessionHierarchy = 1u << 1,
+  kSessionReverseRefs = 1u << 2,
 };
 
 struct BodyTraceIndex {
@@ -110,13 +195,10 @@ struct BodyTraceIndex {
 };
 
 struct TraceCompileCache {
-  std::unordered_map<const slang::ast::AssignmentExpression *, std::vector<std::string>>
-      assignment_lhs_signals;
-  std::unordered_map<const slang::ast::AssignmentExpression *, std::vector<std::string>>
-      assignment_rhs_signals;
-  std::unordered_map<const slang::ast::Statement *, std::vector<std::string>> statement_lhs_signals;
+  std::unordered_map<const slang::ast::AssignmentExpression *, SymbolRefList> assignment_lhs_signals;
+  std::unordered_map<const slang::ast::AssignmentExpression *, SymbolRefList> assignment_rhs_signals;
+  std::unordered_map<const slang::ast::Statement *, SymbolRefList> statement_lhs_signals;
   std::unordered_map<const slang::ast::InstanceBodySymbol *, BodyTraceIndex> body_trace_indexes;
-  std::unordered_map<const slang::ast::Symbol *, SignalRecord> signal_records;
 };
 
 class CompileLogger {
@@ -151,6 +233,58 @@ class CompileLogger {
 
   std::ofstream file_;
 };
+
+constexpr size_t kGraphDbMagicSize = 16;
+constexpr char kGraphDbMagic[kGraphDbMagicSize] = {
+    'R', 'T', 'L', '_', 'T', 'R', 'A', 'C', 'E', '_', 'G', 'D', 'B', '_', '1', '\0'};
+
+struct GraphDbFileHeader {
+  char magic[kGraphDbMagicSize];
+  uint32_t version = 1;
+  uint32_t reserved = 0;
+  uint64_t string_count = 0;
+  uint64_t string_blob_size = 0;
+  uint64_t signal_count = 0;
+  uint64_t endpoint_count = 0;
+  uint64_t signal_ref_count = 0;
+  uint64_t load_ref_range_count = 0;
+  uint64_t load_ref_count = 0;
+  uint64_t driver_ref_range_count = 0;
+  uint64_t driver_ref_count = 0;
+  uint64_t hierarchy_count = 0;
+  uint64_t hierarchy_child_count = 0;
+  uint64_t global_net_count = 0;
+  uint64_t global_sink_count = 0;
+};
+
+template <typename T>
+bool WriteBinaryValue(std::ofstream &out, const T &value) {
+  out.write(reinterpret_cast<const char *>(&value), sizeof(T));
+  return out.good();
+}
+
+template <typename T>
+bool ReadBinaryValue(std::ifstream &in, T &value) {
+  in.read(reinterpret_cast<char *>(&value), sizeof(T));
+  return in.good();
+}
+
+template <typename T>
+bool WriteBinaryVector(std::ofstream &out, const std::vector<T> &items) {
+  if (items.empty()) return true;
+  out.write(reinterpret_cast<const char *>(items.data()),
+            static_cast<std::streamsize>(items.size() * sizeof(T)));
+  return out.good();
+}
+
+template <typename T>
+bool ReadBinaryVector(std::ifstream &in, std::vector<T> &items, size_t count) {
+  items.resize(count);
+  if (count == 0) return true;
+  in.read(reinterpret_cast<char *>(items.data()),
+          static_cast<std::streamsize>(items.size() * sizeof(T)));
+  return in.good();
+}
 
 enum class OutputFormat { kText, kJson };
 
@@ -189,6 +323,13 @@ struct HierOptions {
   OutputFormat format = OutputFormat::kText;
 };
 
+struct FindOptions {
+  std::string query;
+  bool regex_mode = false;
+  size_t limit = 20;
+  OutputFormat format = OutputFormat::kText;
+};
+
 struct HierTreeNode {
   std::string path;
   std::string module;
@@ -204,12 +345,12 @@ struct HierRunResult {
   std::optional<HierTreeNode> tree;
 };
 
-std::vector<std::string> CollectLhsSignalsFromStatement(const slang::ast::Statement &stmt);
-const std::vector<std::string> &GetCachedLhsSignals(
+SymbolRefList CollectLhsSignalsFromStatement(const slang::ast::Statement &stmt);
+const SymbolRefList &GetCachedLhsSignals(
     const slang::ast::AssignmentExpression *assignment, TraceCompileCache &cache);
-const std::vector<std::string> &GetCachedRhsSignals(
+const SymbolRefList &GetCachedRhsSignals(
     const slang::ast::AssignmentExpression *assignment, TraceCompileCache &cache);
-const std::vector<std::string> &GetCachedStatementLhsSignals(
+const SymbolRefList &GetCachedStatementLhsSignals(
     const slang::ast::Statement &stmt, TraceCompileCache &cache);
 EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManager &sm,
                                   bool drivers_mode, TraceCompileCache *cache);
@@ -233,6 +374,27 @@ const slang::ast::InstanceSymbol *GetContainingInstanceSymbol(const slang::ast::
 bool IsTraceable(const slang::ast::Symbol *sym) {
   if (sym == nullptr) return false;
   return sym->kind == slang::ast::SymbolKind::Net || sym->kind == slang::ast::SymbolKind::Variable;
+}
+
+bool SymbolPathLess(const slang::ast::Symbol *lhs, const slang::ast::Symbol *rhs) {
+  if (lhs == rhs) return false;
+  return std::string(lhs->getHierarchicalPath()) < std::string(rhs->getHierarchicalPath());
+}
+
+std::vector<std::string> MaterializeSignalPaths(const SymbolRefList &signals) {
+  std::vector<std::string> out;
+  out.reserve(signals.size());
+  for (const slang::ast::Symbol *sym : signals) {
+    if (sym == nullptr) continue;
+    out.push_back(std::string(sym->getHierarchicalPath()));
+  }
+  return out;
+}
+
+std::string MakeInstancePortPath(const slang::ast::InstanceSymbol *instance,
+                                 const slang::ast::PortSymbol *port) {
+  if (instance == nullptr || port == nullptr) return "";
+  return std::string(instance->getHierarchicalPath()) + "." + std::string(port->name);
 }
 
 template <bool DRIVERS>
@@ -287,11 +449,11 @@ class BodyTraceIndexBuilder : public slang::ast::ASTVisitor<BodyTraceIndexBuilde
       this->visitDefault(stmt);
       return;
     }
-    std::vector<std::string> context_lhs = GetCachedStatementLhsSignals(stmt.ifTrue, cache_);
+    SymbolRefList context_lhs = GetCachedStatementLhsSignals(stmt.ifTrue, cache_);
     if (stmt.ifFalse != nullptr) {
       const auto &else_lhs = GetCachedStatementLhsSignals(*stmt.ifFalse, cache_);
       context_lhs.insert(context_lhs.end(), else_lhs.begin(), else_lhs.end());
-      std::sort(context_lhs.begin(), context_lhs.end());
+      std::sort(context_lhs.begin(), context_lhs.end(), SymbolPathLess);
       context_lhs.erase(std::unique(context_lhs.begin(), context_lhs.end()), context_lhs.end());
     }
 
@@ -313,7 +475,7 @@ class BodyTraceIndexBuilder : public slang::ast::ASTVisitor<BodyTraceIndexBuilde
       this->visitDefault(stmt);
       return;
     }
-    std::vector<std::string> context_lhs;
+    SymbolRefList context_lhs;
     for (const auto &item : stmt.items) {
       const auto &item_lhs = GetCachedStatementLhsSignals(*item.stmt, cache_);
       context_lhs.insert(context_lhs.end(), item_lhs.begin(), item_lhs.end());
@@ -322,7 +484,7 @@ class BodyTraceIndexBuilder : public slang::ast::ASTVisitor<BodyTraceIndexBuilde
       const auto &default_lhs = GetCachedStatementLhsSignals(*stmt.defaultCase, cache_);
       context_lhs.insert(context_lhs.end(), default_lhs.begin(), default_lhs.end());
     }
-    std::sort(context_lhs.begin(), context_lhs.end());
+    std::sort(context_lhs.begin(), context_lhs.end(), SymbolPathLess);
     context_lhs.erase(std::unique(context_lhs.begin(), context_lhs.end()), context_lhs.end());
 
     condition_lhs_stack_.push_back(std::move(context_lhs));
@@ -384,8 +546,6 @@ class BodyTraceIndexBuilder : public slang::ast::ASTVisitor<BodyTraceIndexBuilde
           result.context_from_instance_port = true;
           result.context_instance = active_instance_;
           result.context_port = active_port_;
-          result.context_instance_port_signal =
-              std::string(active_instance_->getHierarchicalPath()) + "." + std::string(active_port_->name);
         }
         Entries()[&nve.symbol].push_back(std::move(result));
       }
@@ -399,8 +559,6 @@ class BodyTraceIndexBuilder : public slang::ast::ASTVisitor<BodyTraceIndexBuilde
           result.context_from_instance_port = true;
           result.context_instance = active_instance_;
           result.context_port = active_port_;
-          result.context_instance_port_signal =
-              std::string(active_instance_->getHierarchicalPath()) + "." + std::string(active_port_->name);
         }
         if (current_assignment_ == nullptr && current_condition_expr_ != nullptr &&
             !condition_lhs_stack_.empty()) {
@@ -435,8 +593,8 @@ class BodyTraceIndexBuilder : public slang::ast::ASTVisitor<BodyTraceIndexBuilde
   const slang::ast::AssignmentExpression *current_assignment_ = nullptr;
   const slang::ast::Expression *current_condition_expr_ = nullptr;
   std::vector<const slang::ast::Expression *> selector_stack_;
-  std::vector<std::vector<std::string>> condition_lhs_stack_;
-  std::vector<std::vector<std::string>> timed_lhs_stack_;
+  std::vector<SymbolRefList> condition_lhs_stack_;
+  std::vector<SymbolRefList> timed_lhs_stack_;
 };
 
 const BodyTraceIndex &GetOrBuildBodyTraceIndex(const slang::ast::InstanceBodySymbol &body,
@@ -467,10 +625,6 @@ class PortConnectionResultCollector
     result.context_from_instance_port = true;
     result.context_instance = instance_;
     result.context_port = port_;
-    if (instance_ != nullptr && port_ != nullptr) {
-      result.context_instance_port_signal =
-          std::string(instance_->getHierarchicalPath()) + "." + std::string(port_->name);
-    }
     out_.push_back(std::move(result));
   }
 
@@ -573,11 +727,8 @@ std::vector<TraceResult> ComputeIndexedTraceResults(
   return out;
 }
 
-const SignalRecord &GetOrBuildSignalRecord(const slang::ast::Symbol *sym, const slang::SourceManager &sm,
-                                           TraceCompileCache &cache) {
-  auto it = cache.signal_records.find(sym);
-  if (it != cache.signal_records.end()) return it->second;
-
+SignalRecord BuildSignalRecord(const slang::ast::Symbol *sym, const slang::SourceManager &sm,
+                               TraceCompileCache &cache) {
   SignalRecord rec;
   std::unordered_set<const slang::ast::Symbol *> visited_drivers;
   visited_drivers.insert(sym);
@@ -589,7 +740,7 @@ const SignalRecord &GetOrBuildSignalRecord(const slang::ast::Symbol *sym, const 
   for (const TraceResult &r : ComputeIndexedTraceResults</*DRIVERS*/ false>(sym, cache, visited_loads))
     rec.loads.push_back(ResolveTraceResult(r, sm, false, &cache));
 
-  return cache.signal_records.emplace(sym, std::move(rec)).first->second;
+  return rec;
 }
 
 std::string DirectionToString(slang::ast::ArgumentDirection dir) {
@@ -648,15 +799,6 @@ std::pair<std::string, std::string> SplitPathPrefixLeaf(const std::string &path)
   return {path.substr(0, pos), path.substr(pos + 1)};
 }
 
-uint64_t Fnv1a64(std::string_view s) {
-  uint64_t h = 1469598103934665603ull;
-  for (char c : s) {
-    h ^= static_cast<unsigned char>(c);
-    h *= 1099511628211ull;
-  }
-  return h;
-}
-
 uint32_t InternString(const std::string &s, std::vector<std::string> &pool,
                       std::unordered_map<std::string, uint32_t> &index) {
   auto it = index.find(s);
@@ -665,6 +807,12 @@ uint32_t InternString(const std::string &s, std::vector<std::string> &pool,
   pool.push_back(s);
   index.emplace(pool.back(), id);
   return id;
+}
+
+const std::string &GraphString(const GraphDb &db, uint32_t id) {
+  static const std::string empty;
+  if (id >= db.strings.size()) return empty;
+  return db.strings[id];
 }
 
 const std::string &EndpointPath(const TraceDb &db, const EndpointRecord &e) {
@@ -695,15 +843,6 @@ std::vector<std::string> SplitJoinedField(const std::string &field) {
     start = pos + 1;
   }
   return out;
-}
-
-std::string JoinLines(const std::vector<std::string> &items) {
-  std::string joined;
-  for (size_t i = 0; i < items.size(); ++i) {
-    if (i != 0) joined += '\n';
-    joined += items[i];
-  }
-  return joined;
 }
 
 std::optional<std::pair<int32_t, int32_t>> ParseExactBitMapText(std::string_view bit_map) {
@@ -900,72 +1039,72 @@ std::pair<std::string, bool> DescribeBitSelectors(
   return {bit_map, approximate};
 }
 
-std::vector<std::string> CollectRhsSignals(const slang::ast::AssignmentExpression *assignment) {
+SymbolRefList CollectRhsSignals(const slang::ast::AssignmentExpression *assignment) {
   if (assignment == nullptr) return {};
 
   class RhsSignalCollector : public slang::ast::ASTVisitor<RhsSignalCollector, true, true> {
    public:
-    explicit RhsSignalCollector(std::vector<std::string> &out) : out_(out) {}
+    explicit RhsSignalCollector(SymbolRefList &out) : out_(out) {}
 
     void handle(const slang::ast::NamedValueExpression &nve) {
       if (!IsTraceable(&nve.symbol)) return;
-      out_.push_back(std::string(nve.symbol.getHierarchicalPath()));
+      out_.push_back(&nve.symbol);
     }
 
    private:
-    std::vector<std::string> &out_;
+    SymbolRefList &out_;
   };
 
-  std::vector<std::string> paths;
+  SymbolRefList paths;
   RhsSignalCollector collector(paths);
   assignment->right().visit(collector);
-  std::sort(paths.begin(), paths.end());
+  std::sort(paths.begin(), paths.end(), SymbolPathLess);
   paths.erase(std::unique(paths.begin(), paths.end()), paths.end());
   return paths;
 }
 
-std::vector<std::string> CollectLhsSignals(const slang::ast::AssignmentExpression *assignment) {
+SymbolRefList CollectLhsSignals(const slang::ast::AssignmentExpression *assignment) {
   if (assignment == nullptr) return {};
 
   class LhsSignalCollector : public slang::ast::ASTVisitor<LhsSignalCollector, true, true> {
    public:
-    explicit LhsSignalCollector(std::vector<std::string> &out) : out_(out) {}
+    explicit LhsSignalCollector(SymbolRefList &out) : out_(out) {}
 
     void handle(const slang::ast::NamedValueExpression &nve) {
       if (!IsTraceable(&nve.symbol)) return;
-      out_.push_back(std::string(nve.symbol.getHierarchicalPath()));
+      out_.push_back(&nve.symbol);
     }
 
    private:
-    std::vector<std::string> &out_;
+    SymbolRefList &out_;
   };
 
-  std::vector<std::string> paths;
+  SymbolRefList paths;
   LhsSignalCollector collector(paths);
   assignment->left().visit(collector);
-  std::sort(paths.begin(), paths.end());
+  std::sort(paths.begin(), paths.end(), SymbolPathLess);
   paths.erase(std::unique(paths.begin(), paths.end()), paths.end());
   return paths;
 }
 
-std::vector<std::string> CollectLhsSignalsFromStatement(const slang::ast::Statement &stmt) {
+SymbolRefList CollectLhsSignalsFromStatement(const slang::ast::Statement &stmt) {
   class StatementLhsCollector
       : public slang::ast::ASTVisitor<StatementLhsCollector, true, true> {
    public:
-    explicit StatementLhsCollector(std::vector<std::string> &out) : out_(out) {}
+    explicit StatementLhsCollector(SymbolRefList &out) : out_(out) {}
 
     void handle(const slang::ast::AssignmentExpression &assignment) {
       class LhsCollector : public slang::ast::ASTVisitor<LhsCollector, true, true> {
        public:
-        explicit LhsCollector(std::vector<std::string> &out) : out_(out) {}
+        explicit LhsCollector(SymbolRefList &out) : out_(out) {}
 
         void handle(const slang::ast::NamedValueExpression &nve) {
           if (!IsTraceable(&nve.symbol)) return;
-          out_.push_back(std::string(nve.symbol.getHierarchicalPath()));
+          out_.push_back(&nve.symbol);
         }
 
        private:
-        std::vector<std::string> &out_;
+        SymbolRefList &out_;
       };
       LhsCollector lhs_collector(out_);
       assignment.left().visit(lhs_collector);
@@ -973,36 +1112,36 @@ std::vector<std::string> CollectLhsSignalsFromStatement(const slang::ast::Statem
     }
 
    private:
-    std::vector<std::string> &out_;
+    SymbolRefList &out_;
   };
 
-  std::vector<std::string> paths;
+  SymbolRefList paths;
   StatementLhsCollector collector(paths);
   stmt.visit(collector);
-  std::sort(paths.begin(), paths.end());
+  std::sort(paths.begin(), paths.end(), SymbolPathLess);
   paths.erase(std::unique(paths.begin(), paths.end()), paths.end());
   return paths;
 }
 
-const std::vector<std::string> &GetCachedLhsSignals(
+const SymbolRefList &GetCachedLhsSignals(
     const slang::ast::AssignmentExpression *assignment, TraceCompileCache &cache) {
-  static const std::vector<std::string> empty;
+  static const SymbolRefList empty;
   if (assignment == nullptr) return empty;
   auto it = cache.assignment_lhs_signals.find(assignment);
   if (it != cache.assignment_lhs_signals.end()) return it->second;
   return cache.assignment_lhs_signals.emplace(assignment, CollectLhsSignals(assignment)).first->second;
 }
 
-const std::vector<std::string> &GetCachedRhsSignals(
+const SymbolRefList &GetCachedRhsSignals(
     const slang::ast::AssignmentExpression *assignment, TraceCompileCache &cache) {
-  static const std::vector<std::string> empty;
+  static const SymbolRefList empty;
   if (assignment == nullptr) return empty;
   auto it = cache.assignment_rhs_signals.find(assignment);
   if (it != cache.assignment_rhs_signals.end()) return it->second;
   return cache.assignment_rhs_signals.emplace(assignment, CollectRhsSignals(assignment)).first->second;
 }
 
-const std::vector<std::string> &GetCachedStatementLhsSignals(
+const SymbolRefList &GetCachedStatementLhsSignals(
     const slang::ast::Statement &stmt, TraceCompileCache &cache) {
   auto it = cache.statement_lhs_signals.find(&stmt);
   if (it != cache.statement_lhs_signals.end()) return it->second;
@@ -1038,25 +1177,26 @@ EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManag
               rec.assignment_end = off->second;
             }
             if (cache != nullptr) {
-              rec.lhs_signals = GetCachedLhsSignals(item.assignment, *cache);
-              rec.rhs_signals = GetCachedRhsSignals(item.assignment, *cache);
+              rec.lhs_signals = MaterializeSignalPaths(GetCachedLhsSignals(item.assignment, *cache));
+              rec.rhs_signals = MaterializeSignalPaths(GetCachedRhsSignals(item.assignment, *cache));
             } else {
-              rec.lhs_signals = CollectLhsSignals(item.assignment);
-              rec.rhs_signals = CollectRhsSignals(item.assignment);
+              rec.lhs_signals = MaterializeSignalPaths(CollectLhsSignals(item.assignment));
+              rec.rhs_signals = MaterializeSignalPaths(CollectRhsSignals(item.assignment));
             }
           } else if (!item.context_lhs_signals.empty()) {
-            rec.lhs_signals = item.context_lhs_signals;
+            rec.lhs_signals = MaterializeSignalPaths(item.context_lhs_signals);
           }
-          if (item.context_from_instance_port && !item.context_instance_port_signal.empty()) {
+          if (item.context_from_instance_port && item.context_instance != nullptr && item.context_port != nullptr) {
+            const std::string port_signal = MakeInstancePortPath(item.context_instance, item.context_port);
             if (drivers_mode) {
               if (std::find(rec.rhs_signals.begin(), rec.rhs_signals.end(),
-                            item.context_instance_port_signal) == rec.rhs_signals.end()) {
-                rec.rhs_signals.push_back(item.context_instance_port_signal);
+                            port_signal) == rec.rhs_signals.end()) {
+                rec.rhs_signals.push_back(port_signal);
               }
             } else {
               if (std::find(rec.lhs_signals.begin(), rec.lhs_signals.end(),
-                            item.context_instance_port_signal) == rec.lhs_signals.end()) {
-                rec.lhs_signals.push_back(item.context_instance_port_signal);
+                            port_signal) == rec.lhs_signals.end()) {
+                rec.lhs_signals.push_back(port_signal);
               }
             }
           }
@@ -1155,151 +1295,6 @@ void BuildHierarchyFromSignals(TraceDb &db) {
     std::sort(node.children.begin(), node.children.end());
     node.children.erase(std::unique(node.children.begin(), node.children.end()), node.children.end());
   }
-}
-
-std::string EscapeField(std::string_view s) {
-  std::string out;
-  out.reserve(s.size());
-  for (char c : s) {
-    if (c == '\\') {
-      out += "\\\\";
-    } else if (c == '\t') {
-      out += "\\t";
-    } else if (c == '\n') {
-      out += "\\n";
-    } else {
-      out += c;
-    }
-  }
-  return out;
-}
-
-std::vector<std::string> SplitEscapedTsv(std::string_view line) {
-  std::vector<std::string> fields;
-  std::string cur;
-  bool escaped = false;
-  for (char c : line) {
-    if (escaped) {
-      if (c == 't') {
-        cur += '\t';
-      } else if (c == 'n') {
-        cur += '\n';
-      } else {
-        cur += c;
-      }
-      escaped = false;
-      continue;
-    }
-    if (c == '\\') {
-      escaped = true;
-    } else if (c == '\t') {
-      fields.push_back(cur);
-      cur.clear();
-    } else {
-      cur += c;
-    }
-  }
-  fields.push_back(cur);
-  return fields;
-}
-
-struct V7WriteStringIndex {
-  std::unordered_map<std::string, uint32_t> prefix_to_id;
-  std::unordered_map<std::string, uint32_t> file_to_id;
-  std::vector<std::string> prefix_by_id;
-  std::vector<std::string> file_by_id;
-};
-
-void WriteEndpointLine(std::ofstream &out, char kind, const EndpointRecord &e, const V7WriteStringIndex &index,
-                       const TraceDb *db);
-void CollectEndpointStrings(const EndpointRecord &e, V7WriteStringIndex &index, const TraceDb *db);
-void WriteV7StringTables(std::ofstream &out, const V7WriteStringIndex &index);
-uint32_t RegisterPrefix(V7WriteStringIndex &index, const std::string &prefix);
-uint32_t RegisterFile(V7WriteStringIndex &index, const std::string &file);
-std::string EncodePathToken(const std::string &path, const V7WriteStringIndex &index);
-
-bool SaveDb(const std::string &db_path, const TraceDb &db) {
-  std::ofstream out(db_path);
-  if (!out.is_open()) return false;
-
-  V7WriteStringIndex string_index;
-  std::vector<std::string> signal_names;
-  signal_names.reserve(db.signals.size());
-  for (const auto &[name, _] : db.signals) {
-    signal_names.push_back(name);
-  }
-  std::sort(signal_names.begin(), signal_names.end());
-
-  for (const std::string &name : signal_names) {
-    const auto it = db.signals.find(name);
-    if (it == db.signals.end()) continue;
-    const auto [sig_prefix, _sig_leaf] = SplitPathPrefixLeaf(name);
-    RegisterPrefix(string_index, sig_prefix);
-    const std::vector<EndpointRecord> drivers = MergeEndpointBitRanges(it->second.drivers);
-    const std::vector<EndpointRecord> loads = MergeEndpointBitRanges(it->second.loads);
-    for (const EndpointRecord &e : drivers)
-      CollectEndpointStrings(e, string_index, &db);
-    for (const EndpointRecord &e : loads)
-      CollectEndpointStrings(e, string_index, &db);
-  }
-  for (const auto &[path, node] : db.hierarchy) {
-    const auto [pfx, _leaf] = SplitPathPrefixLeaf(path);
-    RegisterPrefix(string_index, pfx);
-    for (const std::string &ch : node.children) {
-      const auto [cpfx, _cleaf] = SplitPathPrefixLeaf(ch);
-      RegisterPrefix(string_index, cpfx);
-    }
-  }
-
-  out << "RTL_TRACE_DB_V8\n";
-  WriteV7StringTables(out, string_index);
-
-  for (const std::string &name : signal_names) {
-    const auto it = db.signals.find(name);
-    if (it == db.signals.end()) continue;
-    const auto [sig_prefix, sig_leaf] = SplitPathPrefixLeaf(name);
-    const auto pit = string_index.prefix_to_id.find(sig_prefix);
-    if (pit == string_index.prefix_to_id.end()) continue;
-    const std::vector<EndpointRecord> drivers = MergeEndpointBitRanges(it->second.drivers);
-    const std::vector<EndpointRecord> loads = MergeEndpointBitRanges(it->second.loads);
-    out << "S\t" << pit->second << '\t' << EscapeField(sig_leaf) << '\n';
-    for (const EndpointRecord &e : drivers)
-      WriteEndpointLine(out, 'D', e, string_index, &db);
-    for (const EndpointRecord &e : loads)
-      WriteEndpointLine(out, 'L', e, string_index, &db);
-    out << "X\n";
-  }
-  std::vector<std::string> hier_paths;
-  hier_paths.reserve(db.hierarchy.size());
-  for (const auto &[path, _] : db.hierarchy)
-    hier_paths.push_back(path);
-  std::sort(hier_paths.begin(), hier_paths.end());
-  for (const std::string &path : hier_paths) {
-    const auto it = db.hierarchy.find(path);
-    if (it == db.hierarchy.end()) continue;
-    const auto [pfx, leaf] = SplitPathPrefixLeaf(path);
-    const auto pit = string_index.prefix_to_id.find(pfx);
-    if (pit == string_index.prefix_to_id.end()) continue;
-    std::vector<std::string> enc_children;
-    enc_children.reserve(it->second.children.size());
-    for (const std::string &ch : it->second.children)
-      enc_children.push_back(EncodePathToken(ch, string_index));
-    const std::string children_joined = JoinLines(enc_children);
-    out << "I\t" << pit->second << '\t' << EscapeField(leaf) << '\t' << EscapeField(it->second.module) << '\t'
-        << EscapeField(children_joined) << '\n';
-  }
-  std::vector<std::string> global_sources;
-  global_sources.reserve(db.global_nets.size());
-  for (const auto &[path, _] : db.global_nets)
-    global_sources.push_back(path);
-  std::sort(global_sources.begin(), global_sources.end());
-  for (const std::string &source : global_sources) {
-    const auto it = db.global_nets.find(source);
-    if (it == db.global_nets.end()) continue;
-    out << "G\t" << EscapeField(source) << '\t' << EscapeField(it->second.category) << '\t'
-        << EscapeField(JoinLines(it->second.sinks)) << '\n';
-  }
-  return true;
 }
 
 bool IsUnderHierarchyRoot(const std::string &signal, const std::string &root) {
@@ -1414,108 +1409,10 @@ std::vector<std::vector<size_t>> BucketSignalsByPartitions(
   return buckets;
 }
 
-uint32_t RegisterPrefix(V7WriteStringIndex &index, const std::string &prefix) {
-  auto it = index.prefix_to_id.find(prefix);
-  if (it != index.prefix_to_id.end()) return it->second;
-  const uint32_t id = static_cast<uint32_t>(index.prefix_by_id.size());
-  index.prefix_to_id.emplace(prefix, id);
-  index.prefix_by_id.push_back(prefix);
-  return id;
-}
-
-uint32_t RegisterFile(V7WriteStringIndex &index, const std::string &file) {
-  auto it = index.file_to_id.find(file);
-  if (it != index.file_to_id.end()) return it->second;
-  const uint32_t id = static_cast<uint32_t>(index.file_by_id.size());
-  index.file_to_id.emplace(file, id);
-  index.file_by_id.push_back(file);
-  return id;
-}
-
-void WriteEndpointLine(std::ofstream &out, char kind, const EndpointRecord &e, const V7WriteStringIndex &index,
-                       const TraceDb *db) {
-  const std::string &path = (db == nullptr) ? e.path : EndpointPath(*db, e);
-  const std::string &file = (db == nullptr) ? e.file : EndpointFile(*db, e);
-  const auto [prefix, leaf] = SplitPathPrefixLeaf(path);
-  auto pit = index.prefix_to_id.find(prefix);
-  auto fit = index.file_to_id.find(file);
-  if (pit == index.prefix_to_id.end() || fit == index.file_to_id.end()) return;
-  const uint32_t prefix_id = pit->second;
-  const uint32_t file_id = fit->second;
-  out << kind << '\t' << (e.kind == EndpointKind::kPort ? 'P' : 'E') << '\t' << prefix_id << '\t'
-      << EscapeField(leaf) << '\t' << file_id << '\t' << e.line << '\t' << EscapeField(e.direction)
-      << '\t' << EscapeField(e.bit_map) << '\t' << (e.bit_map_approximate ? "1" : "0");
-  if (e.has_assignment_range || !e.assignment_text.empty() || !e.lhs_signals.empty() || !e.rhs_signals.empty()) {
-    std::string lhs_joined;
-    for (size_t i = 0; i < e.lhs_signals.size(); ++i) {
-      if (i != 0) lhs_joined += '\n';
-      lhs_joined += EncodePathToken(e.lhs_signals[i], index);
-    }
-    std::string rhs_joined;
-    for (size_t i = 0; i < e.rhs_signals.size(); ++i) {
-      if (i != 0) rhs_joined += '\n';
-      rhs_joined += EncodePathToken(e.rhs_signals[i], index);
-    }
-    out << '\t' << (e.has_assignment_range ? "1" : "0") << '\t' << e.assignment_start << '\t'
-        << e.assignment_end << '\t' << EscapeField(lhs_joined) << '\t' << EscapeField(rhs_joined);
-  }
-  out << '\n';
-}
-
-void CollectEndpointStrings(const EndpointRecord &e, V7WriteStringIndex &index, const TraceDb *db) {
-  const std::string &path = (db == nullptr) ? e.path : EndpointPath(*db, e);
-  const std::string &file = (db == nullptr) ? e.file : EndpointFile(*db, e);
-  const auto [prefix, _] = SplitPathPrefixLeaf(path);
-  RegisterPrefix(index, prefix);
-  RegisterFile(index, file);
-  for (const std::string &sig : e.lhs_signals) {
-    const auto [pfx, _leaf] = SplitPathPrefixLeaf(sig);
-    RegisterPrefix(index, pfx);
-  }
-  for (const std::string &sig : e.rhs_signals) {
-    const auto [pfx, _leaf] = SplitPathPrefixLeaf(sig);
-    RegisterPrefix(index, pfx);
-  }
-}
-
-void WriteV7StringTables(std::ofstream &out, const V7WriteStringIndex &index) {
-  for (size_t i = 0; i < index.prefix_by_id.size(); ++i) {
-    const std::string &prefix = index.prefix_by_id[i];
-    out << "P\t" << i << '\t' << Fnv1a64(prefix) << '\t' << EscapeField(prefix) << '\n';
-  }
-  for (size_t i = 0; i < index.file_by_id.size(); ++i) {
-    const std::string &file = index.file_by_id[i];
-    out << "F\t" << i << '\t' << Fnv1a64(file) << '\t' << EscapeField(file) << '\n';
-  }
-}
-
-std::string EncodePathToken(const std::string &path, const V7WriteStringIndex &index) {
-  const auto [prefix, leaf] = SplitPathPrefixLeaf(path);
-  const auto it = index.prefix_to_id.find(prefix);
-  if (it == index.prefix_to_id.end()) return path;
-  return std::to_string(it->second) + ":" + leaf;
-}
-
-void WriteGlobalNetLines(std::ofstream &out, const TraceDb &db) {
-  std::vector<std::string> global_sources;
-  global_sources.reserve(db.global_nets.size());
-  for (const auto &[path, _] : db.global_nets)
-    global_sources.push_back(path);
-  std::sort(global_sources.begin(), global_sources.end());
-  for (const std::string &source : global_sources) {
-    const auto it = db.global_nets.find(source);
-    if (it == db.global_nets.end()) continue;
-    out << "G\t" << EscapeField(source) << '\t' << EscapeField(it->second.category) << '\t'
-        << EscapeField(JoinLines(it->second.sinks)) << '\n';
-  }
-}
-
-bool SaveDbStreaming(const std::string &db_path, const std::vector<std::string> &keys,
-                     const std::unordered_map<std::string, const slang::ast::Symbol *> &symbols,
-                     const slang::SourceManager &sm, const TraceDb &hier_db,
-                     const std::vector<PartitionRecord> &parts,
-                     const std::vector<std::vector<size_t>> &buckets, size_t &signal_count,
-                     CompileLogger *logger) {
+bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &keys,
+                 const std::unordered_map<std::string, const slang::ast::Symbol *> &symbols,
+                 const slang::SourceManager &sm, const TraceDb &hier_db, size_t &signal_count,
+                 CompileLogger *logger) {
   using Clock = std::chrono::steady_clock;
   auto fmt_seconds = [](const Clock::time_point &start, const Clock::time_point &end) {
     std::ostringstream os;
@@ -1523,406 +1420,387 @@ bool SaveDbStreaming(const std::string &db_path, const std::vector<std::string> 
        << std::chrono::duration<double>(end - start).count();
     return os.str();
   };
+
   const auto t_total_start = Clock::now();
   if (logger != nullptr) {
-    logger->Log("save_db_streaming: begin keys=" + std::to_string(keys.size()) +
-                " hier_nodes=" + std::to_string(hier_db.hierarchy.size()) +
-                " partitions=" + std::to_string(parts.size()));
+    logger->Log("save_graph_db: begin keys=" + std::to_string(keys.size()) +
+                " hier_nodes=" + std::to_string(hier_db.hierarchy.size()));
   }
 
-  std::ofstream out(db_path);
-  if (!out.is_open()) return false;
-  V7WriteStringIndex string_index;
+  GraphDb graph;
+  std::unordered_map<std::string, uint32_t> string_index;
+  std::unordered_map<uint32_t, std::vector<uint32_t>> load_refs;
+  std::unordered_map<uint32_t, std::vector<uint32_t>> driver_refs;
+  TraceDb compact_db;
   TraceCompileCache trace_cache;
-  auto build_signal_record = [&](const slang::ast::Symbol *sym) -> const SignalRecord & {
-    return GetOrBuildSignalRecord(sym, sm, trace_cache);
+
+  auto intern = [&](const std::string &s) -> uint32_t {
+    return InternString(s, graph.strings, string_index);
   };
-  auto collect_strings_for_signal = [&](const std::string &path) {
+  auto append_signal_refs = [&](const std::vector<std::string> &signals, uint32_t &begin, uint32_t &count) {
+    begin = static_cast<uint32_t>(graph.signal_refs.size());
+    count = static_cast<uint32_t>(signals.size());
+    for (const std::string &sig : signals)
+      graph.signal_refs.push_back(intern(sig));
+  };
+  auto append_endpoint = [&](const EndpointRecord &e) {
+    GraphEndpointRecord ge;
+    ge.path_str_id = intern(e.path);
+    ge.file_str_id = intern(e.file);
+    ge.direction_str_id = e.direction.empty() ? std::numeric_limits<uint32_t>::max() : intern(e.direction);
+    ge.bit_map_str_id = e.bit_map.empty() ? std::numeric_limits<uint32_t>::max() : intern(e.bit_map);
+    ge.line = static_cast<uint32_t>(std::max(e.line, 0));
+    ge.assignment_start = e.assignment_start;
+    ge.assignment_end = e.assignment_end;
+    append_signal_refs(e.lhs_signals, ge.lhs_begin, ge.lhs_count);
+    append_signal_refs(e.rhs_signals, ge.rhs_begin, ge.rhs_count);
+    ge.kind = (e.kind == EndpointKind::kPort) ? 1u : 0u;
+    ge.bit_map_approximate = e.bit_map_approximate ? 1u : 0u;
+    ge.has_assignment_range = e.has_assignment_range ? 1u : 0u;
+    graph.endpoints.push_back(ge);
+  };
+  auto build_signal_record = [&](const slang::ast::Symbol *sym) -> SignalRecord {
+    return BuildSignalRecord(sym, sm, trace_cache);
+  };
+
+  graph.signals.resize(keys.size());
+  for (size_t i = 0; i < keys.size(); ++i)
+    graph.signals[i].name_str_id = intern(keys[i]);
+
+  const auto t_build_start = Clock::now();
+  signal_count = 0;
+  for (size_t sig_id = 0; sig_id < keys.size(); ++sig_id) {
+    const std::string &path = keys[sig_id];
     auto it = symbols.find(path);
-    if (it == symbols.end() || !IsTraceable(it->second)) return;
-    const auto [sig_prefix, _sig_leaf] = SplitPathPrefixLeaf(path);
-    RegisterPrefix(string_index, sig_prefix);
+    if (it == symbols.end() || !IsTraceable(it->second)) continue;
+
     SignalRecord rec = build_signal_record(it->second);
     if (ShouldCompactGlobalNet(path, rec.loads.size())) {
       GlobalNetRecord g;
       g.category = ClassifyGlobalNetCategory(path);
       g.sinks = ExtractCompactSinkPaths(path, rec.loads);
-      if (!g.sinks.empty()) rec.loads.clear();
+      if (!g.sinks.empty()) {
+        for (const std::string &sink : g.sinks)
+          compact_db.global_sink_to_source[sink] = path;
+        compact_db.global_nets.emplace(path, std::move(g));
+        rec.loads.clear();
+      }
     }
-    std::vector<EndpointRecord> drivers = MergeEndpointBitRanges(std::move(rec.drivers));
-    std::vector<EndpointRecord> loads = MergeEndpointBitRanges(std::move(rec.loads));
-    for (const EndpointRecord &e : drivers)
-      CollectEndpointStrings(e, string_index, nullptr);
-    for (const EndpointRecord &e : loads)
-      CollectEndpointStrings(e, string_index, nullptr);
-  };
+    rec.drivers = MergeEndpointBitRanges(std::move(rec.drivers));
+    rec.loads = MergeEndpointBitRanges(std::move(rec.loads));
 
-  const auto t_collect_start = Clock::now();
-  if (parts.empty()) {
-    for (size_t ki : buckets.front())
-      collect_strings_for_signal(keys[ki]);
-  } else {
-    for (size_t p = 0; p < parts.size(); ++p) {
-      for (size_t ki : buckets[p])
-        collect_strings_for_signal(keys[ki]);
+    GraphSignalRecord &gs = graph.signals[sig_id];
+    gs.driver_begin = static_cast<uint32_t>(graph.endpoints.size());
+    gs.driver_count = static_cast<uint32_t>(rec.drivers.size());
+    for (const EndpointRecord &e : rec.drivers) {
+      append_endpoint(e);
+      if (!e.path.empty()) driver_refs[intern(e.path)].push_back(static_cast<uint32_t>(sig_id));
     }
-  }
-  for (const auto &[path, node] : hier_db.hierarchy) {
-    const auto [pfx, _leaf] = SplitPathPrefixLeaf(path);
-    RegisterPrefix(string_index, pfx);
-    for (const std::string &ch : node.children) {
-      const auto [cpfx, _cleaf] = SplitPathPrefixLeaf(ch);
-      RegisterPrefix(string_index, cpfx);
+    gs.load_begin = static_cast<uint32_t>(graph.endpoints.size());
+    gs.load_count = static_cast<uint32_t>(rec.loads.size());
+    for (const EndpointRecord &e : rec.loads) {
+      append_endpoint(e);
+      if (!e.path.empty()) load_refs[intern(e.path)].push_back(static_cast<uint32_t>(sig_id));
     }
+    ++signal_count;
   }
-  const auto t_collect_end = Clock::now();
+  const auto t_build_end = Clock::now();
   if (logger != nullptr) {
-    logger->Log("save_db_streaming: collect_strings done elapsed_s=" +
-                fmt_seconds(t_collect_start, t_collect_end) +
-                " prefixes=" + std::to_string(string_index.prefix_by_id.size()) +
-                " files=" + std::to_string(string_index.file_by_id.size()));
+    logger->Log("save_graph_db: build_graph done elapsed_s=" +
+                fmt_seconds(t_build_start, t_build_end) +
+                " strings=" + std::to_string(graph.strings.size()) +
+                " endpoints=" + std::to_string(graph.endpoints.size()));
   }
 
-  const auto t_header_start = Clock::now();
-  out << "RTL_TRACE_DB_V8\n";
-  WriteV7StringTables(out, string_index);
-  const auto t_header_end = Clock::now();
-  if (logger != nullptr) {
-    logger->Log("save_db_streaming: write_header_tables done elapsed_s=" +
-                fmt_seconds(t_header_start, t_header_end));
-  }
-
-  signal_count = 0;
-  size_t emit_items_total = 0;
-  for (const auto &bucket : buckets)
-    emit_items_total += bucket.size();
-  size_t emit_items_done = 0;
-  const auto t_emit_start = Clock::now();
-  auto t_emit_last_log = t_emit_start;
-  auto maybe_log_emit_progress = [&](bool force) {
-    if (logger == nullptr) return;
-    const auto now = Clock::now();
-    const bool enough_time = std::chrono::duration_cast<std::chrono::seconds>(now - t_emit_last_log).count() >= 30;
-    const bool enough_items = (emit_items_done != 0 && (emit_items_done % 10000 == 0));
-    if (!force && !enough_time && !enough_items) return;
-    t_emit_last_log = now;
-    std::string pct = "n/a";
-    if (emit_items_total != 0) {
-      std::ostringstream os;
-      os << std::fixed << std::setprecision(2)
-         << (100.0 * static_cast<double>(emit_items_done) / static_cast<double>(emit_items_total));
-      pct = os.str();
-    }
-    logger->Log("save_db_streaming: emit progress elapsed_s=" +
-                fmt_seconds(t_emit_start, now) + " items=" + std::to_string(emit_items_done) +
-                "/" + std::to_string(emit_items_total) + " (" + pct + "%) written_signals=" +
-                std::to_string(signal_count));
-  };
-  TraceDb compact_db;
-  size_t compacted_net_count = 0;
-  size_t compacted_sink_count = 0;
-  if (parts.empty()) {
-    if (logger != nullptr) logger->Log("db emit: single partition mode");
-    for (size_t ki : buckets.front()) {
-      ++emit_items_done;
-      const std::string &path = keys[ki];
-      auto it = symbols.find(path);
-      if (it == symbols.end() || !IsTraceable(it->second)) continue;
-      SignalRecord rec = build_signal_record(it->second);
-      if (ShouldCompactGlobalNet(path, rec.loads.size())) {
-        GlobalNetRecord g;
-        g.category = ClassifyGlobalNetCategory(path);
-        g.sinks = ExtractCompactSinkPaths(path, rec.loads);
-        if (!g.sinks.empty()) {
-          compacted_sink_count += g.sinks.size();
-          ++compacted_net_count;
-          for (const std::string &sink : g.sinks)
-            compact_db.global_sink_to_source[sink] = path;
-          compact_db.global_nets.emplace(path, std::move(g));
-          rec.loads.clear();
+  auto finalize_path_refs =
+      [&](std::unordered_map<uint32_t, std::vector<uint32_t>> &src, std::vector<GraphPathRefRange> &ranges,
+          std::vector<uint32_t> &flat) {
+        std::vector<uint32_t> path_ids;
+        path_ids.reserve(src.size());
+        for (const auto &[path_id, _] : src)
+          path_ids.push_back(path_id);
+        std::sort(path_ids.begin(), path_ids.end());
+        for (uint32_t path_id : path_ids) {
+          std::vector<uint32_t> &vec = src[path_id];
+          std::sort(vec.begin(), vec.end());
+          vec.erase(std::unique(vec.begin(), vec.end()), vec.end());
+          GraphPathRefRange range;
+          range.path_str_id = path_id;
+          range.begin = static_cast<uint32_t>(flat.size());
+          range.count = static_cast<uint32_t>(vec.size());
+          flat.insert(flat.end(), vec.begin(), vec.end());
+          ranges.push_back(range);
         }
-      }
-      rec.drivers = MergeEndpointBitRanges(std::move(rec.drivers));
-      rec.loads = MergeEndpointBitRanges(std::move(rec.loads));
-      const auto [sig_prefix, sig_leaf] = SplitPathPrefixLeaf(path);
-      const auto pit = string_index.prefix_to_id.find(sig_prefix);
-      if (pit == string_index.prefix_to_id.end()) continue;
-      out << "S\t" << pit->second << '\t' << EscapeField(sig_leaf) << '\n';
-      for (const EndpointRecord &e : rec.drivers)
-        WriteEndpointLine(out, 'D', e, string_index, nullptr);
-      for (const EndpointRecord &e : rec.loads)
-        WriteEndpointLine(out, 'L', e, string_index, nullptr);
-      out << "X\n";
-      ++signal_count;
-      maybe_log_emit_progress(false);
-    }
-  } else {
-    for (size_t p = 0; p < parts.size(); ++p) {
-      if (logger != nullptr) {
-        logger->Log("db emit: partition " + std::to_string(p + 1) + "/" + std::to_string(parts.size()) +
-                    " root=" + parts[p].root + " planned_signals=" +
-                    std::to_string(parts[p].signal_count) + " assigned=" +
-                    std::to_string(buckets[p].size()));
-      }
-      for (size_t ki : buckets[p]) {
-        ++emit_items_done;
-        const std::string &path = keys[ki];
-        auto it = symbols.find(path);
-        if (it == symbols.end() || !IsTraceable(it->second)) continue;
-        SignalRecord rec = build_signal_record(it->second);
-        if (ShouldCompactGlobalNet(path, rec.loads.size())) {
-          GlobalNetRecord g;
-          g.category = ClassifyGlobalNetCategory(path);
-          g.sinks = ExtractCompactSinkPaths(path, rec.loads);
-          if (!g.sinks.empty()) {
-            compacted_sink_count += g.sinks.size();
-            ++compacted_net_count;
-            for (const std::string &sink : g.sinks)
-              compact_db.global_sink_to_source[sink] = path;
-            compact_db.global_nets.emplace(path, std::move(g));
-            rec.loads.clear();
-          }
-        }
-        rec.drivers = MergeEndpointBitRanges(std::move(rec.drivers));
-        rec.loads = MergeEndpointBitRanges(std::move(rec.loads));
-        const auto [sig_prefix, sig_leaf] = SplitPathPrefixLeaf(path);
-        const auto pit = string_index.prefix_to_id.find(sig_prefix);
-        if (pit == string_index.prefix_to_id.end()) continue;
-        out << "S\t" << pit->second << '\t' << EscapeField(sig_leaf) << '\n';
-        for (const EndpointRecord &e : rec.drivers)
-          WriteEndpointLine(out, 'D', e, string_index, nullptr);
-        for (const EndpointRecord &e : rec.loads)
-          WriteEndpointLine(out, 'L', e, string_index, nullptr);
-        out << "X\n";
-        ++signal_count;
-        maybe_log_emit_progress(false);
-      }
-    }
-  }
-  maybe_log_emit_progress(true);
-  const auto t_emit_end = Clock::now();
-  if (logger != nullptr) {
-    logger->Log("save_db_streaming: emit_signals done elapsed_s=" +
-                fmt_seconds(t_emit_start, t_emit_end) +
-                " written_signals=" + std::to_string(signal_count));
-  }
+      };
+  finalize_path_refs(load_refs, graph.load_ref_ranges, graph.load_ref_signal_ids);
+  finalize_path_refs(driver_refs, graph.driver_ref_ranges, graph.driver_ref_signal_ids);
 
-  const auto t_hier_start = Clock::now();
   std::vector<std::string> hier_paths;
   hier_paths.reserve(hier_db.hierarchy.size());
   for (const auto &[path, _] : hier_db.hierarchy)
     hier_paths.push_back(path);
   std::sort(hier_paths.begin(), hier_paths.end());
+  graph.hierarchy.reserve(hier_paths.size());
   for (const std::string &path : hier_paths) {
     const auto it = hier_db.hierarchy.find(path);
     if (it == hier_db.hierarchy.end()) continue;
-    const auto [pfx, leaf] = SplitPathPrefixLeaf(path);
-    const auto pit = string_index.prefix_to_id.find(pfx);
-    if (pit == string_index.prefix_to_id.end()) continue;
-    std::vector<std::string> enc_children;
-    enc_children.reserve(it->second.children.size());
-    for (const std::string &ch : it->second.children)
-      enc_children.push_back(EncodePathToken(ch, string_index));
-    const std::string children_joined = JoinLines(enc_children);
-    out << "I\t" << pit->second << '\t' << EscapeField(leaf) << '\t' << EscapeField(it->second.module) << '\t'
-        << EscapeField(children_joined) << '\n';
-  }
-  const auto t_hier_end = Clock::now();
-  if (logger != nullptr) {
-    logger->Log("save_db_streaming: write_hierarchy done elapsed_s=" +
-                fmt_seconds(t_hier_start, t_hier_end) +
-                " nodes=" + std::to_string(hier_paths.size()));
+    GraphHierarchyRecord gh;
+    gh.path_str_id = intern(path);
+    gh.module_str_id =
+        it->second.module.empty() ? std::numeric_limits<uint32_t>::max() : intern(it->second.module);
+    gh.child_begin = static_cast<uint32_t>(graph.hierarchy_children.size());
+    gh.child_count = static_cast<uint32_t>(it->second.children.size());
+    for (const std::string &child : it->second.children)
+      graph.hierarchy_children.push_back(intern(child));
+    graph.hierarchy.push_back(gh);
   }
 
-  const auto t_global_start = Clock::now();
-  WriteGlobalNetLines(out, compact_db);
-  const auto t_global_end = Clock::now();
-  if (logger != nullptr) {
-    logger->Log("save_db_streaming: write_global_nets done elapsed_s=" +
-                fmt_seconds(t_global_start, t_global_end) +
-                " nets=" + std::to_string(compact_db.global_nets.size()));
+  std::vector<std::string> global_sources;
+  global_sources.reserve(compact_db.global_nets.size());
+  for (const auto &[path, _] : compact_db.global_nets)
+    global_sources.push_back(path);
+  std::sort(global_sources.begin(), global_sources.end());
+  graph.global_nets.reserve(global_sources.size());
+  for (const std::string &source : global_sources) {
+    const auto it = compact_db.global_nets.find(source);
+    if (it == compact_db.global_nets.end()) continue;
+    GraphGlobalNetRecord gg;
+    gg.source_path_str_id = intern(source);
+    gg.category_str_id = it->second.category.empty() ? std::numeric_limits<uint32_t>::max()
+                                                     : intern(it->second.category);
+    gg.sink_begin = static_cast<uint32_t>(graph.global_sinks.size());
+    gg.sink_count = static_cast<uint32_t>(it->second.sinks.size());
+    for (const std::string &sink : it->second.sinks)
+      graph.global_sinks.push_back(intern(sink));
+    graph.global_nets.push_back(gg);
   }
-  if (logger != nullptr && compacted_net_count != 0) {
-    logger->Log("global-net compaction: nets=" + std::to_string(compacted_net_count) +
-                " sinks=" + std::to_string(compacted_sink_count));
+
+  std::vector<uint32_t> string_offsets;
+  string_offsets.reserve(graph.strings.size() + 1);
+  std::string string_blob;
+  for (const std::string &s : graph.strings) {
+    string_offsets.push_back(static_cast<uint32_t>(string_blob.size()));
+    string_blob += s;
   }
+  string_offsets.push_back(static_cast<uint32_t>(string_blob.size()));
+
+  GraphDbFileHeader header;
+  std::memcpy(header.magic, kGraphDbMagic, sizeof(header.magic));
+  header.string_count = graph.strings.size();
+  header.string_blob_size = string_blob.size();
+  header.signal_count = graph.signals.size();
+  header.endpoint_count = graph.endpoints.size();
+  header.signal_ref_count = graph.signal_refs.size();
+  header.load_ref_range_count = graph.load_ref_ranges.size();
+  header.load_ref_count = graph.load_ref_signal_ids.size();
+  header.driver_ref_range_count = graph.driver_ref_ranges.size();
+  header.driver_ref_count = graph.driver_ref_signal_ids.size();
+  header.hierarchy_count = graph.hierarchy.size();
+  header.hierarchy_child_count = graph.hierarchy_children.size();
+  header.global_net_count = graph.global_nets.size();
+  header.global_sink_count = graph.global_sinks.size();
+
+  const auto t_write_start = Clock::now();
+  std::ofstream out(db_path, std::ios::binary | std::ios::trunc);
+  if (!out.is_open()) return false;
+  if (!WriteBinaryValue(out, header) || !WriteBinaryVector(out, string_offsets)) return false;
+  out.write(string_blob.data(), static_cast<std::streamsize>(string_blob.size()));
+  if (!out.good()) return false;
+  if (!WriteBinaryVector(out, graph.signals) || !WriteBinaryVector(out, graph.endpoints) ||
+      !WriteBinaryVector(out, graph.signal_refs) || !WriteBinaryVector(out, graph.load_ref_ranges) ||
+      !WriteBinaryVector(out, graph.load_ref_signal_ids) || !WriteBinaryVector(out, graph.driver_ref_ranges) ||
+      !WriteBinaryVector(out, graph.driver_ref_signal_ids) || !WriteBinaryVector(out, graph.hierarchy) ||
+      !WriteBinaryVector(out, graph.hierarchy_children) || !WriteBinaryVector(out, graph.global_nets) ||
+      !WriteBinaryVector(out, graph.global_sinks)) {
+    return false;
+  }
+  const auto t_write_end = Clock::now();
   if (logger != nullptr) {
-    logger->Log("save_db_streaming: done elapsed_s=" +
+    logger->Log("save_graph_db: write_file done elapsed_s=" +
+                fmt_seconds(t_write_start, t_write_end));
+    logger->Log("save_graph_db: done elapsed_s=" +
                 fmt_seconds(t_total_start, Clock::now()));
   }
   return true;
 }
 
-bool LoadDb(const std::string &db_path, TraceDb &db) {
-  std::ifstream in(db_path);
+bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db) {
+  std::ifstream in(db_path, std::ios::binary);
   if (!in.is_open()) return false;
-  db.db_dir = std::filesystem::path(db_path).parent_path().string();
 
-  std::string line;
-  if (!std::getline(in, line)) return false;
-  const bool is_v7 = (line == "RTL_TRACE_DB_V7");
-  const bool is_v8 = (line == "RTL_TRACE_DB_V8");
-  if (!is_v7 && !is_v8) return false;
+  GraphDbFileHeader header;
+  if (!ReadBinaryValue(in, header)) return false;
+  if (std::memcmp(header.magic, kGraphDbMagic, sizeof(header.magic)) != 0) return false;
+  if (header.version != 1) return false;
 
-  SignalRecord *current = nullptr;
-  std::vector<std::string> prefix_dict;
-  std::vector<std::string> file_dict;
-  std::unordered_map<std::string, uint32_t> path_index;
-  std::unordered_map<std::string, uint32_t> file_index;
-  auto decode_path_token = [&](const std::string &token) -> std::string {
-    const size_t sep = token.find(':');
-    if (sep == std::string::npos) return token;
-    try {
-      const size_t pid = static_cast<size_t>(std::stoul(token.substr(0, sep)));
-      if (pid >= prefix_dict.size()) return token;
-      const std::string leaf = token.substr(sep + 1);
-      if (prefix_dict[pid].empty()) return leaf;
-      return prefix_dict[pid] + "." + leaf;
-    } catch (...) { return token; }
-  };
-  while (std::getline(in, line)) {
-    if (line.empty()) continue;
-    const std::vector<std::string> fields = SplitEscapedTsv(line);
-    if (fields.empty()) continue;
-    if (fields[0] == "P") {
-      if (fields.size() < 4) return false;
-      const size_t id = static_cast<size_t>(std::stoul(fields[1]));
-      if (id >= prefix_dict.size()) prefix_dict.resize(id + 1);
-      prefix_dict[id] = fields[3];
-      continue;
-    }
-    if (fields[0] == "F") {
-      if (fields.size() < 4) return false;
-      const size_t id = static_cast<size_t>(std::stoul(fields[1]));
-      if (id >= file_dict.size()) file_dict.resize(id + 1);
-      file_dict[id] = fields[3];
-      continue;
-    }
-    if (fields[0] == "S") {
-      std::string signal_name;
-      if (fields.size() == 2) {
-        signal_name = fields[1];
-      } else if (fields.size() == 3) {
-        const size_t prefix_id = static_cast<size_t>(std::stoul(fields[1]));
-        if (prefix_id >= prefix_dict.size()) return false;
-        signal_name = prefix_dict[prefix_id].empty() ? fields[2] : (prefix_dict[prefix_id] + "." + fields[2]);
-      } else {
-        return false;
-      }
-      auto [it, inserted] = db.signals.emplace(signal_name, SignalRecord{});
-      current = &it->second;
-      continue;
-    }
-    if (fields[0] == "X") {
-      current = nullptr;
-      continue;
-    }
-    if ((fields[0] == "D" || fields[0] == "L") && current != nullptr) {
-      if (fields.size() < 9) return false;
-      EndpointRecord e;
-      e.kind = fields[1] == "P" ? EndpointKind::kPort : EndpointKind::kExpr;
-      const size_t prefix_id = static_cast<size_t>(std::stoul(fields[2]));
-      const std::string &leaf = fields[3];
-      const size_t file_id = static_cast<size_t>(std::stoul(fields[4]));
-      if (prefix_id >= prefix_dict.size() || file_id >= file_dict.size()) return false;
-      const std::string &prefix = prefix_dict[prefix_id];
-      const std::string full_path = prefix.empty() ? leaf : (prefix + "." + leaf);
-      e.path_id = InternString(full_path, db.path_pool, path_index);
-      e.file_id = InternString(file_dict[file_id], db.file_pool, file_index);
-      e.line = std::stoi(fields[5]);
-      e.direction = fields[6];
-      size_t next_field = 7;
-      if (fields.size() > next_field) e.bit_map = fields[next_field];
-      if (fields.size() > next_field + 1) e.bit_map_approximate = (fields[next_field + 1] == "1");
-      next_field += 2;
-      if (is_v8) {
-        if (fields.size() > next_field) e.has_assignment_range = (fields[next_field] == "1");
-        if (fields.size() > next_field + 1) e.assignment_start = static_cast<uint32_t>(std::stoul(fields[next_field + 1]));
-        if (fields.size() > next_field + 2) e.assignment_end = static_cast<uint32_t>(std::stoul(fields[next_field + 2]));
-        if (fields.size() > next_field + 3 && !fields[next_field + 3].empty()) {
-          e.lhs_signals = SplitJoinedField(fields[next_field + 3]);
-          for (std::string &sig : e.lhs_signals)
-            sig = decode_path_token(sig);
-        }
-        if (fields.size() > next_field + 4 && !fields[next_field + 4].empty()) {
-          e.rhs_signals = SplitJoinedField(fields[next_field + 4]);
-          for (std::string &sig : e.rhs_signals)
-            sig = decode_path_token(sig);
-        }
-      } else {
-        if (fields.size() > next_field) {
-          e.assignment_text = fields[next_field];
-        }
-        if (fields.size() > next_field + 1 && !fields[next_field + 1].empty()) {
-          e.lhs_signals = SplitJoinedField(fields[next_field + 1]);
-          for (std::string &sig : e.lhs_signals)
-            sig = decode_path_token(sig);
-        }
-        const size_t rhs_index = next_field + 2;
-        if (fields.size() > rhs_index && !fields[rhs_index].empty()) {
-          e.rhs_signals = SplitJoinedField(fields[rhs_index]);
-          for (std::string &sig : e.rhs_signals)
-            sig = decode_path_token(sig);
-        }
-      }
-      if (fields[0] == "D") {
-        current->drivers.push_back(std::move(e));
-      } else {
-        current->loads.push_back(std::move(e));
-      }
-      continue;
-    }
-    if (fields[0] == "I") {
-      std::string node_path;
-      size_t module_index = 2;
-      size_t children_index = 3;
-      if (fields.size() >= 4) {
-        bool compressed = false;
-        size_t consumed = 0;
-        size_t prefix_id = 0;
-        try {
-          prefix_id = static_cast<size_t>(std::stoul(fields[1], &consumed));
-          compressed = (consumed == fields[1].size());
-        } catch (...) { compressed = false; }
-        if (compressed) {
-          if (prefix_id >= prefix_dict.size()) return false;
-          node_path = prefix_dict[prefix_id].empty() ? fields[2] : (prefix_dict[prefix_id] + "." + fields[2]);
-          module_index = 3;
-          children_index = 4;
-        } else {
-          node_path = fields[1];
-        }
-      } else if (fields.size() == 2) {
-        node_path = fields[1];
-      } else {
-        return false;
-      }
-      auto &node = db.hierarchy[node_path];
-      if (fields.size() > module_index) node.module = fields[module_index];
-      if (fields.size() > children_index && !fields[children_index].empty()) {
-        node.children = SplitJoinedField(fields[children_index]);
-        for (std::string &child : node.children)
-          child = decode_path_token(child);
-      }
-      continue;
-    }
-    if (fields[0] == "G") {
-      if (fields.size() < 4) return false;
-      auto &rec = db.global_nets[fields[1]];
-      rec.category = fields[2];
-      rec.sinks = SplitJoinedField(fields[3]);
-      for (const std::string &sink : rec.sinks) {
-        if (!sink.empty()) db.global_sink_to_source[sink] = fields[1];
-      }
-      continue;
-    }
+  std::vector<uint32_t> string_offsets;
+  if (!ReadBinaryVector(in, string_offsets, static_cast<size_t>(header.string_count + 1))) return false;
+  std::string string_blob(header.string_blob_size, '\0');
+  if (header.string_blob_size != 0) {
+    in.read(string_blob.data(), static_cast<std::streamsize>(string_blob.size()));
+    if (!in.good()) return false;
+  }
+  graph.strings.resize(static_cast<size_t>(header.string_count));
+  for (size_t i = 0; i < graph.strings.size(); ++i) {
+    const size_t start = string_offsets[i];
+    const size_t end = string_offsets[i + 1];
+    if (end < start || end > string_blob.size()) return false;
+    graph.strings[i] = string_blob.substr(start, end - start);
+  }
+
+  if (!ReadBinaryVector(in, graph.signals, static_cast<size_t>(header.signal_count)) ||
+      !ReadBinaryVector(in, graph.endpoints, static_cast<size_t>(header.endpoint_count)) ||
+      !ReadBinaryVector(in, graph.signal_refs, static_cast<size_t>(header.signal_ref_count)) ||
+      !ReadBinaryVector(in, graph.load_ref_ranges, static_cast<size_t>(header.load_ref_range_count)) ||
+      !ReadBinaryVector(in, graph.load_ref_signal_ids, static_cast<size_t>(header.load_ref_count)) ||
+      !ReadBinaryVector(in, graph.driver_ref_ranges, static_cast<size_t>(header.driver_ref_range_count)) ||
+      !ReadBinaryVector(in, graph.driver_ref_signal_ids, static_cast<size_t>(header.driver_ref_count)) ||
+      !ReadBinaryVector(in, graph.hierarchy, static_cast<size_t>(header.hierarchy_count)) ||
+      !ReadBinaryVector(in, graph.hierarchy_children, static_cast<size_t>(header.hierarchy_child_count)) ||
+      !ReadBinaryVector(in, graph.global_nets, static_cast<size_t>(header.global_net_count)) ||
+      !ReadBinaryVector(in, graph.global_sinks, static_cast<size_t>(header.global_sink_count))) {
     return false;
   }
-  for (auto &[_, node] : db.hierarchy) {
-    std::sort(node.children.begin(), node.children.end());
-    node.children.erase(std::unique(node.children.begin(), node.children.end()), node.children.end());
+
+  compat_db.db_dir = std::filesystem::path(db_path).parent_path().string();
+  compat_db.signals.clear();
+  compat_db.hierarchy.clear();
+  compat_db.global_nets.clear();
+  compat_db.global_sink_to_source.clear();
+
+  graph.load_ref_index.clear();
+  graph.driver_ref_index.clear();
+  for (size_t i = 0; i < graph.load_ref_ranges.size(); ++i)
+    graph.load_ref_index.emplace(graph.load_ref_ranges[i].path_str_id, i);
+  for (size_t i = 0; i < graph.driver_ref_ranges.size(); ++i)
+    graph.driver_ref_index.emplace(graph.driver_ref_ranges[i].path_str_id, i);
+
+  for (const GraphHierarchyRecord &gh : graph.hierarchy) {
+    const std::string &path = GraphString(graph, gh.path_str_id);
+    auto &node = compat_db.hierarchy[path];
+    node.module = GraphString(graph, gh.module_str_id);
+    node.children.reserve(gh.child_count);
+    for (uint32_t i = 0; i < gh.child_count; ++i)
+      node.children.push_back(GraphString(graph, graph.hierarchy_children[gh.child_begin + i]));
+  }
+  for (const GraphGlobalNetRecord &gg : graph.global_nets) {
+    const std::string &source = GraphString(graph, gg.source_path_str_id);
+    auto &rec = compat_db.global_nets[source];
+    rec.category = GraphString(graph, gg.category_str_id);
+    rec.sinks.reserve(gg.sink_count);
+    for (uint32_t i = 0; i < gg.sink_count; ++i) {
+      const std::string &sink = GraphString(graph, graph.global_sinks[gg.sink_begin + i]);
+      rec.sinks.push_back(sink);
+      compat_db.global_sink_to_source[sink] = source;
+    }
   }
   return true;
+}
+
+std::string StatMtimeString(const std::string &path) {
+  std::error_code ec;
+  const auto ts = std::filesystem::last_write_time(path, ec);
+  if (ec) return "";
+  return std::to_string(ts.time_since_epoch().count());
+}
+
+void BuildSessionSignalIndex(TraceSession &session) {
+  if (session.signal_index_ready) return;
+  session.signal_name_to_id.clear();
+  session.signal_names_by_id.clear();
+  GraphDb &graph = *session.graph;
+  session.signal_name_to_id.reserve(graph.signals.size());
+  session.signal_names_by_id.reserve(graph.signals.size());
+  for (uint32_t i = 0; i < graph.signals.size(); ++i) {
+    const std::string &name = GraphString(graph, graph.signals[i].name_str_id);
+    session.signal_name_to_id.emplace(std::string_view(name), i);
+    session.signal_names_by_id.push_back(&name);
+  }
+  session.signal_index_ready = true;
+}
+
+void EnsureSessionHierarchy(TraceSession &session) {
+  if (session.hierarchy_ready) return;
+  BuildHierarchyFromSignals(session.db);
+  session.hierarchy_ready = true;
+}
+
+void BuildSessionReverseRefs(TraceSession &session) {
+  if (session.reverse_refs_ready) return;
+  session.reverse_refs_ready = true;
+}
+
+bool OpenTraceSession(const std::string &db_path, TraceSession &session, uint32_t flags) {
+  TraceSession fresh;
+  fresh.db_path = db_path;
+  fresh.db_mtime = StatMtimeString(db_path);
+  GraphDb graph;
+  if (!LoadGraphDb(db_path, graph, fresh.db)) return false;
+  fresh.graph = std::move(graph);
+  session = std::move(fresh);
+  BuildSessionSignalIndex(session);
+  if (flags & kSessionHierarchy) EnsureSessionHierarchy(session);
+  if (flags & kSessionReverseRefs) BuildSessionReverseRefs(session);
+  return true;
+}
+
+std::optional<uint32_t> LookupSignalId(const TraceSession &session, std::string_view name) {
+  auto it = session.signal_name_to_id.find(name);
+  if (it == session.signal_name_to_id.end()) return std::nullopt;
+  return it->second;
+}
+
+const std::string &SessionSignalName(const TraceSession &session, uint32_t id) {
+  return *session.signal_names_by_id[id];
+}
+
+const SignalRecord &SessionSignalRecord(TraceSession &session, uint32_t id) {
+  auto cached = session.materialized_signal_records.find(id);
+  if (cached != session.materialized_signal_records.end()) return cached->second;
+  const GraphDb &graph = *session.graph;
+  const GraphSignalRecord &gs = graph.signals[id];
+  SignalRecord rec;
+  auto materialize_endpoint = [&](const GraphEndpointRecord &ge) {
+    EndpointRecord e;
+    e.kind = (ge.kind == 1u) ? EndpointKind::kPort : EndpointKind::kExpr;
+    e.path = GraphString(graph, ge.path_str_id);
+    e.file = GraphString(graph, ge.file_str_id);
+    e.path_id = ge.path_str_id;
+    e.file_id = ge.file_str_id;
+    e.line = static_cast<int>(ge.line);
+    e.direction = GraphString(graph, ge.direction_str_id);
+    e.bit_map = GraphString(graph, ge.bit_map_str_id);
+    e.bit_map_approximate = (ge.bit_map_approximate != 0);
+    e.has_assignment_range = (ge.has_assignment_range != 0);
+    e.assignment_start = ge.assignment_start;
+    e.assignment_end = ge.assignment_end;
+    e.lhs_signals.reserve(ge.lhs_count);
+    for (uint32_t i = 0; i < ge.lhs_count; ++i)
+      e.lhs_signals.push_back(GraphString(graph, graph.signal_refs[ge.lhs_begin + i]));
+    e.rhs_signals.reserve(ge.rhs_count);
+    for (uint32_t i = 0; i < ge.rhs_count; ++i)
+      e.rhs_signals.push_back(GraphString(graph, graph.signal_refs[ge.rhs_begin + i]));
+    return e;
+  };
+  rec.drivers.reserve(gs.driver_count);
+  for (uint32_t i = 0; i < gs.driver_count; ++i)
+    rec.drivers.push_back(materialize_endpoint(graph.endpoints[gs.driver_begin + i]));
+  rec.loads.reserve(gs.load_count);
+  for (uint32_t i = 0; i < gs.load_count; ++i)
+    rec.loads.push_back(materialize_endpoint(graph.endpoints[gs.load_begin + i]));
+  return session.materialized_signal_records.emplace(id, std::move(rec)).first->second;
+}
+
+std::vector<uint32_t> SessionBridgeRefs(const TraceSession &session, bool use_load_refs,
+                                        uint32_t path_id) {
+  const GraphDb &graph = *session.graph;
+  const auto &index = use_load_refs ? graph.load_ref_index : graph.driver_ref_index;
+  const auto &ranges = use_load_refs ? graph.load_ref_ranges : graph.driver_ref_ranges;
+  const auto &flat = use_load_refs ? graph.load_ref_signal_ids : graph.driver_ref_signal_ids;
+  auto it = index.find(path_id);
+  if (it == index.end()) return {};
+  const GraphPathRefRange &range = ranges[it->second];
+  return std::vector<uint32_t>(flat.begin() + range.begin, flat.begin() + range.begin + range.count);
 }
 
 bool HasTimescaleArg(const std::vector<std::string> &args) {
@@ -2375,6 +2253,49 @@ void PrintGeneralHelp() {
                "[--max-nodes <N>] [--format <text|json>]\n";
   std::cout << "  rtl_trace find --db <file> --query <text|regex> [--regex] [--limit <N>] "
                "[--format <text|json>]\n";
+  std::cout << "  rtl_trace serve [--db <file>]\n";
+}
+
+void PrintTraceHelp() {
+  std::cout << "Usage: rtl_trace trace --db <file> --mode <drivers|loads> --signal "
+               "<hier.path|hier.path[bit]|hier.path[msb:lsb]> "
+               "[--cone-level <N>] [--prefer-port-hop] [--depth <N>] [--max-nodes <N>] "
+               "[--include <regex>] [--exclude <regex>] [--stop-at <regex>] "
+               "[--format <text|json>]\n";
+}
+
+void PrintHierHelp() {
+  std::cout << "Usage: rtl_trace hier --db <file> [--root <hier.path>] [--depth <N>] "
+               "[--max-nodes <N>] [--format <text|json>]\n";
+}
+
+void PrintFindHelp() {
+  std::cout << "Usage: rtl_trace find --db <file> --query <text|regex> [--regex] [--limit <N>] "
+               "[--format <text|json>]\n";
+}
+
+void PrintServeHelp() {
+  std::cout << "Usage: rtl_trace serve [--db <file>]\n\n";
+  std::cout << "Interactive commands:\n";
+  std::cout << "  status\n";
+  std::cout << "  open --db <file>\n";
+  std::cout << "  reload\n";
+  std::cout << "  close\n";
+  std::cout << "  find --query <text> [--regex] [--limit <N>] [--format <text|json>]\n";
+  std::cout << "  trace --mode <drivers|loads> --signal <hier.path> [trace options]\n";
+  std::cout << "  hier [--root <hier.path>] [--depth <N>] [--max-nodes <N>] [--format <text|json>]\n";
+  std::cout << "  quit\n";
+  std::cout << "\nEach response is followed by a line containing <<END>>.\n";
+}
+
+enum class ParseStatus { kOk, kExitSuccess, kError };
+
+std::vector<std::string> ArgvToVector(int argc, char *argv[]) {
+  std::vector<std::string> out;
+  out.reserve(static_cast<size_t>(argc));
+  for (int i = 0; i < argc; ++i)
+    out.emplace_back(argv[i]);
+  return out;
 }
 
 int RunCompile(int argc, char *argv[]) {
@@ -2584,8 +2505,7 @@ int RunCompile(int argc, char *argv[]) {
 
   logger.Log("step: emit db");
   size_t written_signal_count = 0;
-  if (!SaveDbStreaming(db_path, keys, symbols, sm, hier_db, parts, buckets, written_signal_count,
-                       &logger)) {
+  if (!SaveGraphDb(db_path, keys, symbols, sm, hier_db, written_signal_count, &logger)) {
     std::cerr << "Failed to write DB: " << db_path << "\n";
     return 1;
   }
@@ -2597,11 +2517,12 @@ int RunCompile(int argc, char *argv[]) {
   return 0;
 }
 
-std::vector<std::string> TopSuggestions(const TraceDb &db, const std::string &needle, size_t limit) {
+std::vector<std::string> TopSuggestions(const TraceSession &session, const std::string &needle,
+                                        size_t limit) {
   std::vector<std::pair<size_t, std::string>> scored;
-  scored.reserve(db.signals.size());
-  for (const auto &[name, _] : db.signals) {
-    scored.push_back({EditDistance(name, needle), name});
+  scored.reserve(session.signal_names_by_id.size());
+  for (const std::string *name : session.signal_names_by_id) {
+    scored.push_back({EditDistance(*name, needle), *name});
   }
   std::sort(scored.begin(), scored.end(), [](const auto &a, const auto &b) {
     if (a.first != b.first) return a.first < b.first;
@@ -2626,16 +2547,15 @@ std::string ResolveSourcePath(const TraceDb &db, const std::string &file) {
   return p.string();
 }
 
-std::string FetchSourceSlice(const TraceDb &db, const EndpointRecord &e,
-                             std::unordered_map<std::string, std::string> &cache) {
+std::string FetchSourceSlice(TraceSession &session, const EndpointRecord &e) {
   if (!e.has_assignment_range || e.assignment_end <= e.assignment_start) return "";
-  const std::string resolved = ResolveSourcePath(db, EndpointFile(db, e));
-  auto it = cache.find(resolved);
-  if (it == cache.end()) {
+  const std::string resolved = ResolveSourcePath(session.db, EndpointFile(session.db, e));
+  auto it = session.source_file_cache.find(resolved);
+  if (it == session.source_file_cache.end()) {
     std::ifstream in(resolved);
     if (!in.is_open()) return "";
     std::string data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    it = cache.emplace(resolved, std::move(data)).first;
+    it = session.source_file_cache.emplace(resolved, std::move(data)).first;
   }
   const std::string &text = it->second;
   const size_t start = static_cast<size_t>(e.assignment_start);
@@ -2644,13 +2564,12 @@ std::string FetchSourceSlice(const TraceDb &db, const EndpointRecord &e,
   return text.substr(start, end - start);
 }
 
-void MaterializeAssignmentTexts(const TraceDb &db, TraceRunResult &result) {
-  std::unordered_map<std::string, std::string> file_cache;
+void MaterializeAssignmentTexts(TraceSession &session, TraceRunResult &result) {
   for (EndpointRecord &e : result.endpoints) {
     if (e.kind != EndpointKind::kExpr) continue;
     if (!e.assignment_text.empty()) continue;
     if (!e.has_assignment_range) continue;
-    e.assignment_text = FetchSourceSlice(db, e, file_cache);
+    e.assignment_text = FetchSourceSlice(session, e);
   }
 }
 
@@ -2777,37 +2696,19 @@ std::optional<TraceRunResult> TryRunGlobalNetFastPath(const TraceDb &db, const T
   return result;
 }
 
-TraceRunResult RunTraceQuery(const TraceDb &db, const TraceOptions &opts) {
+TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
+  const TraceDb &db = session.db;
   if (std::optional<TraceRunResult> fast = TryRunGlobalNetFastPath(db, opts)) {
     return *fast;
   }
   TraceRunResult result;
-
-  std::unordered_map<std::string, std::vector<std::string>> load_refs;
-  std::unordered_map<std::string, std::vector<std::string>> driver_refs;
-  for (const auto &[name, record] : db.signals) {
-    for (const EndpointRecord &e : record.loads) {
-      load_refs[EndpointPath(db, e)].push_back(name);
-    }
-    for (const EndpointRecord &e : record.drivers) {
-      driver_refs[EndpointPath(db, e)].push_back(name);
-    }
-  }
-  auto dedup_refs = [](std::unordered_map<std::string, std::vector<std::string>> &refs) {
-    for (auto &[_, vec] : refs) {
-      std::sort(vec.begin(), vec.end());
-      vec.erase(std::unique(vec.begin(), vec.end()), vec.end());
-    }
-  };
-  dedup_refs(load_refs);
-  dedup_refs(driver_refs);
 
   const bool is_drivers_mode = (opts.mode == "drivers");
   std::vector<EndpointRecord> logic_endpoints;
   std::vector<EndpointRecord> unresolved_ports;
   std::unordered_set<std::string> seen_logic;
   std::unordered_set<std::string> seen_ports;
-  std::unordered_set<std::string> visited_signals;
+  std::unordered_set<uint32_t> visited_signals;
   std::unordered_set<std::string> stop_once;
   bool node_cap_hit = false;
 
@@ -2825,8 +2726,19 @@ TraceRunResult RunTraceQuery(const TraceDb &db, const TraceOptions &opts) {
     return true;
   };
 
-  std::function<void(const std::string &, size_t, size_t)> walk_signal =
-      [&](const std::string &sig, size_t depth, size_t cone_depth) {
+  std::function<void(uint32_t, size_t, size_t)> walk_signal;
+  std::function<void(std::string_view, size_t, size_t)> walk_signal_name =
+      [&](std::string_view sig_name, size_t depth, size_t cone_depth) {
+        std::optional<uint32_t> sig_id = LookupSignalId(session, sig_name);
+        if (!sig_id.has_value()) {
+          record_stop(std::string(sig_name), "missing_signal", "not-in-db", depth);
+          return;
+        }
+        walk_signal(*sig_id, depth, cone_depth);
+      };
+
+  walk_signal = [&](uint32_t sig_id, size_t depth, size_t cone_depth) {
+        const std::string &sig = SessionSignalName(session, sig_id);
         if (depth > opts.depth_limit) {
           record_stop(sig, "depth_limit", "max-depth-reached", depth);
           return;
@@ -2837,7 +2749,7 @@ TraceRunResult RunTraceQuery(const TraceDb &db, const TraceOptions &opts) {
           record_stop(sig, "node_limit", "max-nodes-reached", depth);
           return;
         }
-        if (!visited_signals.insert(sig).second) {
+        if (!visited_signals.insert(sig_id).second) {
           record_stop(sig, "cycle", "already-visited", depth);
           return;
         }
@@ -2845,14 +2757,9 @@ TraceRunResult RunTraceQuery(const TraceDb &db, const TraceOptions &opts) {
           record_stop(sig, "stop_at", "matched-stop-at-regex", depth);
           return;
         }
-        const auto rec_it = db.signals.find(sig);
-        if (rec_it == db.signals.end()) {
-          record_stop(sig, "missing_signal", "not-in-db", depth);
-          return;
-        }
-
+        const SignalRecord &record = SessionSignalRecord(session, sig_id);
         const std::vector<EndpointRecord> &edges =
-            is_drivers_mode ? rec_it->second.drivers : rec_it->second.loads;
+            is_drivers_mode ? record.drivers : record.loads;
 
         for (const EndpointRecord &e : edges) {
           const std::string &e_path = EndpointPath(db, e);
@@ -2873,17 +2780,19 @@ TraceRunResult RunTraceQuery(const TraceDb &db, const TraceOptions &opts) {
               if (next_signals.empty()) {
                 bool expanded = false;
                 if (opts.prefer_port_hop) {
-                  const auto next_it = db.signals.find(e_path);
-                  if (next_it != db.signals.end() && e_path != sig) {
-                    walk_signal(e_path, depth + 1, cone_depth + 1);
-                    expanded = true;
+                  if (e_path != sig) {
+                    std::optional<uint32_t> direct_id = LookupSignalId(session, e_path);
+                    if (direct_id.has_value()) {
+                      walk_signal(*direct_id, depth + 1, cone_depth + 1);
+                      expanded = true;
+                    }
                   }
-                  const auto &bridge_refs = is_drivers_mode ? load_refs : driver_refs;
-                  const auto bridge_it = bridge_refs.find(e_path);
-                  if (bridge_it != bridge_refs.end()) {
-                    for (const std::string &next_sig : bridge_it->second) {
-                      if (next_sig == sig) continue;
-                      walk_signal(next_sig, depth + 1, cone_depth + 1);
+                  const std::vector<uint32_t> bridge_refs =
+                      SessionBridgeRefs(session, is_drivers_mode, e.path_id);
+                  if (!bridge_refs.empty()) {
+                    for (uint32_t next_sig_id : bridge_refs) {
+                      if (next_sig_id == sig_id) continue;
+                      walk_signal(next_sig_id, depth + 1, cone_depth + 1);
                       expanded = true;
                     }
                   }
@@ -2892,7 +2801,7 @@ TraceRunResult RunTraceQuery(const TraceDb &db, const TraceOptions &opts) {
               } else {
                 for (const std::string &next_sig : next_signals) {
                   if (next_sig == sig) continue;
-                  walk_signal(next_sig, depth + 1, cone_depth + 1);
+                  walk_signal_name(next_sig, depth + 1, cone_depth + 1);
                 }
               }
             } else if (!e.rhs_signals.empty() || !e.lhs_signals.empty()) {
@@ -2903,19 +2812,19 @@ TraceRunResult RunTraceQuery(const TraceDb &db, const TraceOptions &opts) {
 
           bool expanded = false;
           if (e_path != sig) {
-            const auto next_it = db.signals.find(e_path);
-            if (next_it != db.signals.end()) {
-              walk_signal(e_path, depth + 1, cone_depth);
+            std::optional<uint32_t> direct_id = LookupSignalId(session, e_path);
+            if (direct_id.has_value()) {
+              walk_signal(*direct_id, depth + 1, cone_depth);
               expanded = true;
             }
           }
 
-          const auto &bridge_refs = is_drivers_mode ? load_refs : driver_refs;
-          const auto bridge_it = bridge_refs.find(e_path);
-          if (bridge_it != bridge_refs.end()) {
-            for (const std::string &next_sig : bridge_it->second) {
-              if (next_sig == sig) continue;
-              walk_signal(next_sig, depth + 1, cone_depth);
+          const std::vector<uint32_t> bridge_refs =
+              SessionBridgeRefs(session, is_drivers_mode, e.path_id);
+          if (!bridge_refs.empty()) {
+            for (uint32_t next_sig_id : bridge_refs) {
+              if (next_sig_id == sig_id) continue;
+              walk_signal(next_sig_id, depth + 1, cone_depth);
               expanded = true;
             }
           }
@@ -2931,7 +2840,7 @@ TraceRunResult RunTraceQuery(const TraceDb &db, const TraceOptions &opts) {
         }
       };
 
-  walk_signal(opts.root_signal, 0, 0);
+  walk_signal_name(opts.root_signal, 0, 0);
   result.visited_count = visited_signals.size();
   result.endpoints = logic_endpoints.empty() ? unresolved_ports : logic_endpoints;
   std::sort(result.endpoints.begin(), result.endpoints.end(),
@@ -2960,84 +2869,82 @@ TraceRunResult RunTraceQuery(const TraceDb &db, const TraceOptions &opts) {
   return result;
 }
 
-int RunTrace(int argc, char *argv[]) {
-  std::optional<std::string> db_path;
-  TraceOptions opts;
-
-  for (int i = 0; i < argc; ++i) {
-    const std::string arg = argv[i];
+ParseStatus ParseTraceArgs(const std::vector<std::string> &args, std::optional<std::string> *db_path,
+                           TraceOptions &opts, bool require_db) {
+  opts = TraceOptions{};
+  for (size_t i = 0; i < args.size(); ++i) {
+    const std::string &arg = args[i];
     if (arg == "-h" || arg == "--help") {
-      std::cout << "Usage: rtl_trace trace --db <file> --mode <drivers|loads> --signal "
-                   "<hier.path|hier.path[bit]|hier.path[msb:lsb]> "
-                   "[--cone-level <N>] "
-                   "[--prefer-port-hop] "
-                   "[--depth <N>] [--max-nodes <N>] [--include <regex>] [--exclude <regex>] "
-                   "[--stop-at <regex>] [--format <text|json>]\n";
-      return 0;
+      PrintTraceHelp();
+      return ParseStatus::kExitSuccess;
     }
     if (arg == "--db") {
-      if (i + 1 >= argc) {
-        std::cerr << "Missing value for --db\n";
-        return 1;
+      if (db_path == nullptr) {
+        std::cerr << "--db is not accepted in this context\n";
+        return ParseStatus::kError;
       }
-      db_path = argv[++i];
+      if (i + 1 >= args.size()) {
+        std::cerr << "Missing value for --db\n";
+        return ParseStatus::kError;
+      }
+      *db_path = args[++i];
       continue;
     }
     if (arg == "--mode") {
-      if (i + 1 >= argc) {
+      if (i + 1 >= args.size()) {
         std::cerr << "Missing value for --mode\n";
-        return 1;
+        return ParseStatus::kError;
       }
-      opts.mode = argv[++i];
+      opts.mode = args[++i];
       continue;
     }
     if (arg == "--signal") {
-      if (i + 1 >= argc) {
+      if (i + 1 >= args.size()) {
         std::cerr << "Missing value for --signal\n";
-        return 1;
+        return ParseStatus::kError;
       }
-      opts.signal = argv[++i];
+      opts.signal = args[++i];
       continue;
     }
     if (arg == "--depth") {
-      if (i + 1 >= argc) {
+      if (i + 1 >= args.size()) {
         std::cerr << "Missing value for --depth\n";
-        return 1;
+        return ParseStatus::kError;
       }
-      opts.depth_limit = std::stoull(argv[++i]);
+      opts.depth_limit = std::stoull(args[++i]);
       continue;
     }
     if (arg == "--cone-level") {
-      if (i + 1 >= argc) {
+      if (i + 1 >= args.size()) {
         std::cerr << "Missing value for --cone-level\n";
-        return 1;
+        return ParseStatus::kError;
       }
-      const std::string val = argv[++i];
+      const std::string val = args[++i];
       long long parsed = 0;
       try {
         size_t pos = 0;
         parsed = std::stoll(val, &pos, 10);
         if (pos != val.size()) {
           std::cerr << "Invalid --cone-level: " << val << "\n";
-          return 1;
+          return ParseStatus::kError;
         }
       } catch (...) {
         std::cerr << "Invalid --cone-level: " << val << "\n";
-        return 1;
+        return ParseStatus::kError;
       }
       if (parsed < 1) {
         std::cerr << "--cone-level must be >= 1\n";
-        return 1;
+        return ParseStatus::kError;
       }
       opts.cone_level = static_cast<size_t>(parsed);
       continue;
     }
     if (arg == "--max-nodes") {
-      if (i + 1 >= argc) {
+      if (i + 1 >= args.size()) {
         std::cerr << "Missing value for --max-nodes\n";
-        return 1;
+        return ParseStatus::kError;
       }
-      opts.max_nodes = std::stoull(argv[++i]);
+      opts.max_nodes = std::stoull(args[++i]);
       continue;
     }
     if (arg == "--prefer-port-hop") {
@@ -3045,81 +2952,327 @@ int RunTrace(int argc, char *argv[]) {
       continue;
     }
     if (arg == "--include") {
-      if (i + 1 >= argc) {
+      if (i + 1 >= args.size()) {
         std::cerr << "Missing value for --include\n";
-        return 1;
+        return ParseStatus::kError;
       }
-      opts.include_re = std::regex(argv[++i]);
+      opts.include_re = std::regex(args[++i]);
       continue;
     }
     if (arg == "--exclude") {
-      if (i + 1 >= argc) {
+      if (i + 1 >= args.size()) {
         std::cerr << "Missing value for --exclude\n";
-        return 1;
+        return ParseStatus::kError;
       }
-      opts.exclude_re = std::regex(argv[++i]);
+      opts.exclude_re = std::regex(args[++i]);
       continue;
     }
     if (arg == "--stop-at") {
-      if (i + 1 >= argc) {
+      if (i + 1 >= args.size()) {
         std::cerr << "Missing value for --stop-at\n";
-        return 1;
+        return ParseStatus::kError;
       }
-      opts.stop_at_re = std::regex(argv[++i]);
+      opts.stop_at_re = std::regex(args[++i]);
       continue;
     }
     if (arg == "--format") {
-      if (i + 1 >= argc) {
+      if (i + 1 >= args.size()) {
         std::cerr << "Missing value for --format\n";
-        return 1;
+        return ParseStatus::kError;
       }
-      auto fmt = ParseOutputFormat(argv[++i]);
+      auto fmt = ParseOutputFormat(args[++i]);
       if (!fmt.has_value()) {
         std::cerr << "Invalid --format (expected text|json)\n";
-        return 1;
+        return ParseStatus::kError;
       }
       opts.format = *fmt;
       continue;
     }
     std::cerr << "Unknown option: " << arg << "\n";
-    return 1;
+    return ParseStatus::kError;
   }
 
-  if (!db_path.has_value() || opts.mode.empty() || opts.signal.empty()) {
-    std::cerr << "Missing required args: --db --mode --signal\n";
-    return 1;
+  if ((require_db && (db_path == nullptr || !db_path->has_value())) || opts.mode.empty() || opts.signal.empty()) {
+    std::cerr << "Missing required args: " << (require_db ? "--db " : "") << "--mode --signal\n";
+    return ParseStatus::kError;
   }
   if (opts.mode != "drivers" && opts.mode != "loads") {
     std::cerr << "Invalid --mode: " << opts.mode << " (expected drivers|loads)\n";
-    return 1;
+    return ParseStatus::kError;
   }
   if (!ParseSignalQuery(opts.signal, opts.root_signal, opts.signal_select)) {
     std::cerr << "Invalid --signal syntax: " << opts.signal
               << " (expected hier.path or hier.path[bit] or hier.path[msb:lsb])\n";
-    return 1;
+    return ParseStatus::kError;
   }
+  return ParseStatus::kOk;
+}
 
-  TraceDb db;
-  if (!LoadDb(*db_path, db)) {
-    std::cerr << "Failed to read DB: " << *db_path << "\n";
-    return 1;
+ParseStatus ParseHierArgs(const std::vector<std::string> &args, std::optional<std::string> *db_path,
+                          HierOptions &opts, bool require_db) {
+  opts = HierOptions{};
+  opts.root.clear();
+  for (size_t i = 0; i < args.size(); ++i) {
+    const std::string &arg = args[i];
+    if (arg == "-h" || arg == "--help") {
+      PrintHierHelp();
+      return ParseStatus::kExitSuccess;
+    }
+    if (arg == "--db") {
+      if (db_path == nullptr) {
+        std::cerr << "--db is not accepted in this context\n";
+        return ParseStatus::kError;
+      }
+      if (i + 1 >= args.size()) return std::cerr << "Missing value for --db\n", ParseStatus::kError;
+      *db_path = args[++i];
+      continue;
+    }
+    if (arg == "--root") {
+      if (i + 1 >= args.size()) return std::cerr << "Missing value for --root\n", ParseStatus::kError;
+      opts.root = args[++i];
+      continue;
+    }
+    if (arg == "--depth") {
+      if (i + 1 >= args.size()) return std::cerr << "Missing value for --depth\n", ParseStatus::kError;
+      opts.depth_limit = std::stoull(args[++i]);
+      continue;
+    }
+    if (arg == "--max-nodes") {
+      if (i + 1 >= args.size()) return std::cerr << "Missing value for --max-nodes\n", ParseStatus::kError;
+      opts.max_nodes = std::stoull(args[++i]);
+      continue;
+    }
+    if (arg == "--format") {
+      if (i + 1 >= args.size()) return std::cerr << "Missing value for --format\n", ParseStatus::kError;
+      auto fmt = ParseOutputFormat(args[++i]);
+      if (!fmt.has_value()) return std::cerr << "Invalid --format (expected text|json)\n", ParseStatus::kError;
+      opts.format = *fmt;
+      continue;
+    }
+    return std::cerr << "Unknown option: " << arg << "\n", ParseStatus::kError;
   }
-  if (db.signals.find(opts.root_signal) == db.signals.end()) {
+  if (require_db && (db_path == nullptr || !db_path->has_value())) {
+    return std::cerr << "Missing required args: --db\n", ParseStatus::kError;
+  }
+  return ParseStatus::kOk;
+}
+
+ParseStatus ParseFindArgs(const std::vector<std::string> &args, std::optional<std::string> *db_path,
+                          FindOptions &opts, bool require_db) {
+  opts = FindOptions{};
+  for (size_t i = 0; i < args.size(); ++i) {
+    const std::string &arg = args[i];
+    if (arg == "-h" || arg == "--help") {
+      PrintFindHelp();
+      return ParseStatus::kExitSuccess;
+    }
+    if (arg == "--db") {
+      if (db_path == nullptr) {
+        std::cerr << "--db is not accepted in this context\n";
+        return ParseStatus::kError;
+      }
+      if (i + 1 >= args.size()) return std::cerr << "Missing value for --db\n", ParseStatus::kError;
+      *db_path = args[++i];
+      continue;
+    }
+    if (arg == "--query") {
+      if (i + 1 >= args.size()) return std::cerr << "Missing value for --query\n", ParseStatus::kError;
+      opts.query = args[++i];
+      continue;
+    }
+    if (arg == "--regex") {
+      opts.regex_mode = true;
+      continue;
+    }
+    if (arg == "--limit") {
+      if (i + 1 >= args.size()) return std::cerr << "Missing value for --limit\n", ParseStatus::kError;
+      opts.limit = std::stoull(args[++i]);
+      continue;
+    }
+    if (arg == "--format") {
+      if (i + 1 >= args.size()) return std::cerr << "Missing value for --format\n", ParseStatus::kError;
+      auto fmt = ParseOutputFormat(args[++i]);
+      if (!fmt.has_value()) return std::cerr << "Invalid --format (expected text|json)\n", ParseStatus::kError;
+      opts.format = *fmt;
+      continue;
+    }
+    return std::cerr << "Unknown option: " << arg << "\n", ParseStatus::kError;
+  }
+  if ((require_db && (db_path == nullptr || !db_path->has_value())) || opts.query.empty()) {
+    return std::cerr << "Missing required args: " << (require_db ? "--db " : "") << "--query\n",
+           ParseStatus::kError;
+  }
+  return ParseStatus::kOk;
+}
+
+int RunTraceWithSession(TraceSession &session, const TraceOptions &opts) {
+  if (!LookupSignalId(session, opts.root_signal).has_value()) {
     std::cerr << "Signal not found: " << opts.root_signal << "\n";
-    for (const std::string &s : TopSuggestions(db, opts.root_signal, 5)) {
+    for (const std::string &s : TopSuggestions(session, opts.root_signal, 5)) {
       std::cerr << "  suggestion: " << s << "\n";
     }
     return 2;
   }
-
-  TraceRunResult result = RunTraceQuery(db, opts);
-  MaterializeAssignmentTexts(db, result);
+  TraceRunResult result = RunTraceQuery(session, opts);
+  MaterializeAssignmentTexts(session, result);
   if (opts.format == OutputFormat::kJson) {
-    PrintTraceJson(db, opts, result);
+    PrintTraceJson(session.db, opts, result);
   } else {
-    PrintTraceText(db, opts, result);
+    PrintTraceText(session.db, opts, result);
   }
   return 0;
+}
+
+std::vector<std::string> HierRoots(const TraceDb &db);
+std::vector<std::string> TopHierarchySuggestions(const TraceDb &db, const std::string &needle, size_t limit);
+HierRunResult RunHierQuery(const TraceDb &db, const HierOptions &opts);
+void PrintHierText(const HierRunResult &result);
+void PrintHierJson(const HierRunResult &result);
+
+int RunHierWithSession(TraceSession &session, const HierOptions &opts_in) {
+  EnsureSessionHierarchy(session);
+  HierOptions opts = opts_in;
+  if (session.db.hierarchy.empty()) return std::cerr << "No hierarchy data in DB\n", 1;
+  if (opts.root.empty()) {
+    const auto roots = HierRoots(session.db);
+    if (roots.empty()) return std::cerr << "No hierarchy roots found in DB\n", 1;
+    opts.root = roots.front();
+  }
+  if (session.db.hierarchy.find(opts.root) == session.db.hierarchy.end()) {
+    std::cerr << "Root not found: " << opts.root << "\n";
+    for (const std::string &s : TopHierarchySuggestions(session.db, opts.root, 5)) {
+      std::cerr << "  suggestion: " << s << "\n";
+    }
+    return 2;
+  }
+  HierRunResult result = RunHierQuery(session.db, opts);
+  if (opts.format == OutputFormat::kJson) {
+    PrintHierJson(result);
+  } else {
+    PrintHierText(result);
+  }
+  return 0;
+}
+
+int RunFindWithSession(TraceSession &session, const FindOptions &opts) {
+  std::vector<std::string> matches;
+  std::optional<std::regex> re;
+  if (opts.regex_mode) re = std::regex(opts.query);
+  for (const std::string *name : session.signal_names_by_id) {
+    bool ok = false;
+    if (opts.regex_mode) {
+      ok = std::regex_search(*name, *re);
+    } else {
+      ok = (name->find(opts.query) != std::string::npos);
+    }
+    if (ok) matches.push_back(*name);
+  }
+  std::sort(matches.begin(), matches.end());
+  if (matches.size() > opts.limit) matches.resize(opts.limit);
+
+  std::vector<std::string> suggestions;
+  if (matches.empty()) suggestions = TopSuggestions(session, opts.query, opts.limit);
+
+  if (opts.format == OutputFormat::kJson) {
+    std::cout << "{\"query\":\"" << JsonEscape(opts.query) << "\",\"regex\":"
+              << (opts.regex_mode ? "true" : "false") << ",\"count\":" << matches.size() << ",\"matches\":[";
+    for (size_t i = 0; i < matches.size(); ++i) {
+      if (i) std::cout << ",";
+      std::cout << "\"" << JsonEscape(matches[i]) << "\"";
+    }
+    std::cout << "],\"suggestions\":[";
+    for (size_t i = 0; i < suggestions.size(); ++i) {
+      if (i) std::cout << ",";
+      std::cout << "\"" << JsonEscape(suggestions[i]) << "\"";
+    }
+    std::cout << "]}\n";
+  } else {
+    std::cout << "query: " << opts.query << "\n";
+    std::cout << "regex: " << (opts.regex_mode ? "true" : "false") << "\n";
+    std::cout << "count: " << matches.size() << "\n";
+    for (const std::string &m : matches) {
+      std::cout << "signal " << m << "\n";
+    }
+    if (matches.empty() && !suggestions.empty()) {
+      std::cout << "suggestions:\n";
+      for (const std::string &s : suggestions) {
+        std::cout << "  " << s << "\n";
+      }
+    }
+  }
+  return matches.empty() ? 2 : 0;
+}
+
+bool SplitCommandLine(const std::string &line, std::vector<std::string> &out, std::string &err) {
+  out.clear();
+  err.clear();
+  std::string cur;
+  bool in_single = false;
+  bool in_double = false;
+  bool escaped = false;
+  for (char c : line) {
+    if (escaped) {
+      cur.push_back(c);
+      escaped = false;
+      continue;
+    }
+    if (c == '\\') {
+      escaped = true;
+      continue;
+    }
+    if (in_single) {
+      if (c == '\'') {
+        in_single = false;
+      } else {
+        cur.push_back(c);
+      }
+      continue;
+    }
+    if (in_double) {
+      if (c == '"') {
+        in_double = false;
+      } else {
+        cur.push_back(c);
+      }
+      continue;
+    }
+    if (c == '\'') {
+      in_single = true;
+      continue;
+    }
+    if (c == '"') {
+      in_double = true;
+      continue;
+    }
+    if (std::isspace(static_cast<unsigned char>(c))) {
+      if (!cur.empty()) {
+        out.push_back(cur);
+        cur.clear();
+      }
+      continue;
+    }
+    cur.push_back(c);
+  }
+  if (escaped || in_single || in_double) {
+    err = "unterminated escape or quote";
+    return false;
+  }
+  if (!cur.empty()) out.push_back(cur);
+  return true;
+}
+
+int RunTrace(int argc, char *argv[]) {
+  std::optional<std::string> db_path;
+  TraceOptions opts;
+  ParseStatus status = ParseTraceArgs(ArgvToVector(argc, argv), &db_path, opts, true);
+  if (status == ParseStatus::kExitSuccess) return 0;
+  if (status == ParseStatus::kError) return 1;
+  TraceSession session;
+  if (!OpenTraceSession(*db_path, session, kSessionReverseRefs)) {
+    std::cerr << "Failed to read DB: " << *db_path << "\n";
+    return 1;
+  }
+  return RunTraceWithSession(session, opts);
 }
 
 std::vector<std::string> HierRoots(const TraceDb &db) {
@@ -3271,172 +3424,213 @@ void PrintHierJson(const HierRunResult &result) {
 int RunHier(int argc, char *argv[]) {
   std::optional<std::string> db_path;
   HierOptions opts;
-  opts.root.clear();
-
-  for (int i = 0; i < argc; ++i) {
-    const std::string arg = argv[i];
-    if (arg == "-h" || arg == "--help") {
-      std::cout << "Usage: rtl_trace hier --db <file> [--root <hier.path>] [--depth <N>] "
-                   "[--max-nodes <N>] [--format <text|json>]\n";
-      return 0;
-    }
-    if (arg == "--db") {
-      if (i + 1 >= argc) return std::cerr << "Missing value for --db\n", 1;
-      db_path = argv[++i];
-      continue;
-    }
-    if (arg == "--root") {
-      if (i + 1 >= argc) return std::cerr << "Missing value for --root\n", 1;
-      opts.root = argv[++i];
-      continue;
-    }
-    if (arg == "--depth") {
-      if (i + 1 >= argc) return std::cerr << "Missing value for --depth\n", 1;
-      opts.depth_limit = std::stoull(argv[++i]);
-      continue;
-    }
-    if (arg == "--max-nodes") {
-      if (i + 1 >= argc) return std::cerr << "Missing value for --max-nodes\n", 1;
-      opts.max_nodes = std::stoull(argv[++i]);
-      continue;
-    }
-    if (arg == "--format") {
-      if (i + 1 >= argc) return std::cerr << "Missing value for --format\n", 1;
-      auto fmt = ParseOutputFormat(argv[++i]);
-      if (!fmt.has_value()) return std::cerr << "Invalid --format (expected text|json)\n", 1;
-      opts.format = *fmt;
-      continue;
-    }
-    return std::cerr << "Unknown option: " << arg << "\n", 1;
+  ParseStatus status = ParseHierArgs(ArgvToVector(argc, argv), &db_path, opts, true);
+  if (status == ParseStatus::kExitSuccess) return 0;
+  if (status == ParseStatus::kError) return 1;
+  TraceSession session;
+  if (!OpenTraceSession(*db_path, session, kSessionHierarchy)) {
+    std::cerr << "Failed to read DB: " << *db_path << "\n";
+    return 1;
   }
-
-  if (!db_path.has_value()) return std::cerr << "Missing required args: --db\n", 1;
-  TraceDb db;
-  if (!LoadDb(*db_path, db)) return std::cerr << "Failed to read DB: " << *db_path << "\n", 1;
-  BuildHierarchyFromSignals(db);
-
-  if (db.hierarchy.empty()) return std::cerr << "No hierarchy data in DB\n", 1;
-  if (opts.root.empty()) {
-    const auto roots = HierRoots(db);
-    if (roots.empty()) return std::cerr << "No hierarchy roots found in DB\n", 1;
-    opts.root = roots.front();
-  }
-  if (db.hierarchy.find(opts.root) == db.hierarchy.end()) {
-    std::cerr << "Root not found: " << opts.root << "\n";
-    for (const std::string &s : TopHierarchySuggestions(db, opts.root, 5)) {
-      std::cerr << "  suggestion: " << s << "\n";
-    }
-    return 2;
-  }
-
-  HierRunResult result = RunHierQuery(db, opts);
-  if (opts.format == OutputFormat::kJson) {
-    PrintHierJson(result);
-  } else {
-    PrintHierText(result);
-  }
-  return 0;
+  return RunHierWithSession(session, opts);
 }
 
 int RunFind(int argc, char *argv[]) {
   std::optional<std::string> db_path;
-  std::optional<std::string> query;
-  bool regex_mode = false;
-  size_t limit = 20;
-  OutputFormat format = OutputFormat::kText;
-
-  for (int i = 0; i < argc; ++i) {
-    const std::string arg = argv[i];
-    if (arg == "-h" || arg == "--help") {
-      std::cout << "Usage: rtl_trace find --db <file> --query <text|regex> [--regex] [--limit <N>] "
-                   "[--format <text|json>]\n";
-      return 0;
-    }
-    if (arg == "--db") {
-      if (i + 1 >= argc) return std::cerr << "Missing value for --db\n", 1;
-      db_path = argv[++i];
-      continue;
-    }
-    if (arg == "--query") {
-      if (i + 1 >= argc) return std::cerr << "Missing value for --query\n", 1;
-      query = argv[++i];
-      continue;
-    }
-    if (arg == "--regex") {
-      regex_mode = true;
-      continue;
-    }
-    if (arg == "--limit") {
-      if (i + 1 >= argc) return std::cerr << "Missing value for --limit\n", 1;
-      limit = std::stoull(argv[++i]);
-      continue;
-    }
-    if (arg == "--format") {
-      if (i + 1 >= argc) return std::cerr << "Missing value for --format\n", 1;
-      auto fmt = ParseOutputFormat(argv[++i]);
-      if (!fmt.has_value()) return std::cerr << "Invalid --format (expected text|json)\n", 1;
-      format = *fmt;
-      continue;
-    }
-    return std::cerr << "Unknown option: " << arg << "\n", 1;
-  }
-
-  if (!db_path.has_value() || !query.has_value()) {
-    std::cerr << "Missing required args: --db --query\n";
-    return 1;
-  }
-  TraceDb db;
-  if (!LoadDb(*db_path, db)) {
+  FindOptions opts;
+  ParseStatus status = ParseFindArgs(ArgvToVector(argc, argv), &db_path, opts, true);
+  if (status == ParseStatus::kExitSuccess) return 0;
+  if (status == ParseStatus::kError) return 1;
+  TraceSession session;
+  if (!OpenTraceSession(*db_path, session, kSessionSignals)) {
     std::cerr << "Failed to read DB: " << *db_path << "\n";
     return 1;
   }
+  return RunFindWithSession(session, opts);
+}
 
-  std::vector<std::string> matches;
-  std::optional<std::regex> re;
-  if (regex_mode) re = std::regex(*query);
-  for (const auto &[name, _] : db.signals) {
-    bool ok = false;
-    if (regex_mode) {
-      ok = std::regex_search(name, *re);
-    } else {
-      ok = (name.find(*query) != std::string::npos);
+int RunServe(int argc, char *argv[]) {
+  std::optional<std::string> startup_db;
+  for (int i = 0; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "-h" || arg == "--help") {
+      PrintServeHelp();
+      return 0;
     }
-    if (ok) matches.push_back(name);
-  }
-  std::sort(matches.begin(), matches.end());
-  if (matches.size() > limit) matches.resize(limit);
-
-  std::vector<std::string> suggestions;
-  if (matches.empty()) suggestions = TopSuggestions(db, *query, limit);
-
-  if (format == OutputFormat::kJson) {
-    std::cout << "{\"query\":\"" << JsonEscape(*query) << "\",\"regex\":"
-              << (regex_mode ? "true" : "false") << ",\"count\":" << matches.size() << ",\"matches\":[";
-    for (size_t i = 0; i < matches.size(); ++i) {
-      if (i) std::cout << ",";
-      std::cout << "\"" << JsonEscape(matches[i]) << "\"";
-    }
-    std::cout << "],\"suggestions\":[";
-    for (size_t i = 0; i < suggestions.size(); ++i) {
-      if (i) std::cout << ",";
-      std::cout << "\"" << JsonEscape(suggestions[i]) << "\"";
-    }
-    std::cout << "]}\n";
-  } else {
-    std::cout << "query: " << *query << "\n";
-    std::cout << "regex: " << (regex_mode ? "true" : "false") << "\n";
-    std::cout << "count: " << matches.size() << "\n";
-    for (const std::string &m : matches) {
-      std::cout << "signal " << m << "\n";
-    }
-    if (matches.empty() && !suggestions.empty()) {
-      std::cout << "suggestions:\n";
-      for (const std::string &s : suggestions) {
-        std::cout << "  " << s << "\n";
+    if (arg == "--db") {
+      if (i + 1 >= argc) {
+        std::cerr << "Missing value for --db\n";
+        return 1;
       }
+      startup_db = argv[++i];
+      continue;
     }
+    std::cerr << "Unknown option: " << arg << "\n";
+    return 1;
   }
-  return matches.empty() ? 2 : 0;
+
+  std::optional<TraceSession> session;
+  auto finish_response = []() {
+    std::cout << "<<END>>\n";
+    std::cout.flush();
+  };
+  auto open_db = [&](const std::string &path) -> int {
+    TraceSession loaded;
+    if (!OpenTraceSession(path, loaded, kSessionHierarchy | kSessionReverseRefs)) {
+      std::cerr << "Failed to read DB: " << path << "\n";
+      return 1;
+    }
+    session = std::move(loaded);
+    std::cout << "db: " << session->db_path << "\n";
+    std::cout << "signals: " << session->signal_names_by_id.size() << "\n";
+    std::cout << "hier_nodes: " << session->db.hierarchy.size() << "\n";
+    return 0;
+  };
+
+  if (startup_db.has_value()) {
+    (void)open_db(*startup_db);
+  } else {
+    std::cout << "db: <none>\n";
+  }
+  finish_response();
+
+  std::string line;
+  while (std::getline(std::cin, line)) {
+    std::vector<std::string> tokens;
+    std::string split_err;
+    if (!SplitCommandLine(line, tokens, split_err)) {
+      std::cerr << "Command parse error: " << split_err << "\n";
+      finish_response();
+      continue;
+    }
+    if (tokens.empty()) {
+      finish_response();
+      continue;
+    }
+    if (tokens[0].size() > 0 && tokens[0][0] == '#') {
+      finish_response();
+      continue;
+    }
+
+    const std::string cmd = tokens[0];
+    std::vector<std::string> args(tokens.begin() + 1, tokens.end());
+
+    if (cmd == "quit" || cmd == "exit") {
+      std::cout << "bye\n";
+      finish_response();
+      break;
+    }
+    if (cmd == "help") {
+      if (args.empty()) {
+        PrintServeHelp();
+      } else if (args[0] == "trace") {
+        PrintTraceHelp();
+      } else if (args[0] == "find") {
+        PrintFindHelp();
+      } else if (args[0] == "hier") {
+        PrintHierHelp();
+      } else if (args[0] == "serve") {
+        PrintServeHelp();
+      } else {
+        std::cerr << "Unknown help topic: " << args[0] << "\n";
+      }
+      finish_response();
+      continue;
+    }
+    if (cmd == "status") {
+      if (!session.has_value()) {
+        std::cout << "db: <none>\n";
+      } else {
+        std::cout << "db: " << session->db_path << "\n";
+        std::cout << "mtime: " << session->db_mtime << "\n";
+        std::cout << "signals: " << session->signal_names_by_id.size() << "\n";
+        std::cout << "hier_nodes: " << session->db.hierarchy.size() << "\n";
+        const size_t load_ref_paths = session->graph->load_ref_ranges.size();
+        const size_t driver_ref_paths = session->graph->driver_ref_ranges.size();
+        std::cout << "reverse_ref_paths_loads: " << load_ref_paths << "\n";
+        std::cout << "reverse_ref_paths_drivers: " << driver_ref_paths << "\n";
+      }
+      finish_response();
+      continue;
+    }
+    if (cmd == "close") {
+      session.reset();
+      std::cout << "db: <none>\n";
+      finish_response();
+      continue;
+    }
+    if (cmd == "reload") {
+      if (!session.has_value()) {
+        std::cerr << "No DB is open\n";
+      } else {
+        (void)open_db(session->db_path);
+      }
+      finish_response();
+      continue;
+    }
+    if (cmd == "open") {
+      std::optional<std::string> db_path;
+      for (size_t i = 0; i < args.size(); ++i) {
+        if (args[i] == "--db") {
+          if (i + 1 >= args.size()) {
+            std::cerr << "Missing value for --db\n";
+            db_path.reset();
+            break;
+          }
+          db_path = args[++i];
+        } else if (args[i].rfind("--", 0) == 0) {
+          std::cerr << "Unknown option: " << args[i] << "\n";
+          db_path.reset();
+          break;
+        } else if (!db_path.has_value()) {
+          db_path = args[i];
+        } else {
+          std::cerr << "Unexpected extra argument: " << args[i] << "\n";
+          db_path.reset();
+          break;
+        }
+      }
+      if (!db_path.has_value()) {
+        if (args.empty()) std::cerr << "Missing DB path\n";
+      } else {
+        (void)open_db(*db_path);
+      }
+      finish_response();
+      continue;
+    }
+
+    if (!session.has_value()) {
+      std::cerr << "No DB is open\n";
+      finish_response();
+      continue;
+    }
+
+    if (cmd == "trace") {
+      TraceOptions opts;
+      ParseStatus status = ParseTraceArgs(args, nullptr, opts, false);
+      if (status == ParseStatus::kOk) (void)RunTraceWithSession(*session, opts);
+      finish_response();
+      continue;
+    }
+    if (cmd == "find") {
+      FindOptions opts;
+      ParseStatus status = ParseFindArgs(args, nullptr, opts, false);
+      if (status == ParseStatus::kOk) (void)RunFindWithSession(*session, opts);
+      finish_response();
+      continue;
+    }
+    if (cmd == "hier") {
+      HierOptions opts;
+      ParseStatus status = ParseHierArgs(args, nullptr, opts, false);
+      if (status == ParseStatus::kOk) (void)RunHierWithSession(*session, opts);
+      finish_response();
+      continue;
+    }
+
+    std::cerr << "Unknown command: " << cmd << "\n";
+    finish_response();
+  }
+  return 0;
 }
 
 } // namespace
@@ -3463,6 +3657,9 @@ int main(int argc, char *argv[]) {
   }
   if (subcmd == "find") {
     return RunFind(argc - 2, argv + 2);
+  }
+  if (subcmd == "serve") {
+    return RunServe(argc - 2, argv + 2);
   }
 
   std::cerr << "Unknown subcommand: " << subcmd << "\n";
