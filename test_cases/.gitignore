@@ -1,0 +1,21 @@
+# VCS generated files
+simv
+simv.daidir/
+csrc/
+*.daidir/
+vcs.log
+*.vpd
+*.fsdb
+
+# rtl_trace generated files
+*.db
+*.db.meta
+
+# Build artifacts
+*.o
+*.so
+
+# Editor files
+*.swp
+*.swo
+*~
