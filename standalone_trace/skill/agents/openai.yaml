@@ -1,0 +1,4 @@
+interface:
+  display_name: "Standalone Trace"
+  short_description: "Compile and trace RTL drivers/loads with rtl_trace"
+  default_prompt: "Use $standalone-trace to compile an RTL trace DB, find hierarchical signals, and trace drivers or loads with bit and port-hop context."
