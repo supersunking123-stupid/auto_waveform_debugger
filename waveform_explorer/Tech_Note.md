@@ -151,7 +151,13 @@ Relevant functions:
 Behavior:
 - loaded paths are normalized by stripping a leading `TOP.`
 - query-time lookup accepts both styles where possible
+- for packed FSDB signals, a bracket-free base name can resolve to a uniquely matching dumped path
+  - example: `top.u_cq.cq_rd_count9` -> `top.u_cq.cq_rd_count9[8:0]`
 - this keeps client behavior tolerant across waveform sources
+
+Implementation detail:
+- `rebuild_base_signal_path_cache(...)` builds a base-path to packed-path map after load
+- ambiguous base names are excluded from fallback resolution on purpose
 
 ### 4. Lazy transition loading for FSDB
 
@@ -176,6 +182,7 @@ Important implication:
 - metadata queries are cheap
 - first transition query on a signal pays the load cost once
 - repeated queries on the same signal are fast
+- packed-vector fallback resolution happens before this stage; lazy loading still works on the resolved signal id
 
 ### 5. Value-at-time lookup
 
@@ -276,6 +283,7 @@ That keeps JSON output simple, but it is not the most memory-efficient format.
 - Path normalization behavior:
   - `normalize_loaded_path(...)`
   - `resolve_query_path(...)`
+  - `rebuild_base_signal_path_cache(...)`
 
 ## Practical mental model
 
@@ -286,3 +294,6 @@ Think of `waveform_explorer` as:
 - simple long-lived daemon wrapper
 
 The backend decides how data is loaded. `AgentAPI` decides how that data is exposed.
+
+Regression history for the packed-vector lookup failure that motivated this behavior is recorded in:
+- `/home/qsun/AI_PROJ/auto_waveform_debugger/failure_history.md`

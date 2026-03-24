@@ -33,6 +33,11 @@ Supported file types are `.vcd`, `.fst`, and `.fsdb`.
 Hierarchical paths are normalized to remove a leading `TOP.` for consistency.
 Queries accept both styles (`tb_top.sig` and `TOP.tb_top.sig`).
 
+For FSDB, direct queries can also use a bare hierarchical base name for a packed vector signal.
+If the dump contains a unique packed path such as `top.u_cq.cq_rd_count9[8:0]`, then querying
+`top.u_cq.cq_rd_count9` will resolve to that packed signal automatically.
+This fallback is only used for bracket-free queries and only when the packed match is unique.
+
 ### FSDB Build Requirement
 FSDB support requires Synopsys Verdi FsdbReader SDK (`ffrAPI.h`, `libnffr.so`, `libnsys.so`).
 By default, `CMakeLists.txt` looks under:
@@ -47,12 +52,27 @@ cmake -B build -DVERDI_HOME=/path/to/verdi -DENABLE_FSDB=ON .
 Some Verdi FSDB builds print informational banners (for example `FSDB Reader...` or `logDir = ...`).
 `wave_agent_cli` filters those lines so stdout remains JSON-only for MCP/client parsing.
 
+### FSDB Packed-Signal Resolution
+Some FSDB dumps store internal vectors only as packed signal names, for example:
+- `top.nvdla_top...u_cq.cq_rd_count9[8:0]`
+- `top.nvdla_top...u_cq.cq_rd_take_thread_id[3:0]`
+
+To keep structural and waveform queries aligned, `wave_agent_cli` now falls back from a bare path
+to the uniquely matching packed-vector signal when possible.
+
 ### Supported Commands
 
 #### 1. `list_signals`
 List all hierarchical signal paths found in the waveform file.
 - **Query:** `{"cmd": "list_signals"}`
 - **Response:** `{"status": "success", "data": ["TOP.clk", "TOP.dut.rst_n", ...]}`
+
+#### 1b. `list_signals_page` (FSDB only)
+List hierarchical signal paths in a paged, prefix-filtered way for large FSDB waveforms.
+- **Query:** `{"cmd": "list_signals_page", "args": {"prefix": "top.mem0_", "cursor": "", "limit": 200}}`
+- **Response:** includes `data`, `has_more`, and `next_cursor`.
+- `list_signals` remains unchanged for all formats.
+- `list_signals_page` is intended for large FSDB designs to avoid massive one-shot JSON payloads.
 
 #### 2. `get_snapshot`
 Get the values of multiple signals at a specific timestamp.
@@ -135,6 +155,9 @@ Edit your `claude_desktop_config.json` to include:
 ### Verification
 Once configured, restart your agent and try asking:
 > "List all signals in /home/qsun/AI_PROJ/auto_waveform_debugger/waveform_explorer/timer_tb.vcd"
+
+Regression-style examples for previously failing FSDB queries are recorded in
+`/home/qsun/AI_PROJ/auto_waveform_debugger/failure_history.md`.
 
 ### Exposed Tools
 - `list_signals(vcd_path)`

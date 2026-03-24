@@ -37,6 +37,12 @@ std::string strip_top_prefix(const std::string& path) {
     return path;
 }
 
+std::string strip_bit_suffix(const std::string& path) {
+    const size_t bracket = path.find('[');
+    if (bracket == std::string::npos) return path;
+    return path.substr(0, bracket);
+}
+
 #ifdef WAVE_HAS_FSDB
 uint64_t fsdb_xtag_to_u64(const fsdbXTag& xtag) {
     return (static_cast<uint64_t>(xtag.hltag.H) << 32) | static_cast<uint64_t>(xtag.hltag.L);
@@ -97,9 +103,7 @@ std::string decode_fsdb_value(ffrVCTrvsHdl hdl, byte_T* vc_ptr) {
 
 struct FSDBTreeContext {
     std::unordered_map<std::string, SignalInfo>* signal_info = nullptr;
-    std::unordered_map<std::string, std::vector<Transition>>* id_transitions = nullptr;
     std::vector<std::string> scope_stack;
-    std::unordered_map<fsdbVarIdcode, std::string> id_to_path;
     bool normalize_top_prefix = true;
 };
 
@@ -134,7 +138,7 @@ private:
 
 bool_T fsdb_tree_cb(fsdbTreeCBType cb_type, void* client_data, void* tree_cb_data) {
     FSDBTreeContext* ctx = static_cast<FSDBTreeContext*>(client_data);
-    if (!ctx || !ctx->signal_info || !ctx->id_transitions) return static_cast<bool_T>(0);
+    if (!ctx || !ctx->signal_info) return static_cast<bool_T>(0);
 
     switch (cb_type) {
         case FSDB_TREE_CBT_SCOPE: {
@@ -167,10 +171,6 @@ bool_T fsdb_tree_cb(fsdbTreeCBType cb_type, void* client_data, void* tree_cb_dat
             info.signal_id = std::to_string(static_cast<long long>(var->u.idcode));
 
             (*ctx->signal_info)[path] = info;
-            if (ctx->id_transitions->find(info.signal_id) == ctx->id_transitions->end()) {
-                (*ctx->id_transitions)[info.signal_id] = std::vector<Transition>();
-            }
-            ctx->id_to_path[var->u.idcode] = path;
             break;
         }
         default:
@@ -184,10 +184,27 @@ bool_T fsdb_tree_cb(fsdbTreeCBType cb_type, void* client_data, void* tree_cb_dat
 
 WaveDatabase::WaveDatabase() {}
 
+WaveDatabase::~WaveDatabase() {
+    clear();
+}
+
 void WaveDatabase::clear() {
+#ifdef WAVE_HAS_FSDB
+    if (fsdb_obj != nullptr) {
+        ScopedStdIOSilencer silencer;
+        fsdb_obj->ffrClose();
+        fsdb_obj = nullptr;
+    }
+    fsdb_loaded_signal_ids.clear();
+#endif
+    backend_kind = BackendKind::None;
     timescale.clear();
     signal_info.clear();
     id_transitions.clear();
+    sorted_signal_paths_cache.clear();
+    sorted_signal_paths_valid = false;
+    base_signal_path_cache.clear();
+    ambiguous_base_signal_paths.clear();
 }
 
 bool WaveDatabase::load(const std::string& filepath) {
@@ -202,6 +219,7 @@ bool WaveDatabase::load(const std::string& filepath) {
 
 bool WaveDatabase::load_fst(const std::string& filepath) {
     clear();
+    backend_kind = BackendKind::Fst;
     fstReaderContext* ctx = (fstReaderContext*)fstReaderOpen(filepath.c_str());
     if (!ctx) {
         std::cerr << "Failed to open FST file: " << filepath << std::endl;
@@ -290,6 +308,7 @@ bool WaveDatabase::load_fst(const std::string& filepath) {
     fstReaderIterBlocks(ctx, callback, this, nullptr);
 
     fstReaderClose(ctx);
+    rebuild_base_signal_path_cache();
     return true;
 }
 
@@ -316,7 +335,7 @@ bool WaveDatabase::load_fsdb(const std::string& filepath) {
     {
         ScopedStdIOSilencer silencer;
 
-        ffrObject* fsdb_obj = ffrObject::ffrOpen3(const_cast<char*>(filepath.c_str()));
+        fsdb_obj = ffrObject::ffrOpen3(const_cast<char*>(filepath.c_str()));
         if (!fsdb_obj) {
             ok = false;
             error_message = "Failed to open FSDB file: " + filepath;
@@ -324,9 +343,21 @@ bool WaveDatabase::load_fsdb(const std::string& filepath) {
             const char* scale = fsdb_obj->ffrGetScaleUnit();
             timescale = (scale && *scale) ? scale : "1";
 
+            fsdbTag64 min_tag64{};
+            fsdbTag64 max_tag64{};
+            if (fsdb_obj->ffrGetMinFsdbTag64(&min_tag64) == FSDB_RC_SUCCESS &&
+                fsdb_obj->ffrGetMaxFsdbTag64(&max_tag64) == FSDB_RC_SUCCESS) {
+                fsdbXTag start_xtag{};
+                fsdbXTag close_xtag{};
+                start_xtag.hltag.H = min_tag64.H;
+                start_xtag.hltag.L = min_tag64.L;
+                close_xtag.hltag.H = max_tag64.H;
+                close_xtag.hltag.L = max_tag64.L;
+                (void)fsdb_obj->ffrSetViewWindow(&start_xtag, &close_xtag);
+            }
+
             FSDBTreeContext tree_ctx;
             tree_ctx.signal_info = &signal_info;
-            tree_ctx.id_transitions = &id_transitions;
 
             if (fsdb_obj->ffrSetTreeCBFunc(fsdb_tree_cb, &tree_ctx) != FSDB_RC_SUCCESS) {
                 ok = false;
@@ -334,73 +365,25 @@ bool WaveDatabase::load_fsdb(const std::string& filepath) {
             } else if (fsdb_obj->ffrReadScopeVarTree() != FSDB_RC_SUCCESS) {
                 ok = false;
                 error_message = "Failed to read FSDB scope/var tree.";
-            } else {
-                for (const auto& kv : tree_ctx.id_to_path) {
-                    fsdb_obj->ffrAddToSignalList(kv.first);
-                }
-
-                if (fsdb_obj->ffrLoadSignals() != FSDB_RC_SUCCESS) {
-                    ok = false;
-                    error_message = "Failed to load FSDB signal value changes.";
-                } else {
-                    for (const auto& kv : tree_ctx.id_to_path) {
-                        const fsdbVarIdcode idcode = kv.first;
-                        const std::string id = std::to_string(static_cast<long long>(idcode));
-
-                        ffrVCTrvsHdl hdl = fsdb_obj->ffrCreateVCTraverseHandle(idcode);
-                        if (!hdl) continue;
-
-                        if (!hdl->ffrHasIncoreVC()) {
-                            hdl->ffrFree();
-                            continue;
-                        }
-
-                        fsdbXTag xtag;
-                        if (hdl->ffrGetMinXTag(&xtag) != FSDB_RC_SUCCESS || hdl->ffrGotoXTag(&xtag) != FSDB_RC_SUCCESS) {
-                            hdl->ffrFree();
-                            continue;
-                        }
-
-                        auto& trans = id_transitions[id];
-
-                        while (true) {
-                            fsdbXTag cur_xtag;
-                            byte_T* vc_ptr = nullptr;
-                            if (hdl->ffrGetXTag(&cur_xtag) != FSDB_RC_SUCCESS || hdl->ffrGetVC(&vc_ptr) != FSDB_RC_SUCCESS) {
-                                break;
-                            }
-
-                            const uint64_t t = fsdb_xtag_to_u64(cur_xtag);
-                            bool is_glitch = false;
-                            if (!trans.empty() && trans.back().timestamp == t) {
-                                is_glitch = true;
-                                trans.back().is_glitch = true;
-                            }
-                            trans.push_back({t, decode_fsdb_value(hdl, vc_ptr), is_glitch});
-
-                            if (hdl->ffrGotoNextVC() != FSDB_RC_SUCCESS) break;
-                        }
-
-                        hdl->ffrFree();
-                    }
-                    fsdb_obj->ffrUnloadSignals();
-                }
             }
-
-            fsdb_obj->ffrClose();
         }
     }
 
     if (!ok) {
+        clear();
         std::cerr << error_message << std::endl;
         return false;
     }
+
+    backend_kind = BackendKind::Fsdb;
+    rebuild_base_signal_path_cache();
     return true;
 #endif
 }
 
 bool WaveDatabase::load_vcd(const std::string& filepath) {
     clear();
+    backend_kind = BackendKind::Vcd;
     std::ifstream file(filepath);
     if (!file.is_open()) {
         std::cerr << "Failed to open VCD file: " << filepath << std::endl;
@@ -507,7 +490,30 @@ bool WaveDatabase::load_vcd(const std::string& filepath) {
         }
     }
     
+    rebuild_base_signal_path_cache();
     return true;
+}
+
+void WaveDatabase::rebuild_base_signal_path_cache() {
+    base_signal_path_cache.clear();
+    ambiguous_base_signal_paths.clear();
+
+    for (const auto& entry : signal_info) {
+        const std::string& path = entry.first;
+        const std::string base_path = strip_bit_suffix(path);
+        if (base_path == path) continue;
+        if (ambiguous_base_signal_paths.find(base_path) != ambiguous_base_signal_paths.end()) continue;
+
+        const auto it = base_signal_path_cache.find(base_path);
+        if (it == base_signal_path_cache.end()) {
+            base_signal_path_cache.emplace(base_path, path);
+            continue;
+        }
+        if (it->second != path) {
+            base_signal_path_cache.erase(it);
+            ambiguous_base_signal_paths.insert(base_path);
+        }
+    }
 }
 
 bool WaveDatabase::has_signal(const std::string& path) const {
@@ -518,9 +524,72 @@ const SignalInfo& WaveDatabase::get_signal_info(const std::string& path) const {
     return signal_info.at(resolve_query_path(path));
 }
 
+std::vector<std::string> WaveDatabase::list_signal_paths_page(
+    const std::string& prefix,
+    const std::string& cursor,
+    size_t limit,
+    bool& has_more,
+    std::string& next_cursor) const {
+    if (!sorted_signal_paths_valid) {
+        sorted_signal_paths_cache.clear();
+        sorted_signal_paths_cache.reserve(signal_info.size());
+        for (const auto& pair : signal_info) {
+            sorted_signal_paths_cache.push_back(pair.first);
+        }
+        std::sort(sorted_signal_paths_cache.begin(), sorted_signal_paths_cache.end());
+        sorted_signal_paths_valid = true;
+    }
+
+    if (limit == 0) limit = 1;
+
+    auto matches_prefix = [&](const std::string& path) {
+        return prefix.empty() || path.rfind(prefix, 0) == 0;
+    };
+
+    auto begin_it = prefix.empty()
+        ? sorted_signal_paths_cache.begin()
+        : std::lower_bound(sorted_signal_paths_cache.begin(), sorted_signal_paths_cache.end(), prefix);
+
+    if (!cursor.empty()) {
+        auto cursor_it = std::upper_bound(sorted_signal_paths_cache.begin(), sorted_signal_paths_cache.end(), cursor);
+        if (cursor_it > begin_it) begin_it = cursor_it;
+    }
+
+    std::vector<std::string> page;
+    page.reserve(limit);
+    auto it = begin_it;
+    while (it != sorted_signal_paths_cache.end() && page.size() < limit) {
+        if (!matches_prefix(*it)) {
+            if (!prefix.empty() && *it > prefix) break;
+            ++it;
+            continue;
+        }
+        page.push_back(*it);
+        ++it;
+    }
+
+    has_more = false;
+    next_cursor.clear();
+    while (it != sorted_signal_paths_cache.end()) {
+        if (!matches_prefix(*it)) {
+            if (!prefix.empty() && *it > prefix) break;
+            ++it;
+            continue;
+        }
+        has_more = true;
+        break;
+    }
+    if (has_more && !page.empty()) next_cursor = page.back();
+    return page;
+}
+
 const std::vector<Transition>& WaveDatabase::get_transitions(const std::string& path) const {
     const std::string resolved = resolve_query_path(path);
     if (signal_info.find(resolved) == signal_info.end()) {
+        static const std::vector<Transition> empty;
+        return empty;
+    }
+    if (!ensure_signal_transitions_loaded(resolved)) {
         static const std::vector<Transition> empty;
         return empty;
     }
@@ -531,7 +600,8 @@ const std::vector<Transition>& WaveDatabase::get_transitions(const std::string& 
 std::string WaveDatabase::get_value_at_time(const std::string& path, uint64_t time) const {
     const std::string resolved = resolve_query_path(path);
     if (signal_info.find(resolved) == signal_info.end()) return "U";
-    
+    if (!ensure_signal_transitions_loaded(resolved)) return "U";
+
     const std::string& id = signal_info.at(resolved).signal_id;
     const auto& trans = id_transitions.at(id);
     if (trans.empty()) return "U";
@@ -560,5 +630,114 @@ std::string WaveDatabase::resolve_query_path(const std::string& path) const {
     const std::string with_top = "TOP." + path;
     if (signal_info.find(with_top) != signal_info.end()) return with_top;
 
+    if (path.find('[') == std::string::npos) {
+        const auto base_it = base_signal_path_cache.find(no_top);
+        if (base_it != base_signal_path_cache.end()) return base_it->second;
+    }
+
     return path;
 }
+
+bool WaveDatabase::ensure_signal_transitions_loaded(const std::string& resolved_path) const {
+    const auto it = signal_info.find(resolved_path);
+    if (it == signal_info.end()) return false;
+
+    const std::string& signal_id = it->second.signal_id;
+    if (id_transitions.find(signal_id) != id_transitions.end()) return true;
+
+    if (backend_kind != BackendKind::Fsdb) return false;
+
+#ifdef WAVE_HAS_FSDB
+    return ensure_fsdb_signal_loaded(it->second);
+#else
+    return false;
+#endif
+}
+
+#ifdef WAVE_HAS_FSDB
+bool WaveDatabase::ensure_fsdb_signal_loaded(const SignalInfo& info) const {
+    if (fsdb_obj == nullptr) return false;
+    if (fsdb_loaded_signal_ids.find(info.signal_id) != fsdb_loaded_signal_ids.end()) return true;
+
+    const fsdbVarIdcode idcode = static_cast<fsdbVarIdcode>(std::stoll(info.signal_id));
+    std::vector<Transition> transitions;
+    bool ok = true;
+
+    {
+        ScopedStdIOSilencer silencer;
+
+        if (fsdb_obj->ffrResetSignalList() != FSDB_RC_SUCCESS) {
+            ok = false;
+        } else if (fsdb_obj->ffrAddToSignalList(idcode) != FSDB_RC_SUCCESS) {
+            ok = false;
+        } else if (fsdb_obj->ffrLoadSignals() != FSDB_RC_SUCCESS) {
+            ok = false;
+        } else {
+            ffrVCTrvsHdl hdl = fsdb_obj->ffrCreateVCTraverseHandle(idcode);
+            if (hdl == nullptr) {
+                ok = false;
+            } else {
+                bool loaded_any = false;
+                if (hdl->ffrGotoTheFirstVC() == FSDB_RC_SUCCESS) {
+                    while (true) {
+                        fsdbXTag cur_xtag;
+                        byte_T* vc_ptr = nullptr;
+                        if (hdl->ffrGetXTag(&cur_xtag) != FSDB_RC_SUCCESS ||
+                            hdl->ffrGetVC(&vc_ptr) != FSDB_RC_SUCCESS) {
+                            break;
+                        }
+
+                        const uint64_t t = fsdb_xtag_to_u64(cur_xtag);
+                        bool is_glitch = false;
+                        if (!transitions.empty() && transitions.back().timestamp == t) {
+                            is_glitch = true;
+                            transitions.back().is_glitch = true;
+                        }
+                        transitions.push_back({t, decode_fsdb_value(hdl, vc_ptr), is_glitch});
+                        loaded_any = true;
+
+                        if (hdl->ffrGotoNextVC() != FSDB_RC_SUCCESS) break;
+                    }
+                }
+
+                // Some FSDB traces do not advertise incore VC, but direct traversal still works.
+                // Keep the old min-xtag walk as a compatibility fallback if the first-vc path is empty.
+                if (!loaded_any) {
+                    fsdbXTag xtag;
+                    if (hdl->ffrGetMinXTag(&xtag) == FSDB_RC_SUCCESS &&
+                        hdl->ffrGotoXTag(&xtag) == FSDB_RC_SUCCESS) {
+                        while (true) {
+                            fsdbXTag cur_xtag;
+                            byte_T* vc_ptr = nullptr;
+                            if (hdl->ffrGetXTag(&cur_xtag) != FSDB_RC_SUCCESS ||
+                                hdl->ffrGetVC(&vc_ptr) != FSDB_RC_SUCCESS) {
+                                break;
+                            }
+
+                            const uint64_t t = fsdb_xtag_to_u64(cur_xtag);
+                            bool is_glitch = false;
+                            if (!transitions.empty() && transitions.back().timestamp == t) {
+                                is_glitch = true;
+                                transitions.back().is_glitch = true;
+                            }
+                            transitions.push_back({t, decode_fsdb_value(hdl, vc_ptr), is_glitch});
+
+                            if (hdl->ffrGotoNextVC() != FSDB_RC_SUCCESS) break;
+                        }
+                    }
+                }
+                hdl->ffrFree();
+            }
+
+            (void)fsdb_obj->ffrUnloadSignals(idcode);
+            (void)fsdb_obj->ffrResetSignalList();
+        }
+    }
+
+    if (!ok) return false;
+
+    id_transitions.emplace(info.signal_id, std::move(transitions));
+    fsdb_loaded_signal_ids.insert(info.signal_id);
+    return true;
+}
+#endif
