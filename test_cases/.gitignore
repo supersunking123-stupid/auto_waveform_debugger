@@ -1,21 +1,14 @@
-# VCS generated files
-simv
-simv.daidir/
-csrc/
-*.daidir/
-vcs.log
-*.vpd
-*.fsdb
+# Cross-link test outputs
+cross_link_test_report.md
+cross_link_test_summary.csv
+cross_link_bug_list.json
 
-# rtl_trace generated files
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Test artifacts
 *.db
-*.db.meta
-
-# Build artifacts
-*.o
-*.so
-
-# Editor files
-*.swp
-*.swo
-*~
+*.fsdb
+*.vcd
