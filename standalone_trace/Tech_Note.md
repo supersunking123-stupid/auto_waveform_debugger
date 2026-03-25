@@ -236,6 +236,17 @@ For assignment text, compile stores source offsets instead of full source text. 
 
 This keeps DB size under control.
 
+## Memory Optimization
+
+To handle large designs like NVDLA within a reasonable memory envelope, several optimizations were implemented to reduce peak RSS fragmentation and allocation overhead:
+
+1. **Efficient Containers**: Replaced `std::unordered_map` with `slang::flat_hash_map` for all major compile-time caches (`TraceDb`, `TraceCompileCache`, `BodyTraceIndex`). This significantly reduces pointer-chasing overhead and heap fragmentation.
+2. **Zero-allocation Path Utilities**: Refactored `ParentPath`, `LeafName`, and `SplitPathPrefixLeaf` to use `std::string_view` instead of returning new `std::string` copies. This avoids millions of transient string allocations during hierarchy traversal.
+3. **Structural AST Traversal**: Replaced generic `slang::ast::makeVisitor` (which visits every expression/statement) with a custom structural visitor in `CollectTraceableSymbols`. This skip-logic prevents visiting billions of unnecessary leaf nodes, reducing baseline memory by ~1GB.
+4. **Endpoint Key Normalization**: Replaced the expensive string-concatenation-based `EndpointMergeKey` with a `EndpointKeyView` struct that holds raw pointers/views. This avoids allocating 4.3M massive tracking strings during the merge loop.
+5. **Flat Array Scaling**: Flattened `driver_refs` and `load_refs` from `flat_hash_map<uint32_t, vector<uint32_t>>` into unified `vector<pair<uint32_t, uint32_t>>` arrays. This eradicates the 2-million-vector overhead while maintaining fast sorted access.
+6. **Bounded Cache Growth (`--low-mem`)**: Introduced an optional `--low-mem` flag that periodically flushes the `TraceCompileCache` when cross-module boundaries are detected. This bounds memory at the cost of some wall-time performance (due to AST re-evaluation).
+
 ## Where to start if you need to change behavior
 
 - Change compile-time connectivity extraction:

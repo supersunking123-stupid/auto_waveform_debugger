@@ -33,7 +33,7 @@ ninja -C build
 ## Usage
 
 ```bash
-build/rtl_trace compile --db rtl_trace.db --top <top_module> [--incremental] [--relax-defparam] [--mfcu] [--partition-budget N] [--compile-log <file>] [slang source args...]
+build/rtl_trace compile --db rtl_trace.db --top <top_module> [--incremental] [--relax-defparam] [--mfcu] [--low-mem] [--partition-budget N] [--compile-log <file>] [slang source args...]
 build/rtl_trace trace --db rtl_trace.db --mode drivers --signal top.u0.sig[3] \
   [--cone-level N] [--prefer-port-hop] [--depth N] [--max-nodes N] [--include RE] [--exclude RE] [--stop-at RE] [--format text|json]
 build/rtl_trace trace --db rtl_trace.db --mode loads --signal top.u0.sig[7:4] \
@@ -49,6 +49,7 @@ build/rtl_trace serve [--db rtl_trace.db]
 - `compile --incremental` 会基于输入指纹复用已有 DB（命中时跳过重编译）。
 - `compile --relax-defparam` 会放宽 defparam 相关报错（例如跨层级 defparam 暂未解析时），便于先生成可用 DB。
 - `compile --mfcu` 使用“分组 MFCU”：每个 `-f` 文件列表内的源文件合并为一个 compilation unit，命令行直接传入的源文件合并为另一个 compilation unit（而不是把所有输入全并成一个 unit）。
+- `compile --low-mem` 使用低内存模式：在 `SaveGraphDb` 阶段会主动清理 `TraceCompileCache`（每跨越 200 个 module body 清理一次）。在大设计（如 NVDLA）上可以节省约 **1.1 GB** 的峰值内存，但会增加约 **10-15s** 的 Wall Time（由于 cache miss 导致的 AST 重复解析）。
 - `compile --partition-budget N` 会按实例树做预算切分并分区生成 DB（日志会显示切分结果和每个分区执行进度）。
 - `compile --compile-log <file>` 会把编译阶段关键步骤与分区信息同步写入日志文件（同时仍打印到屏幕）；对于 DB 生成阶段，还会额外记录 `save_graph_db` 子步骤用时（如 `build_graph`、`write_file`）。
 - `trace` 阶段只查询数据库，不会再次解析 RTL。

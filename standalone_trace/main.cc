@@ -21,10 +21,42 @@
 #include <cctype>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include "slang/util/Hash.h"
 #include <ctime>
+#include <sys/resource.h>
+#include <unistd.h>
+
+long GetMaxRSSMB() {
+  struct rusage usage;
+  if (getrusage(RUSAGE_SELF, &usage) == 0) {
+    return usage.ru_maxrss / 1024; // Linux ru_maxrss is in kb
+  }
+  return 0;
+}
+
+long GetCurrentRSSMB() {
+  long rss = 0;
+  std::ifstream in("/proc/self/statm");
+  if (in.is_open()) {
+    long size, resident;
+    if (in >> size >> resident) {
+      long page_size = sysconf(_SC_PAGE_SIZE);
+      rss = (resident * page_size) / (1024 * 1024);
+    }
+  }
+  return rss;
+}
+
+#include <iostream>
+
+void LogMem(const std::string& step) {
+  std::cout << "[Memory] " << step << " Current RSS: " << GetCurrentRSSMB() << "MB, Peak RSS: " << GetMaxRSSMB() << "MB\n";
+}
+
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -91,10 +123,10 @@ struct GlobalNetRecord {
 };
 
 struct TraceDb {
-  std::unordered_map<std::string, SignalRecord> signals;
-  std::unordered_map<std::string, HierNodeRecord> hierarchy;
-  std::unordered_map<std::string, GlobalNetRecord> global_nets;
-  std::unordered_map<std::string, std::string> global_sink_to_source;
+  slang::flat_hash_map<std::string, SignalRecord> signals;
+  slang::flat_hash_map<std::string, HierNodeRecord> hierarchy;
+  slang::flat_hash_map<std::string, GlobalNetRecord> global_nets;
+  slang::flat_hash_map<std::string, std::string> global_sink_to_source;
   std::vector<std::string> path_pool;
   std::vector<std::string> file_pool;
   std::string db_dir;
@@ -159,8 +191,8 @@ struct GraphDb {
   std::vector<uint32_t> hierarchy_children;
   std::vector<GraphGlobalNetRecord> global_nets;
   std::vector<uint32_t> global_sinks;
-  std::unordered_map<uint32_t, size_t> load_ref_index;
-  std::unordered_map<uint32_t, size_t> driver_ref_index;
+  slang::flat_hash_map<uint32_t, size_t> load_ref_index;
+  slang::flat_hash_map<uint32_t, size_t> driver_ref_index;
 };
 
 struct TraceSession {
@@ -168,10 +200,10 @@ struct TraceSession {
   std::optional<GraphDb> graph;
   std::string db_path;
   std::string db_mtime;
-  std::unordered_map<std::string_view, uint32_t> signal_name_to_id;
+  slang::flat_hash_map<std::string_view, uint32_t> signal_name_to_id;
   std::vector<const std::string *> signal_names_by_id;
-  std::unordered_map<uint32_t, SignalRecord> materialized_signal_records;
-  std::unordered_map<std::string, std::string> source_file_cache;
+  slang::flat_hash_map<uint32_t, SignalRecord> materialized_signal_records;
+  slang::flat_hash_map<std::string, std::string> source_file_cache;
   bool signal_index_ready = false;
   bool reverse_refs_ready = false;
   bool hierarchy_ready = false;
@@ -190,15 +222,15 @@ enum SessionBuildFlags : uint32_t {
 };
 
 struct BodyTraceIndex {
-  std::unordered_map<const slang::ast::Symbol *, std::vector<TraceResult>> drivers;
-  std::unordered_map<const slang::ast::Symbol *, std::vector<TraceResult>> loads;
+  slang::flat_hash_map<const slang::ast::Symbol *, std::vector<TraceResult>> drivers;
+  slang::flat_hash_map<const slang::ast::Symbol *, std::vector<TraceResult>> loads;
 };
 
 struct TraceCompileCache {
-  std::unordered_map<const slang::ast::AssignmentExpression *, SymbolRefList> assignment_lhs_signals;
-  std::unordered_map<const slang::ast::AssignmentExpression *, SymbolRefList> assignment_rhs_signals;
-  std::unordered_map<const slang::ast::Statement *, SymbolRefList> statement_lhs_signals;
-  std::unordered_map<const slang::ast::InstanceBodySymbol *, BodyTraceIndex> body_trace_indexes;
+  slang::flat_hash_map<const slang::ast::AssignmentExpression *, SymbolRefList> assignment_lhs_signals;
+  slang::flat_hash_map<const slang::ast::AssignmentExpression *, SymbolRefList> assignment_rhs_signals;
+  slang::flat_hash_map<const slang::ast::Statement *, SymbolRefList> statement_lhs_signals;
+  slang::flat_hash_map<const slang::ast::InstanceBodySymbol *, BodyTraceIndex> body_trace_indexes;
 };
 
 class CompileLogger {
@@ -398,7 +430,7 @@ std::string MakeInstancePortPath(const slang::ast::InstanceSymbol *instance,
 }
 
 template <bool DRIVERS>
-class BodyTraceIndexBuilder : public slang::ast::ASTVisitor<BodyTraceIndexBuilder<DRIVERS>, true, true> {
+class BodyTraceIndexBuilder : public slang::ast::ASTVisitor<BodyTraceIndexBuilder<DRIVERS>, slang::ast::VisitFlags::AllGood> {
  public:
   BodyTraceIndexBuilder(BodyTraceIndex &index, TraceCompileCache &cache)
       : index_(index), cache_(cache) {}
@@ -574,7 +606,7 @@ class BodyTraceIndexBuilder : public slang::ast::ASTVisitor<BodyTraceIndexBuilde
   void handle(const slang::ast::UninstantiatedDefSymbol &uninst) {}
 
  private:
-  std::unordered_map<const slang::ast::Symbol *, std::vector<TraceResult>> &Entries() {
+  slang::flat_hash_map<const slang::ast::Symbol *, std::vector<TraceResult>> &Entries() {
     if constexpr (DRIVERS) {
       return index_.drivers;
     } else {
@@ -610,7 +642,7 @@ const BodyTraceIndex &GetOrBuildBodyTraceIndex(const slang::ast::InstanceBodySym
 }
 
 class PortConnectionResultCollector
-    : public slang::ast::ASTVisitor<PortConnectionResultCollector, true, true> {
+    : public slang::ast::ASTVisitor<PortConnectionResultCollector, slang::ast::VisitFlags::AllGood> {
  public:
   PortConnectionResultCollector(std::vector<TraceResult> &out,
                                 std::unordered_set<const slang::ast::Symbol *> &visited)
@@ -673,7 +705,7 @@ std::vector<TraceResult> ComputeIndexedTraceResults(
   if (body == nullptr) return {};
 
   const BodyTraceIndex &index = GetOrBuildBodyTraceIndex(*body, cache);
-  const auto &entries = [&]() -> const std::unordered_map<const slang::ast::Symbol *, std::vector<TraceResult>> & {
+  const auto &entries = [&]() -> const slang::flat_hash_map<const slang::ast::Symbol *, std::vector<TraceResult>> & {
     if constexpr (DRIVERS) {
       return index.drivers;
     } else {
@@ -781,26 +813,26 @@ std::optional<std::pair<uint32_t, uint32_t>> GetSourceOffsetRange(slang::SourceR
   return std::make_pair(static_cast<uint32_t>(start.offset()), static_cast<uint32_t>(end.offset()));
 }
 
-std::string ParentPath(const std::string &path) {
+std::string_view ParentPath(std::string_view path) {
   const size_t pos = path.rfind('.');
-  if (pos == std::string::npos) return "";
+  if (pos == std::string_view::npos) return "";
   return path.substr(0, pos);
 }
 
-std::string LeafName(const std::string &path) {
+std::string_view LeafName(std::string_view path) {
   const size_t pos = path.rfind('.');
-  if (pos == std::string::npos) return path;
+  if (pos == std::string_view::npos) return path;
   return path.substr(pos + 1);
 }
 
-std::pair<std::string, std::string> SplitPathPrefixLeaf(const std::string &path) {
+std::pair<std::string_view, std::string_view> SplitPathPrefixLeaf(std::string_view path) {
   const size_t pos = path.rfind('.');
-  if (pos == std::string::npos) return {"", path};
+  if (pos == std::string_view::npos) return {"", path};
   return {path.substr(0, pos), path.substr(pos + 1)};
 }
 
 uint32_t InternString(const std::string &s, std::vector<std::string> &pool,
-                      std::unordered_map<std::string, uint32_t> &index) {
+                      slang::flat_hash_map<std::string, uint32_t> &index) {
   auto it = index.find(s);
   if (it != index.end()) return it->second;
   const uint32_t id = static_cast<uint32_t>(pool.size());
@@ -865,26 +897,48 @@ std::string FormatBitRange(int32_t hi, int32_t lo) {
   return "[" + std::to_string(hi) + ":" + std::to_string(lo) + "]";
 }
 
-std::string EndpointMergeKey(const EndpointRecord &e) {
-  std::string lhs;
-  for (size_t i = 0; i < e.lhs_signals.size(); ++i) {
-    if (i) lhs += '\n';
-    lhs += e.lhs_signals[i];
+struct EndpointKeyView {
+  int kind;
+  std::string_view path;
+  std::string_view file;
+  int line;
+  std::string_view direction;
+  bool range;
+  int32_t a_start;
+  int32_t a_end;
+  std::string_view a_text;
+  const std::vector<std::string>* lhs;
+  const std::vector<std::string>* rhs;
+
+  bool operator==(const EndpointKeyView& o) const {
+    return kind == o.kind && path == o.path && file == o.file && line == o.line &&
+           direction == o.direction && range == o.range && a_start == o.a_start &&
+           a_end == o.a_end && a_text == o.a_text && *lhs == *o.lhs && *rhs == *o.rhs;
   }
-  std::string rhs;
-  for (size_t i = 0; i < e.rhs_signals.size(); ++i) {
-    if (i) rhs += '\n';
-    rhs += e.rhs_signals[i];
+};
+
+struct EndpointKeyHash {
+  size_t operator()(const EndpointKeyView& k) const {
+    size_t h = std::hash<std::string_view>()(k.path);
+    h ^= std::hash<int>()(k.line) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    h ^= std::hash<std::string_view>()(k.a_text) + 0x9e3779b9 + (h << 6) + (h >> 2);
+    return h;
   }
-  return std::to_string(static_cast<int>(e.kind)) + "\t" + e.path + "\t" + e.file + "\t" +
-         std::to_string(e.line) + "\t" + e.direction + "\t" + (e.has_assignment_range ? "1" : "0") + "\t" +
-         std::to_string(e.assignment_start) + "\t" + std::to_string(e.assignment_end) + "\t" +
-         e.assignment_text + "\t" + lhs + "\t" + rhs;
+};
+
+EndpointKeyView MakeEndpointKeyView(const EndpointRecord &e) {
+  return EndpointKeyView{
+      static_cast<int>(e.kind),
+      e.path, e.file, e.line, e.direction,
+      e.has_assignment_range, e.assignment_start, e.assignment_end, e.assignment_text,
+      &e.lhs_signals, &e.rhs_signals};
 }
 
-std::vector<EndpointRecord> MergeEndpointBitRanges(std::vector<EndpointRecord> endpoints) {
+using EndpointMergeGroups = slang::flat_hash_map<EndpointKeyView, std::vector<std::pair<std::pair<int32_t, int32_t>, EndpointRecord>>, EndpointKeyHash>;
+
+void MergeEndpointBitRangesInPlace(std::vector<EndpointRecord>& endpoints, EndpointMergeGroups& groups) {
+  groups.clear();
   std::vector<EndpointRecord> out;
-  std::unordered_map<std::string, std::vector<std::pair<std::pair<int32_t, int32_t>, EndpointRecord>>> groups;
   out.reserve(endpoints.size());
   for (EndpointRecord &e : endpoints) {
     if (e.bit_map.empty() || e.bit_map_approximate) {
@@ -898,7 +952,7 @@ std::vector<EndpointRecord> MergeEndpointBitRanges(std::vector<EndpointRecord> e
     }
     const int32_t lo = std::min(parsed->first, parsed->second);
     const int32_t hi = std::max(parsed->first, parsed->second);
-    groups[EndpointMergeKey(e)].push_back({{lo, hi}, std::move(e)});
+    groups[MakeEndpointKeyView(e)].push_back({{lo, hi}, std::move(e)});
   }
 
   for (auto &[_, vec] : groups) {
@@ -924,13 +978,13 @@ std::vector<EndpointRecord> MergeEndpointBitRanges(std::vector<EndpointRecord> e
       out.push_back(std::move(merged));
     }
   }
-  return out;
+  endpoints = std::move(out);
 }
 
 constexpr size_t kCompactGlobalNetThreshold = 1024;
 
 bool LooksLikeClockOrResetName(std::string_view path) {
-  std::string leaf = LeafName(std::string(path));
+  std::string leaf = std::string(LeafName(path));
   for (char &c : leaf)
     c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
   if (leaf == "clk" || leaf == "clock" || leaf == "rst" || leaf == "reset" || leaf == "rst_n" ||
@@ -941,7 +995,7 @@ bool LooksLikeClockOrResetName(std::string_view path) {
 }
 
 std::string ClassifyGlobalNetCategory(std::string_view path) {
-  std::string leaf = LeafName(std::string(path));
+  std::string leaf = std::string(LeafName(path));
   for (char &c : leaf)
     c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
   if (leaf.find("rst") != std::string::npos || leaf.find("reset") != std::string::npos) {
@@ -1042,7 +1096,7 @@ std::pair<std::string, bool> DescribeBitSelectors(
 SymbolRefList CollectRhsSignals(const slang::ast::AssignmentExpression *assignment) {
   if (assignment == nullptr) return {};
 
-  class RhsSignalCollector : public slang::ast::ASTVisitor<RhsSignalCollector, true, true> {
+  class RhsSignalCollector : public slang::ast::ASTVisitor<RhsSignalCollector, slang::ast::VisitFlags::AllGood> {
    public:
     explicit RhsSignalCollector(SymbolRefList &out) : out_(out) {}
 
@@ -1066,7 +1120,7 @@ SymbolRefList CollectRhsSignals(const slang::ast::AssignmentExpression *assignme
 SymbolRefList CollectLhsSignals(const slang::ast::AssignmentExpression *assignment) {
   if (assignment == nullptr) return {};
 
-  class LhsSignalCollector : public slang::ast::ASTVisitor<LhsSignalCollector, true, true> {
+  class LhsSignalCollector : public slang::ast::ASTVisitor<LhsSignalCollector, slang::ast::VisitFlags::AllGood> {
    public:
     explicit LhsSignalCollector(SymbolRefList &out) : out_(out) {}
 
@@ -1089,12 +1143,12 @@ SymbolRefList CollectLhsSignals(const slang::ast::AssignmentExpression *assignme
 
 SymbolRefList CollectLhsSignalsFromStatement(const slang::ast::Statement &stmt) {
   class StatementLhsCollector
-      : public slang::ast::ASTVisitor<StatementLhsCollector, true, true> {
+      : public slang::ast::ASTVisitor<StatementLhsCollector, slang::ast::VisitFlags::AllGood> {
    public:
     explicit StatementLhsCollector(SymbolRefList &out) : out_(out) {}
 
     void handle(const slang::ast::AssignmentExpression &assignment) {
-      class LhsCollector : public slang::ast::ASTVisitor<LhsCollector, true, true> {
+      class LhsCollector : public slang::ast::ASTVisitor<LhsCollector, slang::ast::VisitFlags::AllGood> {
        public:
         explicit LhsCollector(SymbolRefList &out) : out_(out) {}
 
@@ -1213,7 +1267,7 @@ EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManag
 }
 
 void CollectTraceableSymbols(const slang::ast::RootSymbol &root,
-                             std::unordered_map<std::string, const slang::ast::Symbol *> &out) {
+                             slang::flat_hash_map<std::string, const slang::ast::Symbol *> &out) {
   auto collect_from_scope = [&](const slang::ast::Scope &scope) {
     for (const auto &net : scope.membersOfType<slang::ast::NetSymbol>()) {
       out.try_emplace(std::string(net.getHierarchicalPath()), &net);
@@ -1223,49 +1277,87 @@ void CollectTraceableSymbols(const slang::ast::RootSymbol &root,
     }
   };
 
+  auto visit_structural = [&](auto &self, const slang::ast::Scope &scope) -> void {
+    for (const auto &member : scope.members()) {
+      if (member.kind == slang::ast::SymbolKind::Instance) {
+        const auto &child_inst = member.as<slang::ast::InstanceSymbol>();
+        collect_from_scope(child_inst.body);
+        self(self, child_inst.body);
+      } else if (member.kind == slang::ast::SymbolKind::InstanceArray) {
+        for (const auto &elem_ptr : member.as<slang::ast::InstanceArraySymbol>().elements) {
+          const auto &elem = elem_ptr->as<slang::ast::InstanceSymbol>();
+          collect_from_scope(elem.body);
+          self(self, elem.body);
+        }
+      } else if (member.kind == slang::ast::SymbolKind::GenerateBlock) {
+        const auto &gen = member.as<slang::ast::GenerateBlockSymbol>();
+        if (!gen.isUninstantiated) {
+          collect_from_scope(gen);
+          self(self, gen);
+        }
+      } else if (member.kind == slang::ast::SymbolKind::GenerateBlockArray) {
+        for (const auto &elem_ptr : member.as<slang::ast::GenerateBlockArraySymbol>().entries) {
+          const auto &elem = elem_ptr->as<slang::ast::GenerateBlockSymbol>();
+          if (!elem.isUninstantiated) {
+            collect_from_scope(elem);
+            self(self, elem);
+          }
+        }
+      }
+    }
+  };
+
   for (const slang::ast::InstanceSymbol *top : root.topInstances) {
     collect_from_scope(top->body);
-    top->visit(slang::ast::makeVisitor(
-        [&](auto &visitor, const slang::ast::InstanceSymbol &inst) {
-          collect_from_scope(inst.body);
-          visitor.visitDefault(inst);
-        },
-        [&](auto &visitor, const slang::ast::GenerateBlockSymbol &gen) {
-          if (gen.isUninstantiated) return;
-          collect_from_scope(gen);
-          visitor.visitDefault(gen);
-        }));
+    visit_structural(visit_structural, top->body);
   }
 }
 
 void CollectInstanceHierarchy(const slang::ast::RootSymbol &root, TraceDb &db) {
-  std::unordered_map<std::string, std::string> modules;
+  slang::flat_hash_map<std::string, std::string> modules;
+  modules.reserve(2000000); // Pre-allocate to prevent rehash fragmentation
   auto note_instance = [&](const slang::ast::InstanceSymbol &inst) {
     modules.try_emplace(std::string(inst.getHierarchicalPath()),
                         std::string(inst.getDefinition().name));
   };
 
+  auto visit_structural = [&](auto &self, const slang::ast::Scope &scope) -> void {
+    for (const auto &member : scope.members()) {
+      if (member.kind == slang::ast::SymbolKind::Instance) {
+        const auto &child_inst = member.as<slang::ast::InstanceSymbol>();
+        note_instance(child_inst);
+        self(self, child_inst.body);
+      } else if (member.kind == slang::ast::SymbolKind::InstanceArray) {
+        for (const auto &elem_ptr : member.as<slang::ast::InstanceArraySymbol>().elements) {
+          const auto &elem = elem_ptr->as<slang::ast::InstanceSymbol>();
+          note_instance(elem);
+          self(self, elem.body);
+        }
+      } else if (member.kind == slang::ast::SymbolKind::GenerateBlock) {
+        const auto &gen = member.as<slang::ast::GenerateBlockSymbol>();
+        if (!gen.isUninstantiated) self(self, gen);
+      } else if (member.kind == slang::ast::SymbolKind::GenerateBlockArray) {
+        for (const auto &elem_ptr : member.as<slang::ast::GenerateBlockArraySymbol>().entries) {
+          const auto &elem = elem_ptr->as<slang::ast::GenerateBlockSymbol>();
+          if (!elem.isUninstantiated) self(self, elem);
+        }
+      }
+    }
+  };
+
   for (const slang::ast::InstanceSymbol *top : root.topInstances) {
     note_instance(*top);
-    top->visit(slang::ast::makeVisitor(
-        [&](auto &visitor, const slang::ast::InstanceSymbol &inst) {
-          note_instance(inst);
-          visitor.visitDefault(inst);
-        },
-        [&](auto &visitor, const slang::ast::GenerateBlockSymbol &gen) {
-          if (gen.isUninstantiated) return;
-          visitor.visitDefault(gen);
-        }));
+    visit_structural(visit_structural, top->body);
   }
 
   for (const auto &[path, module] : modules) {
     auto &node = db.hierarchy[path];
     node.module = module;
   }
-  for (const auto &[path, _] : modules) {
-    const std::string parent = ParentPath(path);
+  for (const auto &[path, _] : db.hierarchy) {
+    std::string_view parent = ParentPath(path);
     if (parent.empty()) continue;
-    auto parent_it = db.hierarchy.find(parent);
+    auto parent_it = db.hierarchy.find(std::string(parent));
     if (parent_it == db.hierarchy.end()) continue;
     parent_it->second.children.push_back(path);
   }
@@ -1278,16 +1370,19 @@ void CollectInstanceHierarchy(const slang::ast::RootSymbol &root, TraceDb &db) {
 void BuildHierarchyFromSignals(TraceDb &db) {
   if (!db.hierarchy.empty()) return;
   for (const auto &[sig, _] : db.signals) {
-    std::string cur = ParentPath(sig);
+    std::string_view cur = ParentPath(sig);
     while (!cur.empty()) {
-      db.hierarchy.try_emplace(cur, HierNodeRecord{});
+      auto it = db.hierarchy.find(std::string(cur));
+      if (it == db.hierarchy.end()) {
+        db.hierarchy.emplace(std::string(cur), HierNodeRecord{});
+      }
       cur = ParentPath(cur);
     }
   }
   for (const auto &[path, _] : db.hierarchy) {
-    const std::string parent = ParentPath(path);
+    std::string_view parent = ParentPath(path);
     if (parent.empty()) continue;
-    auto it = db.hierarchy.find(parent);
+    auto it = db.hierarchy.find(std::string(parent));
     if (it == db.hierarchy.end()) continue;
     it->second.children.push_back(path);
   }
@@ -1305,11 +1400,11 @@ bool IsUnderHierarchyRoot(const std::string &signal, const std::string &root) {
   return signal[root.size()] == '.';
 }
 
-std::unordered_map<std::string, size_t> BuildSubtreeSignalCounts(
+slang::flat_hash_map<std::string_view, size_t> BuildSubtreeSignalCounts(
     const std::vector<std::string> &keys) {
-  std::unordered_map<std::string, size_t> counts;
+  slang::flat_hash_map<std::string_view, size_t> counts;
   for (const std::string &sig : keys) {
-    std::string inst = ParentPath(sig);
+    std::string_view inst = ParentPath(sig);
     while (!inst.empty()) {
       counts[inst] += 1;
       inst = ParentPath(inst);
@@ -1319,7 +1414,7 @@ std::unordered_map<std::string, size_t> BuildSubtreeSignalCounts(
 }
 
 std::vector<PartitionRecord> PlanHierarchyPartitions(
-    const TraceDb &hier_db, const std::unordered_map<std::string, size_t> &subtree_counts,
+    const TraceDb &hier_db, const slang::flat_hash_map<std::string_view, size_t> &subtree_counts,
     size_t budget, CompileLogger *logger) {
   std::vector<std::string> roots;
   roots.reserve(hier_db.hierarchy.size());
@@ -1410,9 +1505,9 @@ std::vector<std::vector<size_t>> BucketSignalsByPartitions(
 }
 
 bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &keys,
-                 const std::unordered_map<std::string, const slang::ast::Symbol *> &symbols,
+                 const slang::flat_hash_map<std::string, const slang::ast::Symbol *> &symbols,
                  const slang::SourceManager &sm, const TraceDb &hier_db, size_t &signal_count,
-                 CompileLogger *logger) {
+                 bool low_mem, CompileLogger *logger) {
   using Clock = std::chrono::steady_clock;
   auto fmt_seconds = [](const Clock::time_point &start, const Clock::time_point &end) {
     std::ostringstream os;
@@ -1428,11 +1523,17 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &key
   }
 
   GraphDb graph;
-  std::unordered_map<std::string, uint32_t> string_index;
-  std::unordered_map<uint32_t, std::vector<uint32_t>> load_refs;
-  std::unordered_map<uint32_t, std::vector<uint32_t>> driver_refs;
+  slang::flat_hash_map<std::string, uint32_t> string_index;
+  std::vector<std::pair<uint32_t, uint32_t>> load_refs_flat;
+  std::vector<std::pair<uint32_t, uint32_t>> driver_refs_flat;
   TraceDb compact_db;
   TraceCompileCache trace_cache;
+  EndpointMergeGroups merge_groups;
+
+  graph.endpoints.reserve(5000000);
+  string_index.reserve(2000000);
+  load_refs_flat.reserve(5000000);
+  driver_refs_flat.reserve(5000000);
 
   auto intern = [&](const std::string &s) -> uint32_t {
     return InternString(s, graph.strings, string_index);
@@ -1469,10 +1570,22 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &key
 
   const auto t_build_start = Clock::now();
   signal_count = 0;
+  const slang::ast::InstanceBodySymbol* current_cache_body = nullptr;
   for (size_t sig_id = 0; sig_id < keys.size(); ++sig_id) {
     const std::string &path = keys[sig_id];
     auto it = symbols.find(path);
     if (it == symbols.end() || !IsTraceable(it->second)) continue;
+
+    const slang::ast::InstanceBodySymbol *body = GetContainingInstance(it->second);
+    if (body != current_cache_body) {
+      if (low_mem && trace_cache.body_trace_indexes.size() > 200) {
+        trace_cache.body_trace_indexes.clear();
+        trace_cache.assignment_lhs_signals.clear();
+        trace_cache.assignment_rhs_signals.clear();
+        trace_cache.statement_lhs_signals.clear();
+      }
+      current_cache_body = body;
+    }
 
     SignalRecord rec = build_signal_record(it->second);
     if (ShouldCompactGlobalNet(path, rec.loads.size())) {
@@ -1486,21 +1599,21 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &key
         rec.loads.clear();
       }
     }
-    rec.drivers = MergeEndpointBitRanges(std::move(rec.drivers));
-    rec.loads = MergeEndpointBitRanges(std::move(rec.loads));
+    MergeEndpointBitRangesInPlace(rec.drivers, merge_groups);
+    MergeEndpointBitRangesInPlace(rec.loads, merge_groups);
 
     GraphSignalRecord &gs = graph.signals[sig_id];
     gs.driver_begin = static_cast<uint32_t>(graph.endpoints.size());
     gs.driver_count = static_cast<uint32_t>(rec.drivers.size());
     for (const EndpointRecord &e : rec.drivers) {
       append_endpoint(e);
-      if (!e.path.empty()) driver_refs[intern(e.path)].push_back(static_cast<uint32_t>(sig_id));
+      if (!e.path.empty()) driver_refs_flat.push_back({intern(e.path), static_cast<uint32_t>(sig_id)});
     }
     gs.load_begin = static_cast<uint32_t>(graph.endpoints.size());
     gs.load_count = static_cast<uint32_t>(rec.loads.size());
     for (const EndpointRecord &e : rec.loads) {
       append_endpoint(e);
-      if (!e.path.empty()) load_refs[intern(e.path)].push_back(static_cast<uint32_t>(sig_id));
+      if (!e.path.empty()) load_refs_flat.push_back({intern(e.path), static_cast<uint32_t>(sig_id)});
     }
     ++signal_count;
   }
@@ -1513,27 +1626,36 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &key
   }
 
   auto finalize_path_refs =
-      [&](std::unordered_map<uint32_t, std::vector<uint32_t>> &src, std::vector<GraphPathRefRange> &ranges,
+      [&](std::vector<std::pair<uint32_t, uint32_t>> &flat_src, std::vector<GraphPathRefRange> &ranges,
           std::vector<uint32_t> &flat) {
-        std::vector<uint32_t> path_ids;
-        path_ids.reserve(src.size());
-        for (const auto &[path_id, _] : src)
-          path_ids.push_back(path_id);
-        std::sort(path_ids.begin(), path_ids.end());
-        for (uint32_t path_id : path_ids) {
-          std::vector<uint32_t> &vec = src[path_id];
-          std::sort(vec.begin(), vec.end());
-          vec.erase(std::unique(vec.begin(), vec.end()), vec.end());
-          GraphPathRefRange range;
-          range.path_str_id = path_id;
-          range.begin = static_cast<uint32_t>(flat.size());
-          range.count = static_cast<uint32_t>(vec.size());
-          flat.insert(flat.end(), vec.begin(), vec.end());
-          ranges.push_back(range);
+        if (flat_src.empty()) return;
+        std::sort(flat_src.begin(), flat_src.end());
+        flat_src.erase(std::unique(flat_src.begin(), flat_src.end()), flat_src.end());
+        
+        flat.reserve(flat_src.size());
+        uint32_t current_path = flat_src[0].first;
+        uint32_t current_begin = 0;
+        
+        for (size_t i = 0; i < flat_src.size(); ++i) {
+          if (flat_src[i].first != current_path) {
+            GraphPathRefRange range;
+            range.path_str_id = current_path;
+            range.begin = current_begin;
+            range.count = static_cast<uint32_t>(flat.size() - current_begin);
+            ranges.push_back(range);
+            current_path = flat_src[i].first;
+            current_begin = static_cast<uint32_t>(flat.size());
+          }
+          flat.push_back(flat_src[i].second);
         }
+        GraphPathRefRange range;
+        range.path_str_id = current_path;
+        range.begin = current_begin;
+        range.count = static_cast<uint32_t>(flat.size() - current_begin);
+        ranges.push_back(range);
       };
-  finalize_path_refs(load_refs, graph.load_ref_ranges, graph.load_ref_signal_ids);
-  finalize_path_refs(driver_refs, graph.driver_ref_ranges, graph.driver_ref_signal_ids);
+  finalize_path_refs(load_refs_flat, graph.load_ref_ranges, graph.load_ref_signal_ids);
+  finalize_path_refs(driver_refs_flat, graph.driver_ref_ranges, graph.driver_ref_signal_ids);
 
   std::vector<std::string> hier_paths;
   hier_paths.reserve(hier_db.hierarchy.size());
@@ -1577,7 +1699,10 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &key
 
   std::vector<uint32_t> string_offsets;
   string_offsets.reserve(graph.strings.size() + 1);
+  size_t total_str_bytes = 0;
+  for (const std::string &s : graph.strings) total_str_bytes += s.size();
   std::string string_blob;
+  string_blob.reserve(total_str_bytes);
   for (const std::string &s : graph.strings) {
     string_offsets.push_back(static_cast<uint32_t>(string_blob.size()));
     string_blob += s;
@@ -2303,6 +2428,7 @@ int RunCompile(int argc, char *argv[]) {
   bool incremental = false;
   bool relax_defparam = false;
   bool mfcu = false;
+  bool low_mem = false;
   size_t partition_budget = 0;
   std::string compile_log_path;
   std::vector<std::string> passthrough_args;
@@ -2311,7 +2437,7 @@ int RunCompile(int argc, char *argv[]) {
     const std::string arg = argv[i];
     if (arg == "-h" || arg == "--help") {
       std::cout << "Usage: rtl_trace compile [--db <file>] [--incremental] [--relax-defparam] [--mfcu] "
-                   "[--partition-budget <N>] [--compile-log <file>] "
+                   "[--low-mem] [--partition-budget <N>] [--compile-log <file>] "
                    "[slang source args...]\n";
       return 0;
     }
@@ -2333,6 +2459,10 @@ int RunCompile(int argc, char *argv[]) {
     }
     if (arg == "--mfcu") {
       mfcu = true;
+      continue;
+    }
+    if (arg == "--low-mem") {
+      low_mem = true;
       continue;
     }
     if (arg == "--partition-budget") {
@@ -2460,8 +2590,10 @@ int RunCompile(int argc, char *argv[]) {
   logger.Log("step: parse all sources");
   if (!driver.parseAllSources()) return 1;
   logger.Log("step: create compilation and elaborate");
+  LogMem("MemBeforeElab");
   std::unique_ptr<slang::ast::Compilation> compilation = driver.createCompilation();
   driver.reportCompilation(*compilation, /*quiet*/ true);
+  LogMem("MemAfterElab");
   if (HasBlockingCompileDiagnostics(*compilation, relax_defparam)) {
     if (!driver.reportDiagnostics(/*quiet*/ true)) return 1;
   }
@@ -2469,9 +2601,12 @@ int RunCompile(int argc, char *argv[]) {
   const slang::ast::RootSymbol &root = compilation->getRoot();
   const slang::SourceManager &sm = *compilation->getSourceManager();
 
-  std::unordered_map<std::string, const slang::ast::Symbol *> symbols;
+  slang::flat_hash_map<std::string, const slang::ast::Symbol *> symbols;
+  symbols.reserve(2000000); // Pre-allocate to prevent massive rehash spikes
   logger.Log("step: collect traceable symbols");
+  LogMem("MemBeforeCollectSymbols");
   CollectTraceableSymbols(root, symbols);
+  LogMem("MemAfterCollectSymbols");
 
   std::vector<std::string> keys;
   keys.reserve(symbols.size());
@@ -2482,7 +2617,9 @@ int RunCompile(int argc, char *argv[]) {
 
   TraceDb hier_db;
   logger.Log("step: collect instance hierarchy");
+  LogMem("MemBeforeCollectHierarchy");
   CollectInstanceHierarchy(root, hier_db);
+  LogMem("MemAfterCollectHierarchy");
 
   std::vector<PartitionRecord> parts;
   std::vector<std::vector<size_t>> buckets;
@@ -2505,10 +2642,12 @@ int RunCompile(int argc, char *argv[]) {
 
   logger.Log("step: emit db");
   size_t written_signal_count = 0;
-  if (!SaveGraphDb(db_path, keys, symbols, sm, hier_db, written_signal_count, &logger)) {
+  LogMem("MemBeforeSaveGraphDb");
+  if (!SaveGraphDb(db_path, keys, symbols, sm, hier_db, written_signal_count, low_mem, &logger)) {
     std::cerr << "Failed to write DB: " << db_path << "\n";
     return 1;
   }
+  LogMem("MemAfterSaveGraphDb");
   std::ofstream meta_out(meta_path);
   if (meta_out.is_open()) meta_out << new_fingerprint;
   logger.Log("compile done: db=" + db_path + " signals=" + std::to_string(written_signal_count));
@@ -3278,7 +3417,7 @@ int RunTrace(int argc, char *argv[]) {
 std::vector<std::string> HierRoots(const TraceDb &db) {
   std::vector<std::string> roots;
   for (const auto &[path, _] : db.hierarchy) {
-    const std::string parent = ParentPath(path);
+    const std::string parent = std::string(ParentPath(path));
     if (parent.empty() || db.hierarchy.find(parent) == db.hierarchy.end()) {
       roots.push_back(path);
     }
