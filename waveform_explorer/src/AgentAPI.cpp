@@ -23,6 +23,34 @@ json AgentAPI::get_signal_info(const std::string& signal_path) {
     };
 }
 
+json AgentAPI::list_signals_page(const std::string& prefix, const std::string& cursor, uint64_t limit) {
+    if (!db.is_fsdb_backend()) {
+        return {
+            {"status", "error"},
+            {"message", "list_signals_page is only supported for FSDB waveforms"}
+        };
+    }
+
+    bool has_more = false;
+    std::string next_cursor;
+    const auto page = db.list_signal_paths_page(prefix, cursor, static_cast<size_t>(limit), has_more, next_cursor);
+
+    json data = json::array();
+    for (const auto& path : page) {
+        data.push_back(path);
+    }
+
+    return {
+        {"status", "success"},
+        {"data", data},
+        {"prefix", prefix},
+        {"cursor", cursor},
+        {"limit", limit},
+        {"has_more", has_more},
+        {"next_cursor", has_more ? next_cursor : ""}
+    };
+}
+
 json AgentAPI::get_snapshot(const std::vector<std::string>& signal_paths, uint64_t time) {
     json data = json::object();
     for (const auto& path : signal_paths) {
@@ -69,15 +97,15 @@ json AgentAPI::find_edge(const std::string& signal_path, const std::string& edge
         }
     } else {
         // Backward search
-        auto it = std::lower_bound(trans.begin(), trans.end(), start_time,
-            [](const Transition& tr, uint64_t t) {
-                return tr.timestamp < t;
+        auto it = std::upper_bound(trans.begin(), trans.end(), start_time,
+            [](uint64_t t, const Transition& tr) {
+                return t < tr.timestamp;
             });
-        
-        if (it == trans.end() || it->timestamp >= start_time) {
-            if (it != trans.begin()) --it;
-            else return {{"status", "success"}, {"data", -1}};
+
+        if (it == trans.begin()) {
+            return {{"status", "success"}, {"data", -1}};
         }
+        --it;
 
         while (true) {
             std::string cur_val = it->value;

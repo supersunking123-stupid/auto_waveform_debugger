@@ -13,6 +13,7 @@ public:
 
     // 1. Metadata
     json get_signal_info(const std::string& signal_path);
+    json list_signals_page(const std::string& prefix, const std::string& cursor, uint64_t limit);
 
     // 2. State Snapshot
     json get_snapshot(const std::vector<std::string>& signal_paths, uint64_t time);

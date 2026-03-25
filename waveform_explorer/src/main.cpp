@@ -148,6 +148,11 @@ int main(int argc, char* argv[]) {
 
             if (cmd == "get_signal_info") {
                 response = api.get_signal_info(args.value("path", ""));
+            } else if (cmd == "list_signals_page") {
+                response = api.list_signals_page(
+                    args.value("prefix", ""),
+                    args.value("cursor", ""),
+                    args.value("limit", 1000ULL));
             } else if (cmd == "get_snapshot") {
                 response = api.get_snapshot(args.value("signals", std::vector<std::string>()), args.value("time", 0ULL));
             } else if (cmd == "get_value_at_time") {
@@ -192,6 +197,11 @@ int main(int argc, char* argv[]) {
 
             if (cmd == "get_signal_info") {
                 response = api.get_signal_info(args.value("path", ""));
+            } else if (cmd == "list_signals_page") {
+                response = api.list_signals_page(
+                    args.value("prefix", ""),
+                    args.value("cursor", ""),
+                    args.value("limit", 1000ULL));
             } else if (cmd == "get_snapshot") {
                 response = api.get_snapshot(args.value("signals", std::vector<std::string>()), args.value("time", 0ULL));
             } else if (cmd == "get_value_at_time") {
