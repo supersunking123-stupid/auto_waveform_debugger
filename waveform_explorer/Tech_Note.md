@@ -218,9 +218,12 @@ Important constraint:
 
 #### `get_snapshot`
 - bulk point query over multiple paths at one timestamp
+- scalar responses are normalized to `0`, `1`, `x`, `z`, `rising`, or `falling`
+- bus responses return the sampled bus value, or `changing` when a transition occurs exactly at the queried timestamp
 
 #### `get_value_at_time`
 - single-signal point query
+- uses the same simplified output rules as `get_snapshot`
 
 #### `get_transitions`
 - bounded window query over transition history

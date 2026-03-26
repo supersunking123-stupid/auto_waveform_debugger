@@ -1,10 +1,65 @@
 #include "AgentAPI.h"
 #include <algorithm>
-#include <sstream>
+#include <cctype>
 #include <cmath>
 #include <map>
+#include <sstream>
 
 AgentAPI::AgentAPI(WaveDatabase& db) : db(db) {}
+
+namespace {
+std::string simplify_scalar_value(const std::string& value) {
+    if (value == "0" || value == "1" || value == "x" || value == "z") {
+        return value;
+    }
+    if (value == "U" || value == "u") {
+        return "x";
+    }
+    if (value.empty()) {
+        return "x";
+    }
+
+    const char ch = static_cast<char>(std::tolower(static_cast<unsigned char>(value.front())));
+    if (ch == '0' || ch == '1' || ch == 'x' || ch == 'z') {
+        return std::string(1, ch);
+    }
+    return "x";
+}
+
+json format_signal_value_at_time(WaveDatabase& db, const std::string& signal_path, uint64_t time) {
+    if (!db.has_signal(signal_path)) {
+        return "x";
+    }
+
+    const auto& info = db.get_signal_info(signal_path);
+    const auto& trans = db.get_transitions(signal_path);
+    const std::string value = db.get_value_at_time(signal_path, time);
+    const uint64_t before_time = time == 0 ? 0 : time - 1;
+    const std::string value_before = time == 0 ? "U" : db.get_value_at_time(signal_path, before_time);
+
+    auto it = std::lower_bound(
+        trans.begin(),
+        trans.end(),
+        time,
+        [](const Transition& tr, uint64_t t) {
+            return tr.timestamp < t;
+        });
+
+    bool transition_at_time = it != trans.end() && it->timestamp == time;
+    if (info.width <= 1) {
+        if (transition_at_time) {
+            if (value_before == "0" && value == "1") return "rising";
+            if (value_before == "1" && value == "0") return "falling";
+        }
+        return simplify_scalar_value(value);
+    }
+
+    if (transition_at_time && value_before != value) {
+        return "changing";
+    }
+    return value;
+}
+}
 
 json AgentAPI::get_signal_info(const std::string& signal_path) {
     if (!db.has_signal(signal_path)) {
@@ -54,7 +109,7 @@ json AgentAPI::list_signals_page(const std::string& prefix, const std::string& c
 json AgentAPI::get_snapshot(const std::vector<std::string>& signal_paths, uint64_t time) {
     json data = json::object();
     for (const auto& path : signal_paths) {
-        data[path] = db.get_value_at_time(path, time);
+        data[path] = format_signal_value_at_time(db, path, time);
     }
     return {{"status", "success"}, {"data", data}};
 }
@@ -63,7 +118,7 @@ json AgentAPI::get_value_at_time(const std::string& signal_path, uint64_t time) 
     if (!db.has_signal(signal_path)) {
         return {{"status", "error"}, {"message", "Signal not found"}};
     }
-    return {{"status", "success"}, {"data", db.get_value_at_time(signal_path, time)}};
+    return {{"status", "success"}, {"data", format_signal_value_at_time(db, signal_path, time)}};
 }
 
 json AgentAPI::find_edge(const std::string& signal_path, const std::string& edge_type, uint64_t start_time, const std::string& direction) {
