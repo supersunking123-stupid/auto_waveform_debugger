@@ -1,29 +1,29 @@
 # standalone_trace
 
-`rtl_trace` 是从 simview 中抽取出来的精简版 RTL trace 工具，只保留：
+`rtl_trace` is a slimmed-down RTL trace tool extracted from simview. It keeps only:
 
-- 读取并 elaboration Verilog/SystemVerilog 设计（基于 slang）
-- `compile` 阶段按实例 body 建立 drivers / loads 索引并复用缓存，避免对每个信号重复做整棵 AST 遍历
-- 对指定层级信号进行 `drivers` / `loads` 追踪
-- 支持跨实例端口递归继续追踪（input / output 端口都会继续展开）
-- trace 结果优先返回逻辑表达式位置（assignment / always 中的表达式），避免停留在端口边界
-- `--mode loads` 下，若命中逻辑表达式，会额外打印该表达式对应 assignment 的 LHS 层级路径
-- `--mode drivers` 对接口成员 / bind 场景（如 `if0.sig`、`mon_if.master_if[0].rlast`）支持基于 assignment-LHS 反向索引的快速回溯，不需要退化成整库扫描
-- 支持多跳 tracing 控制：`--depth`、`--max-nodes`、`--stop-at`
-- 支持路径过滤：`--include`、`--exclude`
-- 支持结构化输出：`--format json`
-- 支持信号检索：`find --query ...`（含近似建议）
-- 默认自动追加 `--timescale 1ns/1ps`（若命令行未显式提供 `--timescale`）
+- reading and elaborating Verilog / SystemVerilog designs (based on `slang`)
+- building drivers / loads indexes per instance body during `compile`, with cache reuse to avoid repeated whole-AST walks for each signal
+- tracing `drivers` / `loads` for a specified hierarchical signal
+- recursively continuing traces across instance ports (`input` and `output` ports both keep expanding)
+- preferring logic-expression locations in trace results (expressions inside assignments / `always` blocks) instead of stopping at port boundaries
+- under `--mode loads`, printing the assignment LHS hierarchical path when the hit is a logic expression
+- under `--mode drivers`, fast backtracking for interface-member / bind cases (such as `if0.sig` or `mon_if.master_if[0].rlast`) using an assignment-LHS reverse index, without degrading to a full-DB scan
+- multi-hop tracing controls: `--depth`, `--max-nodes`, `--stop-at`
+- path filters: `--include`, `--exclude`
+- structured output: `--format json`
+- signal search: `find --query ...` (with fuzzy suggestions)
+- automatic `--timescale 1ns/1ps` insertion by default if the command line does not explicitly provide `--timescale`
 
-该目录已 vendored 必要依赖（`third_party/slang`、`third_party/fmt`），
-只拷贝 `standalone_trace/` 整个目录即可独立构建，不依赖上层 simview 工程。
+This directory already vendors the required dependencies (`third_party/slang`, `third_party/fmt`).
+Copying the entire `standalone_trace/` directory is enough to build it independently, without depending on the parent simview project.
 
-本地联调（基于 `Cores-VeeR-EH1`）请见：
+For local bring-up and testing (based on `Cores-VeeR-EH1`), see:
 - [LOCALTEST.md](./LOCALTEST.md)
 
 ## Build
 
-这是独立工程，直接在 `standalone_trace` 目录构建即可：
+This is a standalone project. Build it directly under `standalone_trace`:
 
 ```bash
 cd standalone_trace
@@ -44,49 +44,49 @@ build/rtl_trace find --db rtl_trace.db --query "foo.bar" [--regex] [--limit N] [
 build/rtl_trace serve [--db rtl_trace.db]
 ```
 
-说明：
-- `compile` 阶段会解析/展开 RTL 并生成二进制 graph DB（默认 `rtl_trace.db`）。
-- `--top <top_module>` 为必选参数；缺失时工具会报错并退出。
-- `compile --incremental` 会基于输入指纹复用已有 DB（命中时跳过重编译）。
-- `compile --relax-defparam` 会放宽 defparam 相关报错（例如跨层级 defparam 暂未解析时），便于先生成可用 DB。
-- `compile --mfcu` 使用“分组 MFCU”：每个 `-f` 文件列表内的源文件合并为一个 compilation unit，命令行直接传入的源文件合并为另一个 compilation unit（而不是把所有输入全并成一个 unit）。
-- `compile --low-mem` 使用低内存模式：在 `SaveGraphDb` 阶段会主动清理 `TraceCompileCache`（每跨越 200 个 module body 清理一次）。在大设计（如 NVDLA）上可以节省约 **1.1 GB** 的峰值内存，但会增加约 **10-15s** 的 Wall Time（由于 cache miss 导致的 AST 重复解析）。
-- `compile --partition-budget N` 会按实例树做预算切分并分区生成 DB（日志会显示切分结果和每个分区执行进度）。
-- `compile --compile-log <file>` 会把编译阶段关键步骤与分区信息同步写入日志文件（同时仍打印到屏幕）；对于 DB 生成阶段，还会额外记录 `save_graph_db` 子步骤用时（如 `build_graph`、`write_file`）。
-- `trace` 阶段只查询数据库，不会再次解析 RTL。
-- 数据库当前格式为二进制 graph DB。
-- 当前 graph DB 文件版本为 `v2`。
-- 已不再支持旧的 V7/V8 文本 DB；需要重新 `compile` 生成当前 graph DB。
-- 若你之前生成的是旧的 graph DB（v1），也需要重新 `compile`，因为新版额外持久化了 assignment-LHS 反向引用索引，用于加速接口成员的 `drivers` 查询。
-- `serve` 适合大设计交互式调试：DB 只加载一次，后续 `find` / `trace` / `hier` 会复用常驻会话。
-- 对高扇出时钟/复位网络，`compile` 会把其 fanout 压缩到专用紧凑表中，减少普通 `loads` 明细存储；`trace` 查询这类网络时会优先走该紧凑表。
-- 对接口成员 / bind assignment，`compile` 会额外持久化 assignment LHS 到源信号的反向引用表，因此像 `mon_if.master_if[0].rlast` 这类 `drivers` 查询在独立 CLI 进程里也能直接命中，不再需要 query-time 全量扫描。
-- `compile` 生成 DB 时会缓存每个信号的解析结果，并在字符串收集与最终写出两个阶段之间复用，避免重复解析同一信号。
-- `compile` 时如果你未传 `--timescale`，工具会自动使用 `1ns/1ps`，避免 mixed / missing timescale 报错。
-- 若显式传了 `--timescale`，使用用户值。
-- 若你希望看到最新的跨端口递归结果和 `loads` 的 `lhs` 信息，请重新执行一次 `compile` 生成新 DB。
+Notes:
+- The `compile` phase parses / elaborates RTL and generates a binary graph DB (default `rtl_trace.db`).
+- `--top <top_module>` is required. The tool reports an error and exits if it is missing.
+- `compile --incremental` reuses an existing DB based on input fingerprints and skips recompilation on a cache hit.
+- `compile --relax-defparam` relaxes defparam-related errors (for example, unresolved cross-hierarchy defparams) so a usable DB can still be generated.
+- `compile --mfcu` uses grouped MFCU mode: source files from each `-f` filelist are merged into one compilation unit, and source files passed directly on the command line are merged into another compilation unit, instead of merging all inputs into one unit.
+- `compile --low-mem` enables low-memory mode: during `SaveGraphDb`, `TraceCompileCache` is actively pruned once every 200 module bodies. On large designs such as NVDLA this can save about **1.1 GB** of peak memory, at the cost of about **10-15s** of additional wall time due to cache-miss re-parsing.
+- `compile --partition-budget N` partitions the DB build by instance-tree budget. The log prints the partitioning result and per-partition progress.
+- `compile --compile-log <file>` writes key compile-stage steps and partition information into a log file while still printing to the console. During DB generation it also records `save_graph_db` sub-step timings such as `build_graph` and `write_file`.
+- The `trace` phase only queries the DB and does not parse RTL again.
+- The current DB format is a binary graph DB.
+- The current graph DB file version is `v2`.
+- The old V7 / V8 text DB format is no longer supported. Re-run `compile` to generate the current graph DB.
+- If you previously generated an old graph DB (`v1`), you also need to re-run `compile`, because the new version persists assignment-LHS reverse references to accelerate `drivers` queries on interface members.
+- `serve` is intended for interactive debugging on large designs: the DB is loaded once, and later `find` / `trace` / `hier` commands reuse the resident session.
+- For high-fanout clock / reset networks, `compile` compresses fanout into a dedicated compact table to reduce normal `loads` detail storage. `trace` queries on those networks consult the compact table first.
+- For interface members / bind assignments, `compile` also persists a reverse-reference table from assignment LHS to source signals, so `drivers` queries such as `mon_if.master_if[0].rlast` work directly even in a fresh standalone CLI process, without a query-time full scan.
+- While generating the DB, `compile` caches each signal's resolved result and reuses it across both the string-collection and final-write stages, avoiding repeated resolution of the same signal.
+- If you do not pass `--timescale` during `compile`, the tool automatically uses `1ns/1ps` to avoid mixed / missing timescale errors.
+- If `--timescale` is explicitly provided, the user-supplied value is used.
+- If you want the latest cross-port recursive results and `loads` `lhs` information, re-run `compile` to generate a new DB.
 
-`trace` 输出补充：
-- `mode=drivers`：若表达式可解析到 assignment，会打印：
+Additional `trace` output details:
+- `mode=drivers`: if an expression can be resolved to an assignment, the tool prints:
   - `assign <assignment_text>`
-  - `lhs <hierarchical_path>`（当通过 assignment-LHS 反向索引命中时）
-  - `rhs <hierarchical_path>`（RHS 信号列表）
-- `mode=loads`：若表达式可关联到 assignment，会打印：
-  - `lhs <hierarchical_path>`（LHS 信号列表）
-- `--format json`：输出包含 `summary`、`endpoints`、`stops`，便于 agent / 脚本处理。
-- 支持位选查询：`--signal top.sig[3]`、`--signal top.sig[7:4]`。
-- `hier`：输出实例层级树（支持 `--root`、`--depth`、`--max-nodes`、`--format json`）。
-- `--cone-level N`：逻辑锥自动展开级数（默认 1；`drivers` 沿 RHS 回溯，`loads` 沿 LHS 前推）。
-- `--prefer-port-hop`：当命中端口绑定表达式且无可展开 RHS/LHS 时，优先尝试沿端口桥接继续追踪。
-- `serve`：启动交互式后端，命令以行为单位输入，每次响应后输出一行 `<<END>>`。
+  - `lhs <hierarchical_path>` (when matched through the assignment-LHS reverse index)
+  - `rhs <hierarchical_path>` (RHS signal list)
+- `mode=loads`: if an expression can be associated with an assignment, the tool prints:
+  - `lhs <hierarchical_path>` (LHS signal list)
+- `--format json`: output includes `summary`, `endpoints`, and `stops`, which is convenient for agents / scripts.
+- Bit-select queries are supported: `--signal top.sig[3]`, `--signal top.sig[7:4]`.
+- `hier`: prints the instance hierarchy tree (supports `--root`, `--depth`, `--max-nodes`, `--format json`).
+- `--cone-level N`: automatic logic-cone expansion depth (default 1; `drivers` walks backward along RHS, `loads` walks forward along LHS).
+- `--prefer-port-hop`: when the hit is a port-binding expression and there is no expandable RHS / LHS, prefer continuing the trace across the port bridge.
+- `serve`: starts the interactive backend. Commands are entered one line at a time, and each response ends with `<<END>>`.
 
 ## TODO
 
-- 支持完整的 cross-hier `defparam` 语义（当前仅提供 `--relax-defparam` 作为兼容放宽模式）。
+- Support full cross-hierarchy `defparam` semantics. The current implementation only provides `--relax-defparam` as a compatibility relaxation mode.
 
 ## Automated Semantic Regression
 
-项目内置 CTest 语义回归用例（覆盖跨端口追踪、loads 上下文 LHS、bit 过滤、depth/node stop、find 建议、incremental cache hit）：
+The project includes CTest semantic regression cases covering cross-port tracing, `loads` context LHS, bit filtering, depth / node stops, `find` suggestions, and incremental cache hits:
 
 ```bash
 cd standalone_trace
@@ -95,7 +95,7 @@ ninja -C build
 ctest --test-dir build --output-on-failure
 ```
 
-示例（在 `example/simview_trace` 目录）：
+Example (under `example/simview_trace`):
 
 ```bash
 /path/to/standalone_trace/build/rtl_trace compile \
