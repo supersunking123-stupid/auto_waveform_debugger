@@ -188,12 +188,15 @@ struct GraphDb {
   std::vector<uint32_t> load_ref_signal_ids;
   std::vector<GraphPathRefRange> driver_ref_ranges;
   std::vector<uint32_t> driver_ref_signal_ids;
+  std::vector<GraphPathRefRange> assignment_lhs_ref_ranges;
+  std::vector<uint32_t> assignment_lhs_ref_signal_ids;
   std::vector<GraphHierarchyRecord> hierarchy;
   std::vector<uint32_t> hierarchy_children;
   std::vector<GraphGlobalNetRecord> global_nets;
   std::vector<uint32_t> global_sinks;
   slang::flat_hash_map<uint32_t, size_t> load_ref_index;
   slang::flat_hash_map<uint32_t, size_t> driver_ref_index;
+  slang::flat_hash_map<uint32_t, size_t> assignment_lhs_ref_index;
 };
 
 struct TraceSession {
@@ -273,7 +276,7 @@ constexpr char kGraphDbMagic[kGraphDbMagicSize] = {
 
 struct GraphDbFileHeader {
   char magic[kGraphDbMagicSize];
-  uint32_t version = 1;
+  uint32_t version = 2;
   uint32_t reserved = 0;
   uint64_t string_count = 0;
   uint64_t string_blob_size = 0;
@@ -284,6 +287,8 @@ struct GraphDbFileHeader {
   uint64_t load_ref_count = 0;
   uint64_t driver_ref_range_count = 0;
   uint64_t driver_ref_count = 0;
+  uint64_t assignment_lhs_ref_range_count = 0;
+  uint64_t assignment_lhs_ref_count = 0;
   uint64_t hierarchy_count = 0;
   uint64_t hierarchy_child_count = 0;
   uint64_t global_net_count = 0;
@@ -387,6 +392,8 @@ const SymbolRefList &GetCachedStatementLhsSignals(
     const slang::ast::Statement &stmt, TraceCompileCache &cache);
 EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManager &sm,
                                   bool drivers_mode, TraceCompileCache *cache);
+std::vector<std::string> InferAssignmentLhsPathsFromText(const std::string &endpoint_path,
+                                                         std::string_view assignment_text);
 
 const slang::ast::InstanceBodySymbol *GetContainingInstance(const slang::ast::Symbol *sym) {
   while (sym != nullptr && sym->kind != slang::ast::SymbolKind::InstanceBody) {
@@ -1302,6 +1309,7 @@ EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManag
               rec.assignment_start = off->first;
               rec.assignment_end = off->second;
             }
+            rec.assignment_text = GetSourceText(item.assignment->sourceRange, sm);
             if (cache != nullptr) {
               rec.lhs_signals = MaterializeSignalPaths(GetCachedLhsSignals(item.assignment, *cache));
               rec.rhs_signals = MaterializeSignalPaths(GetCachedRhsSignals(item.assignment, *cache));
@@ -1598,6 +1606,7 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &key
   slang::flat_hash_map<std::string, uint32_t> string_index;
   std::vector<std::pair<uint32_t, uint32_t>> load_refs_flat;
   std::vector<std::pair<uint32_t, uint32_t>> driver_refs_flat;
+  std::vector<std::pair<uint32_t, uint32_t>> assignment_lhs_refs_flat;
   TraceDb compact_db;
   TraceCompileCache trace_cache;
   EndpointMergeGroups merge_groups;
@@ -1606,6 +1615,7 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &key
   string_index.reserve(2000000);
   load_refs_flat.reserve(5000000);
   driver_refs_flat.reserve(5000000);
+  assignment_lhs_refs_flat.reserve(5000000);
 
   auto intern = [&](const std::string &s) -> uint32_t {
     return InternString(s, graph.strings, string_index);
@@ -1686,6 +1696,11 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &key
     for (const EndpointRecord &e : rec.loads) {
       append_endpoint(e);
       if (!e.path.empty()) load_refs_flat.push_back({intern(e.path), static_cast<uint32_t>(sig_id)});
+      const std::vector<std::string> lhs_paths =
+          e.lhs_signals.empty() ? InferAssignmentLhsPathsFromText(e.path, e.assignment_text) : e.lhs_signals;
+      for (const std::string &lhs : lhs_paths) {
+        if (!lhs.empty()) assignment_lhs_refs_flat.push_back({intern(lhs), static_cast<uint32_t>(sig_id)});
+      }
     }
     ++signal_count;
   }
@@ -1728,6 +1743,8 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &key
       };
   finalize_path_refs(load_refs_flat, graph.load_ref_ranges, graph.load_ref_signal_ids);
   finalize_path_refs(driver_refs_flat, graph.driver_ref_ranges, graph.driver_ref_signal_ids);
+  finalize_path_refs(assignment_lhs_refs_flat, graph.assignment_lhs_ref_ranges,
+                     graph.assignment_lhs_ref_signal_ids);
 
   std::vector<std::string> hier_paths;
   hier_paths.reserve(hier_db.hierarchy.size());
@@ -1792,6 +1809,8 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &key
   header.load_ref_count = graph.load_ref_signal_ids.size();
   header.driver_ref_range_count = graph.driver_ref_ranges.size();
   header.driver_ref_count = graph.driver_ref_signal_ids.size();
+  header.assignment_lhs_ref_range_count = graph.assignment_lhs_ref_ranges.size();
+  header.assignment_lhs_ref_count = graph.assignment_lhs_ref_signal_ids.size();
   header.hierarchy_count = graph.hierarchy.size();
   header.hierarchy_child_count = graph.hierarchy_children.size();
   header.global_net_count = graph.global_nets.size();
@@ -1806,9 +1825,11 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &key
   if (!WriteBinaryVector(out, graph.signals) || !WriteBinaryVector(out, graph.endpoints) ||
       !WriteBinaryVector(out, graph.signal_refs) || !WriteBinaryVector(out, graph.load_ref_ranges) ||
       !WriteBinaryVector(out, graph.load_ref_signal_ids) || !WriteBinaryVector(out, graph.driver_ref_ranges) ||
-      !WriteBinaryVector(out, graph.driver_ref_signal_ids) || !WriteBinaryVector(out, graph.hierarchy) ||
-      !WriteBinaryVector(out, graph.hierarchy_children) || !WriteBinaryVector(out, graph.global_nets) ||
-      !WriteBinaryVector(out, graph.global_sinks)) {
+      !WriteBinaryVector(out, graph.driver_ref_signal_ids) ||
+      !WriteBinaryVector(out, graph.assignment_lhs_ref_ranges) ||
+      !WriteBinaryVector(out, graph.assignment_lhs_ref_signal_ids) ||
+      !WriteBinaryVector(out, graph.hierarchy) || !WriteBinaryVector(out, graph.hierarchy_children) ||
+      !WriteBinaryVector(out, graph.global_nets) || !WriteBinaryVector(out, graph.global_sinks)) {
     return false;
   }
   const auto t_write_end = Clock::now();
@@ -1828,7 +1849,7 @@ bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db)
   GraphDbFileHeader header;
   if (!ReadBinaryValue(in, header)) return false;
   if (std::memcmp(header.magic, kGraphDbMagic, sizeof(header.magic)) != 0) return false;
-  if (header.version != 1) return false;
+  if (header.version != 1 && header.version != 2) return false;
 
   std::vector<uint32_t> string_offsets;
   if (!ReadBinaryVector(in, string_offsets, static_cast<size_t>(header.string_count + 1))) return false;
@@ -1851,8 +1872,18 @@ bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db)
       !ReadBinaryVector(in, graph.load_ref_ranges, static_cast<size_t>(header.load_ref_range_count)) ||
       !ReadBinaryVector(in, graph.load_ref_signal_ids, static_cast<size_t>(header.load_ref_count)) ||
       !ReadBinaryVector(in, graph.driver_ref_ranges, static_cast<size_t>(header.driver_ref_range_count)) ||
-      !ReadBinaryVector(in, graph.driver_ref_signal_ids, static_cast<size_t>(header.driver_ref_count)) ||
-      !ReadBinaryVector(in, graph.hierarchy, static_cast<size_t>(header.hierarchy_count)) ||
+      !ReadBinaryVector(in, graph.driver_ref_signal_ids, static_cast<size_t>(header.driver_ref_count))) {
+    return false;
+  }
+  if (header.version >= 2) {
+    if (!ReadBinaryVector(in, graph.assignment_lhs_ref_ranges,
+                          static_cast<size_t>(header.assignment_lhs_ref_range_count)) ||
+        !ReadBinaryVector(in, graph.assignment_lhs_ref_signal_ids,
+                          static_cast<size_t>(header.assignment_lhs_ref_count))) {
+      return false;
+    }
+  }
+  if (!ReadBinaryVector(in, graph.hierarchy, static_cast<size_t>(header.hierarchy_count)) ||
       !ReadBinaryVector(in, graph.hierarchy_children, static_cast<size_t>(header.hierarchy_child_count)) ||
       !ReadBinaryVector(in, graph.global_nets, static_cast<size_t>(header.global_net_count)) ||
       !ReadBinaryVector(in, graph.global_sinks, static_cast<size_t>(header.global_sink_count))) {
@@ -1867,10 +1898,13 @@ bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db)
 
   graph.load_ref_index.clear();
   graph.driver_ref_index.clear();
+  graph.assignment_lhs_ref_index.clear();
   for (size_t i = 0; i < graph.load_ref_ranges.size(); ++i)
     graph.load_ref_index.emplace(graph.load_ref_ranges[i].path_str_id, i);
   for (size_t i = 0; i < graph.driver_ref_ranges.size(); ++i)
     graph.driver_ref_index.emplace(graph.driver_ref_ranges[i].path_str_id, i);
+  for (size_t i = 0; i < graph.assignment_lhs_ref_ranges.size(); ++i)
+    graph.assignment_lhs_ref_index.emplace(graph.assignment_lhs_ref_ranges[i].path_str_id, i);
 
   for (const GraphHierarchyRecord &gh : graph.hierarchy) {
     const std::string &path = GraphString(graph, gh.path_str_id);
@@ -1997,6 +2031,15 @@ std::vector<uint32_t> SessionBridgeRefs(const TraceSession &session, bool use_lo
   auto it = index.find(path_id);
   if (it == index.end()) return {};
   const GraphPathRefRange &range = ranges[it->second];
+  return std::vector<uint32_t>(flat.begin() + range.begin, flat.begin() + range.begin + range.count);
+}
+
+std::vector<uint32_t> SessionAssignmentLhsRefs(const TraceSession &session, uint32_t path_id) {
+  const GraphDb &graph = *session.graph;
+  const auto it = graph.assignment_lhs_ref_index.find(path_id);
+  if (it == graph.assignment_lhs_ref_index.end()) return {};
+  const GraphPathRefRange &range = graph.assignment_lhs_ref_ranges[it->second];
+  const auto &flat = graph.assignment_lhs_ref_signal_ids;
   return std::vector<uint32_t>(flat.begin() + range.begin, flat.begin() + range.begin + range.count);
 }
 
@@ -2784,25 +2827,29 @@ std::string TrimWhitespace(std::string_view text) {
   return std::string(text.substr(begin, end - begin));
 }
 
-std::vector<std::string> InferAssignmentLhsPaths(TraceSession &session, EndpointRecord &e) {
-  if (!e.lhs_signals.empty()) return e.lhs_signals;
-  if (e.kind != EndpointKind::kExpr) return {};
-  if (e.assignment_text.empty()) e.assignment_text = FetchSourceSlice(session, e);
-  if (e.assignment_text.empty()) return {};
-
-  const size_t eq = e.assignment_text.find('=');
+std::vector<std::string> InferAssignmentLhsPathsFromText(const std::string &endpoint_path,
+                                                         std::string_view assignment_text) {
+  if (assignment_text.empty()) return {};
+  const size_t eq = assignment_text.find('=');
   if (eq == std::string::npos) return {};
 
-  std::string lhs = TrimWhitespace(std::string_view(e.assignment_text).substr(0, eq));
+  std::string lhs = TrimWhitespace(assignment_text.substr(0, eq));
   if (lhs.rfind("assign ", 0) == 0) lhs = TrimWhitespace(std::string_view(lhs).substr(7));
   if (lhs.empty()) return {};
 
   if (lhs.rfind("top.", 0) == 0) return {lhs};
 
-  const std::string &path = e.path;
-  const size_t dot = path.rfind('.');
+  const size_t dot = endpoint_path.rfind('.');
   if (dot == std::string::npos) return {};
-  return {path.substr(0, dot) + "." + lhs};
+  return {endpoint_path.substr(0, dot) + "." + lhs};
+}
+
+std::vector<std::string> InferAssignmentLhsPaths(TraceSession &session, EndpointRecord &e) {
+  if (!e.lhs_signals.empty()) return e.lhs_signals;
+  if (e.kind != EndpointKind::kExpr) return {};
+  if (e.assignment_text.empty()) e.assignment_text = FetchSourceSlice(session, e);
+  if (e.assignment_text.empty()) return {};
+  return InferAssignmentLhsPathsFromText(e.path, e.assignment_text);
 }
 
 void MaterializeAssignmentTexts(TraceSession &session, TraceRunResult &result) {
@@ -2903,13 +2950,19 @@ void PrintTraceJson(const TraceDb &db, const TraceOptions &opts, const TraceRunR
   std::cout << "\n";
 }
 
-std::vector<EndpointRecord> FindFallbackDriverEndpoints(TraceSession &session,
-                                                        const std::string &target_signal) {
+std::vector<EndpointRecord> FindFallbackDriverEndpoints(TraceSession &session, uint32_t target_sig_id) {
   std::vector<EndpointRecord> out;
+  if (!session.graph.has_value()) return out;
+
+  const GraphDb &graph = *session.graph;
+  if (target_sig_id >= graph.signals.size()) return out;
+
+  const uint32_t path_id = graph.signals[target_sig_id].name_str_id;
+  const std::string &target_signal = SessionSignalName(session, target_sig_id);
+  const std::vector<uint32_t> source_sig_ids = SessionAssignmentLhsRefs(session, path_id);
   std::unordered_set<std::string> seen;
-  const size_t signal_count = session.graph.has_value() ? session.graph->signals.size() : 0;
-  for (size_t sig_id = 0; sig_id < signal_count; ++sig_id) {
-    const SignalRecord &record = SessionSignalRecord(session, static_cast<uint32_t>(sig_id));
+  for (uint32_t source_sig_id : source_sig_ids) {
+    const SignalRecord &record = SessionSignalRecord(session, source_sig_id);
     for (EndpointRecord e : record.loads) {
       std::vector<std::string> lhs_paths = InferAssignmentLhsPaths(session, e);
       if (lhs_paths.empty()) continue;
@@ -3024,7 +3077,7 @@ TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
         std::vector<EndpointRecord> fallback_edges;
         const std::vector<EndpointRecord> *active_edges = &edges;
         if (is_drivers_mode && edges.empty() && sig == opts.root_signal) {
-          fallback_edges = FindFallbackDriverEndpoints(session, sig);
+          fallback_edges = FindFallbackDriverEndpoints(session, sig_id);
           if (!fallback_edges.empty()) active_edges = &fallback_edges;
         }
 

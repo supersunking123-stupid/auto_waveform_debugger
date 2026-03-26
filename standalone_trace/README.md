@@ -8,6 +8,7 @@
 - 支持跨实例端口递归继续追踪（input / output 端口都会继续展开）
 - trace 结果优先返回逻辑表达式位置（assignment / always 中的表达式），避免停留在端口边界
 - `--mode loads` 下，若命中逻辑表达式，会额外打印该表达式对应 assignment 的 LHS 层级路径
+- `--mode drivers` 对接口成员 / bind 场景（如 `if0.sig`、`mon_if.master_if[0].rlast`）支持基于 assignment-LHS 反向索引的快速回溯，不需要退化成整库扫描
 - 支持多跳 tracing 控制：`--depth`、`--max-nodes`、`--stop-at`
 - 支持路径过滤：`--include`、`--exclude`
 - 支持结构化输出：`--format json`
@@ -54,9 +55,12 @@ build/rtl_trace serve [--db rtl_trace.db]
 - `compile --compile-log <file>` 会把编译阶段关键步骤与分区信息同步写入日志文件（同时仍打印到屏幕）；对于 DB 生成阶段，还会额外记录 `save_graph_db` 子步骤用时（如 `build_graph`、`write_file`）。
 - `trace` 阶段只查询数据库，不会再次解析 RTL。
 - 数据库当前格式为二进制 graph DB。
+- 当前 graph DB 文件版本为 `v2`。
 - 已不再支持旧的 V7/V8 文本 DB；需要重新 `compile` 生成当前 graph DB。
+- 若你之前生成的是旧的 graph DB（v1），也需要重新 `compile`，因为新版额外持久化了 assignment-LHS 反向引用索引，用于加速接口成员的 `drivers` 查询。
 - `serve` 适合大设计交互式调试：DB 只加载一次，后续 `find` / `trace` / `hier` 会复用常驻会话。
 - 对高扇出时钟/复位网络，`compile` 会把其 fanout 压缩到专用紧凑表中，减少普通 `loads` 明细存储；`trace` 查询这类网络时会优先走该紧凑表。
+- 对接口成员 / bind assignment，`compile` 会额外持久化 assignment LHS 到源信号的反向引用表，因此像 `mon_if.master_if[0].rlast` 这类 `drivers` 查询在独立 CLI 进程里也能直接命中，不再需要 query-time 全量扫描。
 - `compile` 生成 DB 时会缓存每个信号的解析结果，并在字符串收集与最终写出两个阶段之间复用，避免重复解析同一信号。
 - `compile` 时如果你未传 `--timescale`，工具会自动使用 `1ns/1ps`，避免 mixed / missing timescale 报错。
 - 若显式传了 `--timescale`，使用用户值。
@@ -65,6 +69,7 @@ build/rtl_trace serve [--db rtl_trace.db]
 `trace` 输出补充：
 - `mode=drivers`：若表达式可解析到 assignment，会打印：
   - `assign <assignment_text>`
+  - `lhs <hierarchical_path>`（当通过 assignment-LHS 反向索引命中时）
   - `rhs <hierarchical_path>`（RHS 信号列表）
 - `mode=loads`：若表达式可关联到 assignment，会打印：
   - `lhs <hierarchical_path>`（LHS 信号列表）

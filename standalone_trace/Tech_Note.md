@@ -219,9 +219,21 @@ This is the preferred mode for large designs because it avoids reloading the gra
 - string interning reduces duplication
 - reverse-reference ranges make traversal faster
 
+In the current format (`GraphDbFileHeader.version = 2`), the DB also stores an additional reverse-reference table for inferred assignment LHS paths. This specifically accelerates `drivers` queries on interface-member / bind-assignment targets that do not naturally produce a direct symbol-keyed driver edge, for example:
+- `top.u_bind.mon_if.master_if[0].rlast`
+- other `if0.sig`-style interface member assignments
+
+Instead of falling back to a query-time full scan of all `loads`, compile now persists:
+- `assignment_lhs_ref_ranges`
+- `assignment_lhs_ref_signal_ids`
+
+These tables map an inferred assignment LHS hierarchical path to candidate source signals whose `loads` endpoints contain that assignment.
+
 ### Lazy materialization in query sessions
 
 The runtime does not eagerly inflate every `SignalRecord` from the graph DB. `TraceSession` materializes only the pieces touched by the current query and caches them in `materialized_signal_records`.
+
+For the interface-member fallback case above, query no longer builds a temporary full reverse index in memory for every one-shot CLI invocation. It uses the persisted assignment-LHS reverse-reference table from the DB and only materializes the candidate source signals that match the queried target path.
 
 ### Global-net shortcut
 
@@ -236,6 +248,8 @@ For assignment text, compile stores source offsets instead of full source text. 
 
 This keeps DB size under control.
 
+Compile also stores `assignment_text` in expression endpoints while building the graph, which allows the assignment-LHS reverse-reference table to be derived once during DB creation instead of being reconstructed by scanning source text during later queries.
+
 ## Memory Optimization
 
 To handle large designs like NVDLA within a reasonable memory envelope, several optimizations were implemented to reduce peak RSS fragmentation and allocation overhead:
@@ -246,6 +260,7 @@ To handle large designs like NVDLA within a reasonable memory envelope, several 
 4. **Endpoint Key Normalization**: Replaced the expensive string-concatenation-based `EndpointMergeKey` with a `EndpointKeyView` struct that holds raw pointers/views. This avoids allocating 4.3M massive tracking strings during the merge loop.
 5. **Flat Array Scaling**: Flattened `driver_refs` and `load_refs` from `flat_hash_map<uint32_t, vector<uint32_t>>` into unified `vector<pair<uint32_t, uint32_t>>` arrays. This eradicates the 2-million-vector overhead while maintaining fast sorted access.
 6. **Bounded Cache Growth (`--low-mem`)**: Introduced an optional `--low-mem` flag that periodically flushes the `TraceCompileCache` when cross-module boundaries are detected. This bounds memory at the cost of some wall-time performance (due to AST re-evaluation).
+7. **Persisted Assignment-LHS Reverse Index**: Added a third compact reverse-reference table keyed by inferred assignment-LHS path. This removes the worst-case cold-query cost for interface-member `drivers` traces in standalone CLI mode, because the runtime no longer needs to scan every materialized `loads` endpoint to reconstruct that mapping.
 
 ## Where to start if you need to change behavior
 
