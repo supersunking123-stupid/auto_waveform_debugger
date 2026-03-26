@@ -76,7 +76,8 @@ namespace {
 using SymbolRefList = std::vector<const slang::ast::Symbol *>;
 
 struct ExprTraceResult {
-  const slang::ast::NamedValueExpression *expr = nullptr;
+  const slang::ast::Expression *expr = nullptr;
+  const slang::ast::Symbol *symbol = nullptr;
   const slang::ast::AssignmentExpression *assignment = nullptr;
   std::vector<const slang::ast::Expression *> selectors;
   SymbolRefList context_lhs_signals;
@@ -572,6 +573,7 @@ class BodyTraceIndexBuilder : public slang::ast::ASTVisitor<BodyTraceIndexBuilde
       if (checking_instance_port_expression_ || checking_lhs_) {
         ExprTraceResult result;
         result.expr = &nve;
+        result.symbol = &nve.symbol;
         if (checking_lhs_) result.assignment = current_assignment_;
         result.selectors = selector_stack_;
         if (checking_instance_port_expression_ && active_instance_ != nullptr && active_port_ != nullptr) {
@@ -585,6 +587,7 @@ class BodyTraceIndexBuilder : public slang::ast::ASTVisitor<BodyTraceIndexBuilde
       if (!(checking_lhs_ && selector_depth_ == 0)) {
         ExprTraceResult result;
         result.expr = &nve;
+        result.symbol = &nve.symbol;
         result.assignment = current_assignment_;
         result.selectors = selector_stack_;
         if (checking_instance_port_expression_ && active_instance_ != nullptr && active_port_ != nullptr) {
@@ -599,6 +602,46 @@ class BodyTraceIndexBuilder : public slang::ast::ASTVisitor<BodyTraceIndexBuilde
           result.context_lhs_signals = timed_lhs_stack_.back();
         }
         Entries()[&nve.symbol].push_back(std::move(result));
+      }
+    }
+  }
+
+  void handle(const slang::ast::MemberAccessExpression &expr) {
+    const slang::ast::Symbol *sym = expr.getSymbolReference();
+    if (!IsTraceable(sym)) return;
+    if constexpr (DRIVERS) {
+      if (checking_instance_port_expression_ || checking_lhs_) {
+        ExprTraceResult result;
+        result.expr = &expr;
+        result.symbol = sym;
+        if (checking_lhs_) result.assignment = current_assignment_;
+        result.selectors = selector_stack_;
+        if (checking_instance_port_expression_ && active_instance_ != nullptr && active_port_ != nullptr) {
+          result.context_from_instance_port = true;
+          result.context_instance = active_instance_;
+          result.context_port = active_port_;
+        }
+        Entries()[sym].push_back(std::move(result));
+      }
+    } else {
+      if (!(checking_lhs_ && selector_depth_ == 0)) {
+        ExprTraceResult result;
+        result.expr = &expr;
+        result.symbol = sym;
+        result.assignment = current_assignment_;
+        result.selectors = selector_stack_;
+        if (checking_instance_port_expression_ && active_instance_ != nullptr && active_port_ != nullptr) {
+          result.context_from_instance_port = true;
+          result.context_instance = active_instance_;
+          result.context_port = active_port_;
+        }
+        if (current_assignment_ == nullptr && current_condition_expr_ != nullptr &&
+            !condition_lhs_stack_.empty()) {
+          result.context_lhs_signals = condition_lhs_stack_.back();
+        } else if (current_assignment_ == nullptr && !timed_lhs_stack_.empty()) {
+          result.context_lhs_signals = timed_lhs_stack_.back();
+        }
+        Entries()[sym].push_back(std::move(result));
       }
     }
   }
@@ -653,6 +696,21 @@ class PortConnectionResultCollector
     if (!visited_.insert(&nve.symbol).second) return;
     ExprTraceResult result;
     result.expr = &nve;
+    result.symbol = &nve.symbol;
+    result.assignment = nullptr;
+    result.context_from_instance_port = true;
+    result.context_instance = instance_;
+    result.context_port = port_;
+    out_.push_back(std::move(result));
+  }
+
+  void handle(const slang::ast::MemberAccessExpression &expr) {
+    const slang::ast::Symbol *sym = expr.getSymbolReference();
+    if (!IsTraceable(sym)) return;
+    if (!visited_.insert(sym).second) return;
+    ExprTraceResult result;
+    result.expr = &expr;
+    result.symbol = sym;
     result.assignment = nullptr;
     result.context_from_instance_port = true;
     result.context_instance = instance_;
@@ -1105,6 +1163,10 @@ SymbolRefList CollectRhsSignals(const slang::ast::AssignmentExpression *assignme
       out_.push_back(&nve.symbol);
     }
 
+    void handle(const slang::ast::MemberAccessExpression &expr) {
+      if (const slang::ast::Symbol *sym = expr.getSymbolReference(); IsTraceable(sym)) out_.push_back(sym);
+    }
+
    private:
     SymbolRefList &out_;
   };
@@ -1127,6 +1189,10 @@ SymbolRefList CollectLhsSignals(const slang::ast::AssignmentExpression *assignme
     void handle(const slang::ast::NamedValueExpression &nve) {
       if (!IsTraceable(&nve.symbol)) return;
       out_.push_back(&nve.symbol);
+    }
+
+    void handle(const slang::ast::MemberAccessExpression &expr) {
+      if (const slang::ast::Symbol *sym = expr.getSymbolReference(); IsTraceable(sym)) out_.push_back(sym);
     }
 
    private:
@@ -1155,6 +1221,10 @@ SymbolRefList CollectLhsSignalsFromStatement(const slang::ast::Statement &stmt) 
         void handle(const slang::ast::NamedValueExpression &nve) {
           if (!IsTraceable(&nve.symbol)) return;
           out_.push_back(&nve.symbol);
+        }
+
+        void handle(const slang::ast::MemberAccessExpression &expr) {
+          if (const slang::ast::Symbol *sym = expr.getSymbolReference(); IsTraceable(sym)) out_.push_back(sym);
         }
 
        private:
@@ -1217,13 +1287,15 @@ EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManag
           rec.line = sm.getLineNumber(loc);
         } else {
           rec.kind = EndpointKind::kExpr;
-          rec.path = item.expr->symbol.getHierarchicalPath();
+          rec.path = item.symbol != nullptr ? item.symbol->getHierarchicalPath() : "";
           const auto loc = item.expr->sourceRange.start();
           rec.file = std::string(sm.getFileName(loc));
           rec.line = sm.getLineNumber(loc);
-          auto bit_desc = DescribeBitSelectors(item.selectors, sm, item.expr->symbol);
-          rec.bit_map = std::move(bit_desc.first);
-          rec.bit_map_approximate = bit_desc.second;
+          if (item.symbol != nullptr) {
+            auto bit_desc = DescribeBitSelectors(item.selectors, sm, *item.symbol);
+            rec.bit_map = std::move(bit_desc.first);
+            rec.bit_map_approximate = bit_desc.second;
+          }
           if (item.assignment != nullptr) {
             if (auto off = GetSourceOffsetRange(item.assignment->sourceRange, sm); off.has_value()) {
               rec.has_assignment_range = true;
@@ -2326,6 +2398,7 @@ std::optional<std::vector<std::string>> BuildMfcuArgs(const std::vector<std::str
 
   return out;
 }
+
 std::string ComputeCompileFingerprint(const std::vector<std::string> &passthrough_args) {
   std::vector<std::string> parts;
   parts.push_back("rtl_trace_compile_fingerprint_v1");
@@ -2703,6 +2776,35 @@ std::string FetchSourceSlice(TraceSession &session, const EndpointRecord &e) {
   return text.substr(start, end - start);
 }
 
+std::string TrimWhitespace(std::string_view text) {
+  size_t begin = 0;
+  while (begin < text.size() && std::isspace(static_cast<unsigned char>(text[begin]))) ++begin;
+  size_t end = text.size();
+  while (end > begin && std::isspace(static_cast<unsigned char>(text[end - 1]))) --end;
+  return std::string(text.substr(begin, end - begin));
+}
+
+std::vector<std::string> InferAssignmentLhsPaths(TraceSession &session, EndpointRecord &e) {
+  if (!e.lhs_signals.empty()) return e.lhs_signals;
+  if (e.kind != EndpointKind::kExpr) return {};
+  if (e.assignment_text.empty()) e.assignment_text = FetchSourceSlice(session, e);
+  if (e.assignment_text.empty()) return {};
+
+  const size_t eq = e.assignment_text.find('=');
+  if (eq == std::string::npos) return {};
+
+  std::string lhs = TrimWhitespace(std::string_view(e.assignment_text).substr(0, eq));
+  if (lhs.rfind("assign ", 0) == 0) lhs = TrimWhitespace(std::string_view(lhs).substr(7));
+  if (lhs.empty()) return {};
+
+  if (lhs.rfind("top.", 0) == 0) return {lhs};
+
+  const std::string &path = e.path;
+  const size_t dot = path.rfind('.');
+  if (dot == std::string::npos) return {};
+  return {path.substr(0, dot) + "." + lhs};
+}
+
 void MaterializeAssignmentTexts(TraceSession &session, TraceRunResult &result) {
   for (EndpointRecord &e : result.endpoints) {
     if (e.kind != EndpointKind::kExpr) continue;
@@ -2799,6 +2901,26 @@ void PrintTraceJson(const TraceDb &db, const TraceOptions &opts, const TraceRunR
   }
   std::cout << "]}";
   std::cout << "\n";
+}
+
+std::vector<EndpointRecord> FindFallbackDriverEndpoints(TraceSession &session,
+                                                        const std::string &target_signal) {
+  std::vector<EndpointRecord> out;
+  std::unordered_set<std::string> seen;
+  const size_t signal_count = session.graph.has_value() ? session.graph->signals.size() : 0;
+  for (size_t sig_id = 0; sig_id < signal_count; ++sig_id) {
+    const SignalRecord &record = SessionSignalRecord(session, static_cast<uint32_t>(sig_id));
+    for (EndpointRecord e : record.loads) {
+      std::vector<std::string> lhs_paths = InferAssignmentLhsPaths(session, e);
+      if (lhs_paths.empty()) continue;
+      if (std::find(lhs_paths.begin(), lhs_paths.end(), target_signal) == lhs_paths.end()) continue;
+      e.lhs_signals = std::move(lhs_paths);
+      const std::string key = EndpointKey(session.db, e);
+      if (!seen.insert(key).second) continue;
+      out.push_back(std::move(e));
+    }
+  }
+  return out;
 }
 
 std::optional<TraceRunResult> TryRunGlobalNetFastPath(const TraceDb &db, const TraceOptions &opts) {
@@ -2899,8 +3021,14 @@ TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
         const SignalRecord &record = SessionSignalRecord(session, sig_id);
         const std::vector<EndpointRecord> &edges =
             is_drivers_mode ? record.drivers : record.loads;
+        std::vector<EndpointRecord> fallback_edges;
+        const std::vector<EndpointRecord> *active_edges = &edges;
+        if (is_drivers_mode && edges.empty() && sig == opts.root_signal) {
+          fallback_edges = FindFallbackDriverEndpoints(session, sig);
+          if (!fallback_edges.empty()) active_edges = &fallback_edges;
+        }
 
-        for (const EndpointRecord &e : edges) {
+        for (const EndpointRecord &e : *active_edges) {
           const std::string &e_path = EndpointPath(db, e);
           if (sig == opts.root_signal && !EndpointMatchesSignalSelect(e, opts.signal_select)) {
             record_stop(e_path, "bit_filter", "endpoint-does-not-overlap-selected-bits", depth);
