@@ -75,14 +75,15 @@ These keep the original `rtl_trace` command model unchanged.
 - `wave_agent_query(vcd_path, cmd, args=None, wave_cli_bin=None)`
 - `list_signals(vcd_path)`
 - `get_signal_info(vcd_path, path)`
-- `get_snapshot(vcd_path, signals, time)`
-- `get_value_at_time(vcd_path, path, time)`
+- `get_snapshot(vcd_path, signals, time, radix="hex")`
+- `get_value_at_time(vcd_path, path, time, radix="hex")`
 - `find_edge(vcd_path, path, edge_type, start_time, direction="forward")`
 - `find_condition(vcd_path, expression, start_time, direction="forward")`
 - `get_transitions(vcd_path, path, start_time, end_time, max_limit=50)`
 - `analyze_pattern(vcd_path, path, start_time, end_time)`
 
 Waveform semantics stay aligned with `wave_agent_cli`. In particular, backward edge search now resolves the last matching edge at or before `T`, including an edge exactly at `T`.
+For multi-bit value queries, `radix` may be `hex`, `bin`, or `dec`; the default is `hex`.
 
 ### Cross-link tools
 

@@ -8,6 +8,21 @@
 AgentAPI::AgentAPI(WaveDatabase& db) : db(db) {}
 
 namespace {
+char normalize_logic_char(char ch) {
+    switch (std::tolower(static_cast<unsigned char>(ch))) {
+        case '0': return '0';
+        case '1': return '1';
+        case 'x':
+        case 'u':
+        case '?':
+            return 'x';
+        case 'z':
+            return 'z';
+        default:
+            return 'x';
+    }
+}
+
 std::string simplify_scalar_value(const std::string& value) {
     if (value == "0" || value == "1" || value == "x" || value == "z") {
         return value;
@@ -26,7 +41,166 @@ std::string simplify_scalar_value(const std::string& value) {
     return "x";
 }
 
-json format_signal_value_at_time(WaveDatabase& db, const std::string& signal_path, uint64_t time) {
+std::string normalize_radix(const std::string& radix) {
+    std::string normalized;
+    normalized.reserve(radix.size());
+    for (char ch : radix) {
+        normalized.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+    }
+    if (normalized == "bin" || normalized == "binary" || normalized == "2") return "bin";
+    if (normalized == "dec" || normalized == "decimal" || normalized == "10") return "dec";
+    return "hex";
+}
+
+std::string normalize_multibit_bits(const std::string& value, uint32_t width) {
+    if (value.empty()) {
+        return "";
+    }
+
+    const size_t hex_digits = std::max<size_t>(1, (static_cast<size_t>(width) + 3) / 4);
+    const size_t bit_digits = std::max<size_t>(1, static_cast<size_t>(width));
+
+    if (value.front() == 'h' || value.front() == 'H') {
+        std::string bits;
+        bits.reserve((value.size() - 1) * 4);
+        for (size_t i = 1; i < value.size(); ++i) {
+            const char ch = static_cast<char>(std::tolower(static_cast<unsigned char>(value[i])));
+            switch (ch) {
+                case '0': bits += "0000"; break;
+                case '1': bits += "0001"; break;
+                case '2': bits += "0010"; break;
+                case '3': bits += "0011"; break;
+                case '4': bits += "0100"; break;
+                case '5': bits += "0101"; break;
+                case '6': bits += "0110"; break;
+                case '7': bits += "0111"; break;
+                case '8': bits += "1000"; break;
+                case '9': bits += "1001"; break;
+                case 'a': bits += "1010"; break;
+                case 'b': bits += "1011"; break;
+                case 'c': bits += "1100"; break;
+                case 'd': bits += "1101"; break;
+                case 'e': bits += "1110"; break;
+                case 'f': bits += "1111"; break;
+                case 'z': bits += "zzzz"; break;
+                default: bits += "xxxx"; break;
+            }
+        }
+        if (bits.size() < hex_digits * 4) {
+            bits.insert(bits.begin(), hex_digits * 4 - bits.size(), '0');
+        }
+        if (bits.size() > bit_digits) {
+            bits = bits.substr(bits.size() - bit_digits);
+        }
+        return bits;
+    }
+
+    if (value.front() == 'b' || value.front() == 'B') {
+        std::string bits;
+        bits.reserve(value.size() - 1);
+        for (size_t i = 1; i < value.size(); ++i) {
+            bits.push_back(normalize_logic_char(value[i]));
+        }
+        if (bits.empty()) {
+            return "";
+        }
+        if (bits.size() < bit_digits) {
+            bits.insert(bits.begin(), bit_digits - bits.size(), '0');
+        }
+        return bits;
+    }
+
+    std::string normalized = value;
+    for (char& ch : normalized) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    return normalized;
+}
+
+std::string binary_bits_to_decimal(const std::string& bits) {
+    std::string decimal = "0";
+    for (char bit : bits) {
+        int carry = (bit == '1') ? 1 : 0;
+        for (int i = static_cast<int>(decimal.size()) - 1; i >= 0; --i) {
+            int digit = (decimal[static_cast<size_t>(i)] - '0') * 2 + carry;
+            decimal[static_cast<size_t>(i)] = static_cast<char>('0' + (digit % 10));
+            carry = digit / 10;
+        }
+        if (carry > 0) {
+            decimal.insert(decimal.begin(), static_cast<char>('0' + carry));
+        }
+    }
+    return decimal;
+}
+
+std::string format_multibit_value(const std::string& value, uint32_t width, const std::string& radix) {
+    const size_t hex_digits = std::max<size_t>(1, (static_cast<size_t>(width) + 3) / 4);
+    const size_t bit_digits = std::max<size_t>(1, static_cast<size_t>(width));
+    const std::string normalized_radix = normalize_radix(radix);
+    const std::string normalized = normalize_multibit_bits(value, width);
+    if (normalized.empty()) {
+        return normalized_radix == "dec" ? "dx" : (normalized_radix == "bin" ? "bx" : "hx");
+    }
+
+    if (!normalized.empty() && normalized.front() != '0' && normalized.front() != '1' &&
+        normalized.front() != 'x' && normalized.front() != 'z') {
+        return normalized;
+    }
+
+    if (normalized_radix == "bin") {
+        std::string bits = normalized;
+        if (bits.size() < bit_digits) {
+            bits.insert(bits.begin(), bit_digits - bits.size(), '0');
+        }
+        return "b" + bits;
+    }
+
+    if (normalized_radix == "dec") {
+        for (char bit : normalized) {
+            if (bit != '0' && bit != '1') {
+                return "b" + normalized;
+            }
+        }
+        return "d" + binary_bits_to_decimal(normalized);
+    }
+
+    std::string bits = normalized;
+    if (bits.empty()) {
+        return "hx";
+    }
+
+    if (bits.size() < hex_digits * 4) {
+        bits.insert(bits.begin(), hex_digits * 4 - bits.size(), '0');
+    }
+
+    std::string out = "h";
+    out.reserve(hex_digits + 1);
+    for (size_t i = 0; i < bits.size(); i += 4) {
+        const std::string nibble = bits.substr(i, 4);
+        bool all_z = true;
+        bool has_unknown = false;
+        int numeric = 0;
+        for (char bit : nibble) {
+            if (bit != 'z') all_z = false;
+            if (bit == 'x' || bit == 'z') {
+                has_unknown = true;
+                continue;
+            }
+            numeric = (numeric << 1) | (bit == '1' ? 1 : 0);
+        }
+        if (all_z) {
+            out.push_back('z');
+        } else if (has_unknown) {
+            out.push_back('x');
+        } else {
+            out.push_back("0123456789abcdef"[numeric]);
+        }
+    }
+
+    return out;
+}
+
+json format_signal_value_at_time(WaveDatabase& db, const std::string& signal_path, uint64_t time, const std::string& radix) {
     if (!db.has_signal(signal_path)) {
         return "x";
     }
@@ -57,7 +231,7 @@ json format_signal_value_at_time(WaveDatabase& db, const std::string& signal_pat
     if (transition_at_time && value_before != value) {
         return "changing";
     }
-    return value;
+    return format_multibit_value(value, info.width, radix);
 }
 }
 
@@ -106,19 +280,19 @@ json AgentAPI::list_signals_page(const std::string& prefix, const std::string& c
     };
 }
 
-json AgentAPI::get_snapshot(const std::vector<std::string>& signal_paths, uint64_t time) {
+json AgentAPI::get_snapshot(const std::vector<std::string>& signal_paths, uint64_t time, const std::string& radix) {
     json data = json::object();
     for (const auto& path : signal_paths) {
-        data[path] = format_signal_value_at_time(db, path, time);
+        data[path] = format_signal_value_at_time(db, path, time, radix);
     }
     return {{"status", "success"}, {"data", data}};
 }
 
-json AgentAPI::get_value_at_time(const std::string& signal_path, uint64_t time) {
+json AgentAPI::get_value_at_time(const std::string& signal_path, uint64_t time, const std::string& radix) {
     if (!db.has_signal(signal_path)) {
         return {{"status", "error"}, {"message", "Signal not found"}};
     }
-    return {{"status", "success"}, {"data", format_signal_value_at_time(db, signal_path, time)}};
+    return {{"status", "success"}, {"data", format_signal_value_at_time(db, signal_path, time, radix)}};
 }
 
 json AgentAPI::find_edge(const std::string& signal_path, const std::string& edge_type, uint64_t start_time, const std::string& direction) {

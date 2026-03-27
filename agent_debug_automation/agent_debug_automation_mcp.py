@@ -4,7 +4,7 @@ import shlex
 import subprocess
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, TypedDict
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -32,6 +32,22 @@ DEFAULT_RANK_WINDOW_BEFORE = 1000
 DEFAULT_RANK_WINDOW_AFTER = 1000
 DEFAULT_EXPLAIN_WINDOW_AFTER = 0
 DEFAULT_TRANSITION_LIMIT = 256
+
+
+class TraceOptions(TypedDict, total=False):
+    cone_level: int
+    depth: int
+    max_nodes: int
+    include: str | List[str]
+    exclude: str | List[str]
+    stop_at: str | List[str]
+    prefer_port_hop: bool
+
+
+EdgeType = Literal["posedge", "negedge", "anyedge"]
+EdgeTypeAlias = Literal["rise", "rising", "risingedge", "fall", "falling", "fallingedge", "edge", "any"]
+Direction = Literal["forward", "backward"]
+TraceMode = Literal["drivers", "loads"]
 
 
 def _resolve_bin(override: Optional[str], default_path: Path, fallback_name: str) -> str:
@@ -84,6 +100,24 @@ def _normalize_top_variants(path: str) -> List[str]:
 
 def _shell_join(args: Sequence[str]) -> str:
     return " ".join(shlex.quote(arg) for arg in args)
+
+
+def _normalize_edge_type(edge_type: str) -> EdgeType:
+    normalized = str(edge_type).strip().lower()
+    alias_map: Dict[str, EdgeType] = {
+        "rise": "posedge",
+        "rising": "posedge",
+        "risingedge": "posedge",
+        "posedge": "posedge",
+        "fall": "negedge",
+        "falling": "negedge",
+        "fallingedge": "negedge",
+        "negedge": "negedge",
+        "edge": "anyedge",
+        "any": "anyedge",
+        "anyedge": "anyedge",
+    }
+    return alias_map.get(normalized, "anyedge")
 
 
 class RtlTraceServeSession:
@@ -167,7 +201,7 @@ def _get_rtl_serve_session(db_path: str, rtl_trace_bin: Optional[str] = None) ->
     return sess
 
 
-def _append_trace_options(args: List[str], trace_options: Optional[Dict[str, Any]]) -> None:
+def _append_trace_options(args: List[str], trace_options: Optional[TraceOptions]) -> None:
     if not trace_options:
         return
 
@@ -196,8 +230,8 @@ def _append_trace_options(args: List[str], trace_options: Optional[Dict[str, Any
 def _rtl_trace_json(
     db_path: str,
     signal: str,
-    mode: str = "drivers",
-    trace_options: Optional[Dict[str, Any]] = None,
+    mode: TraceMode = "drivers",
+    trace_options: Optional[TraceOptions] = None,
     rtl_trace_bin: Optional[str] = None,
 ) -> Dict[str, Any]:
     session = _get_rtl_serve_session(db_path, rtl_trace_bin=rtl_trace_bin)
@@ -511,7 +545,14 @@ def _get_batch_snapshot(
     )
     if result.get("status") != "success":
         raise RuntimeError(result.get("message", "failed to get snapshot"))
-    return dict(result.get("data", {}))
+    snapshot = dict(result.get("data", {}))
+    values: Dict[str, Any] = {}
+    for signal, sample in snapshot.items():
+        if isinstance(sample, dict) and "value" in sample:
+            values[signal] = sample.get("value")
+        else:
+            values[signal] = sample
+    return values
 
 
 def _get_transitions_window(
@@ -974,7 +1015,7 @@ def _build_explanations(
 
 
 @mcp.tool()
-def wave_agent_query(vcd_path: str, cmd: str, args: Optional[dict] = None, wave_cli_bin: Optional[str] = None):
+def wave_agent_query(vcd_path: str, cmd: str, args: Optional[Dict[str, Any]] = None, wave_cli_bin: Optional[str] = None):
     """
     Generic wave_agent_cli command wrapper.
     Keeps original waveform command model: <cmd> + <args>.
@@ -998,20 +1039,27 @@ def get_signal_info(vcd_path: str, path: str):
 
 
 @mcp.tool()
-def get_snapshot(vcd_path: str, signals: List[str], time: int):
+def get_snapshot(vcd_path: str, signals: List[str], time: int, radix: str = "hex"):
     """Get the values of multiple signals at a specific timestamp."""
-    return wave_agent_query(vcd_path, "get_snapshot", {"signals": signals, "time": time})
+    return wave_agent_query(vcd_path, "get_snapshot", {"signals": signals, "time": time, "radix": radix})
 
 
 @mcp.tool()
-def get_value_at_time(vcd_path: str, path: str, time: int):
+def get_value_at_time(vcd_path: str, path: str, time: int, radix: str = "hex"):
     """Get the value of a single signal at a specific timestamp."""
-    return wave_agent_query(vcd_path, "get_value_at_time", {"path": path, "time": time})
+    return wave_agent_query(vcd_path, "get_value_at_time", {"path": path, "time": time, "radix": radix})
 
 
 @mcp.tool()
-def find_edge(vcd_path: str, path: str, edge_type: str, start_time: int, direction: str = "forward"):
+def find_edge(
+    vcd_path: str,
+    path: str,
+    edge_type: EdgeType | EdgeTypeAlias,
+    start_time: int,
+    direction: Direction = "forward",
+):
     """Search for the next/previous transition edge of a signal."""
+    edge_type = _normalize_edge_type(edge_type)
     return wave_agent_query(
         vcd_path,
         "find_edge",
@@ -1025,7 +1073,7 @@ def find_edge(vcd_path: str, path: str, edge_type: str, start_time: int, directi
 
 
 @mcp.tool()
-def find_condition(vcd_path: str, expression: str, start_time: int, direction: str = "forward"):
+def find_condition(vcd_path: str, expression: str, start_time: int, direction: Direction = "forward"):
     """Find the first timestamp where a logical condition is met."""
     return wave_agent_query(
         vcd_path,
@@ -1073,8 +1121,8 @@ def trace_with_snapshot(
     waveform_path: str,
     signal: str,
     time: int,
-    mode: str = "drivers",
-    trace_options: Optional[Dict[str, Any]] = None,
+    mode: TraceMode = "drivers",
+    trace_options: Optional[TraceOptions] = None,
     sample_offsets: Optional[List[int]] = None,
     clock_path: Optional[str] = None,
     cycle_offsets: Optional[List[int]] = None,
@@ -1151,8 +1199,8 @@ def explain_signal_at_time(
     waveform_path: str,
     signal: str,
     time: int,
-    mode: str = "drivers",
-    trace_options: Optional[Dict[str, Any]] = None,
+    mode: TraceMode = "drivers",
+    trace_options: Optional[TraceOptions] = None,
     rank_window_before: Optional[int] = None,
     rank_window_after: Optional[int] = None,
     rtl_trace_bin: Optional[str] = None,
@@ -1194,8 +1242,8 @@ def rank_cone_by_time(
     waveform_path: str,
     signal: str,
     time: int,
-    mode: str = "drivers",
-    trace_options: Optional[Dict[str, Any]] = None,
+    mode: TraceMode = "drivers",
+    trace_options: Optional[TraceOptions] = None,
     window_start: Optional[int] = None,
     window_end: Optional[int] = None,
     rtl_trace_bin: Optional[str] = None,
@@ -1258,10 +1306,10 @@ def explain_edge_cause(
     waveform_path: str,
     signal: str,
     time: int,
-    edge_type: str = "anyedge",
-    direction: str = "backward",
-    mode: str = "drivers",
-    trace_options: Optional[Dict[str, Any]] = None,
+    edge_type: EdgeType | EdgeTypeAlias = "anyedge",
+    direction: Direction = "backward",
+    mode: TraceMode = "drivers",
+    trace_options: Optional[TraceOptions] = None,
     rank_window_before: Optional[int] = None,
     rank_window_after: Optional[int] = None,
     rtl_trace_bin: Optional[str] = None,
@@ -1269,6 +1317,7 @@ def explain_edge_cause(
 ):
     """Resolve the relevant edge for a signal, then explain the upstream cause chain at that edge."""
     try:
+        edge_type = _normalize_edge_type(edge_type)
         mapped_signal = _map_signal_to_waveform(waveform_path, signal, wave_cli_bin=wave_cli_bin)
         if mapped_signal is None:
             return {"status": "error", "message": f"signal not found in waveform: {signal}"}

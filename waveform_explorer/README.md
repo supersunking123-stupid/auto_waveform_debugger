@@ -76,15 +76,17 @@ List hierarchical signal paths in a paged, prefix-filtered way for large FSDB wa
 
 #### 2. `get_snapshot`
 Get the values of multiple signals at a specific timestamp.
-- **Query:** `{"cmd": "get_snapshot", "args": {"signals": ["TOP.clk", "TOP.count"], "time": 5000}}`
-- **Response:** `{"status": "success", "data": {"TOP.clk": "rising", "TOP.count": "b00001010"}}`
+- **Query:** `{"cmd": "get_snapshot", "args": {"signals": ["TOP.clk", "TOP.count"], "time": 5000, "radix": "hex"}}`
+- **Response:** `{"status": "success", "data": {"TOP.clk": "rising", "TOP.count": "h0a"}}`
 - Scalar responses are simplified to `0`, `1`, `x`, `z`, `rising`, or `falling`.
-- Bus responses return the current bus value, or `changing` if the bus transitions exactly at that timestamp.
+- Stable multi-bit responses default to hex radix, for example `h0a`.
+- Bus responses return `changing` if the bus transitions exactly at that timestamp.
+- `radix` is optional and accepts `hex`, `bin`, or `dec`.
 
 #### 2b. `get_value_at_time`
 Get one signal value at a specific timestamp.
-- **Query:** `{"cmd": "get_value_at_time", "args": {"path": "TOP.count", "time": 5000}}`
-- **Response:** `{"status": "success", "data": "b00001010"}`
+- **Query:** `{"cmd": "get_value_at_time", "args": {"path": "TOP.count", "time": 5000, "radix": "hex"}}`
+- **Response:** `{"status": "success", "data": "h0a"}`
 - The returned value uses the same simplified formatting as `get_snapshot`.
 
 #### 3. `get_transitions`

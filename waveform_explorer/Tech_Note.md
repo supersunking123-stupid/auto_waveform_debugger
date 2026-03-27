@@ -219,7 +219,9 @@ Important constraint:
 #### `get_snapshot`
 - bulk point query over multiple paths at one timestamp
 - scalar responses are normalized to `0`, `1`, `x`, `z`, `rising`, or `falling`
-- bus responses return the sampled bus value, or `changing` when a transition occurs exactly at the queried timestamp
+- stable multi-bit values are displayed in hex by default
+- bus responses return `changing` when a transition occurs exactly at the queried timestamp
+- optional `radix` overrides for multi-bit stable values: `hex`, `bin`, `dec`
 
 #### `get_value_at_time`
 - single-signal point query

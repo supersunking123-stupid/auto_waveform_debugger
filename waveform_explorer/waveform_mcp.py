@@ -73,18 +73,18 @@ def get_signal_info(vcd_path: str, path: str):
         return {"status": "error", "message": str(e)}
 
 @mcp.tool()
-def get_snapshot(vcd_path: str, signals: List[str], time: int):
+def get_snapshot(vcd_path: str, signals: List[str], time: int, radix: str = "hex"):
     """Get the values of multiple signals at a specific timestamp."""
     try:
-        return get_daemon(vcd_path).query("get_snapshot", {"signals": signals, "time": time})
+        return get_daemon(vcd_path).query("get_snapshot", {"signals": signals, "time": time, "radix": radix})
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 @mcp.tool()
-def get_value_at_time(vcd_path: str, path: str, time: int):
+def get_value_at_time(vcd_path: str, path: str, time: int, radix: str = "hex"):
     """Get the value of a single signal at a specific timestamp."""
     try:
-        return get_daemon(vcd_path).query("get_value_at_time", {"path": path, "time": time})
+        return get_daemon(vcd_path).query("get_value_at_time", {"path": path, "time": time, "radix": radix})
     except Exception as e:
         return {"status": "error", "message": str(e)}
 

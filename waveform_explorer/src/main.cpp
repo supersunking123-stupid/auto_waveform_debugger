@@ -154,9 +154,15 @@ int main(int argc, char* argv[]) {
                     args.value("cursor", ""),
                     args.value("limit", 1000ULL));
             } else if (cmd == "get_snapshot") {
-                response = api.get_snapshot(args.value("signals", std::vector<std::string>()), args.value("time", 0ULL));
+                response = api.get_snapshot(
+                    args.value("signals", std::vector<std::string>()),
+                    args.value("time", 0ULL),
+                    args.value("radix", "hex"));
             } else if (cmd == "get_value_at_time") {
-                response = api.get_value_at_time(args.value("path", ""), args.value("time", 0ULL));
+                response = api.get_value_at_time(
+                    args.value("path", ""),
+                    args.value("time", 0ULL),
+                    args.value("radix", "hex"));
             } else if (cmd == "find_edge") {
                 response = api.find_edge(args.value("path", ""), args.value("edge_type", "anyedge"),
                                          args.value("start_time", 0ULL), args.value("direction", "forward"));
@@ -203,9 +209,15 @@ int main(int argc, char* argv[]) {
                     args.value("cursor", ""),
                     args.value("limit", 1000ULL));
             } else if (cmd == "get_snapshot") {
-                response = api.get_snapshot(args.value("signals", std::vector<std::string>()), args.value("time", 0ULL));
+                response = api.get_snapshot(
+                    args.value("signals", std::vector<std::string>()),
+                    args.value("time", 0ULL),
+                    args.value("radix", "hex"));
             } else if (cmd == "get_value_at_time") {
-                response = api.get_value_at_time(args.value("path", ""), args.value("time", 0ULL));
+                response = api.get_value_at_time(
+                    args.value("path", ""),
+                    args.value("time", 0ULL),
+                    args.value("radix", "hex"));
             } else if (cmd == "find_edge") {
                 response = api.find_edge(args.value("path", ""), args.value("edge_type", "anyedge"),
                                          args.value("start_time", 0ULL), args.value("direction", "forward"));

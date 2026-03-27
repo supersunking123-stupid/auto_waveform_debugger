@@ -261,6 +261,11 @@ These preserve the original backend command models.
 - `get_transitions(...)`
 - `analyze_pattern(...)`
 
+`get_snapshot(...)` and `get_value_at_time(...)` accept an optional `radix` for multi-bit stable values:
+- `hex` default
+- `bin`
+- `dec`
+
 ### High-level cross-link tools
 
 #### `trace_with_snapshot(...)`
