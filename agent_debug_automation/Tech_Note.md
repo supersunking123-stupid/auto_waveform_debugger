@@ -29,6 +29,7 @@ The module has three layers:
 
 3. MCP tool functions
 - low-level passthrough tools
+- session-state management tools
 - high-level cross-link tools
 
 The most important concept is reuse of long-lived backend processes. Without that, the cross-link tools would pay repeated startup cost.
@@ -54,6 +55,11 @@ These shape the default behavior of the higher-level tools.
 
 ### Session and cache dictionaries
 
+Persistent session state:
+- `SESSION_STORE_DIR`
+- `ACTIVE_SESSION_FILE`
+- `DEFAULT_SESSION_NAME`
+
 - `rtl_serve_sessions`
 - `rtl_session_ids_by_key`
 - `wave_daemons`
@@ -61,7 +67,7 @@ These shape the default behavior of the higher-level tools.
 - `wave_signal_resolution_cache`
 - `wave_prefix_page_cache`
 
-These caches are critical to performance.
+These caches are critical to performance. The session-store paths are critical to the waveform-view UX layer.
 
 ## Important classes
 
@@ -109,6 +115,30 @@ The protocol is one JSON command per line, one JSON response per line.
 
 - `_wave_query(...)`
   - thin JSON query helper over the daemon
+
+### Persistent session helpers
+
+- `_ensure_session_store(...)`
+- `_session_file_path(...)`
+- `_get_active_session_ref(...)`
+- `_set_active_session_ref(...)`
+- `_get_or_create_session(...)`
+- `_resolve_session(...)`
+- `_resolve_time_reference(...)`
+- `_resolve_time_range_reference(...)`
+- `_expand_signal_groups(...)`
+
+Purpose:
+- persist waveform-view state across MCP restarts
+- keep one active session pointer
+- resolve `"Cursor"` and `"BM_<name>"` into concrete integer timestamps
+- expand saved signal-group names into explicit signal lists before waveform queries
+
+Important behavior:
+- sessions are bound to one waveform path
+- `Default_Session` is auto-created on first session-aware access for a waveform
+- session files are stored individually on disk rather than kept only in memory
+- the active session is global, but all bookmark/group/cursor data remains session-local
 
 ### Structural trace helpers
 
@@ -258,6 +288,31 @@ These preserve the original backend command models.
 - `get_value_at_time(...)`
 - `find_edge(...)`
 - `find_value_intervals(...)`
+- `find_condition(...)`
+- `get_transitions(...)`
+- `analyze_pattern(...)`
+
+These merged waveform tools are no longer purely stateless wrappers. They first resolve session context, time aliases, and optional signal-group expansion, then delegate to the underlying `wave_agent_cli` command.
+
+### Session tools
+
+- `create_session(...)`
+- `list_sessions(...)`
+- `get_session(...)`
+- `switch_session(...)`
+- `delete_session(...)`
+- `set_cursor(...)`
+- `move_cursor(...)`
+- `get_cursor(...)`
+- `create_bookmark(...)`
+- `delete_bookmark(...)`
+- `list_bookmarks(...)`
+- `create_signal_group(...)`
+- `update_signal_group(...)`
+- `delete_signal_group(...)`
+- `list_signal_groups(...)`
+
+This tool group is the Python-only waveform-view layer. It is intentionally implemented in `agent_debug_automation` and not pushed into the C++ waveform backend.
 - `find_condition(...)`
 - `get_transitions(...)`
 - `analyze_pattern(...)`

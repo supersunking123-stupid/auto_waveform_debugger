@@ -75,16 +75,60 @@ These keep the original `rtl_trace` command model unchanged.
 - `wave_agent_query(vcd_path, cmd, args=None, wave_cli_bin=None)`
 - `list_signals(vcd_path)`
 - `get_signal_info(vcd_path, path)`
-- `get_snapshot(vcd_path, signals, time, radix="hex")`
-- `get_value_at_time(vcd_path, path, time, radix="hex")`
-- `find_edge(vcd_path, path, edge_type, start_time, direction="forward")`
-- `find_value_intervals(vcd_path, path, value, start_time, end_time, radix="hex")`
-- `find_condition(vcd_path, expression, start_time, direction="forward")`
-- `get_transitions(vcd_path, path, start_time, end_time, max_limit=50)`
-- `analyze_pattern(vcd_path, path, start_time, end_time)`
+- `get_snapshot(vcd_path=None, signals, time, radix="hex", signals_are_groups=False, session_name=None)`
+- `get_value_at_time(vcd_path=None, path, time, radix="hex", session_name=None)`
+- `find_edge(vcd_path=None, path, edge_type, start_time, direction="forward", session_name=None)`
+- `find_value_intervals(vcd_path=None, path, value, start_time, end_time, radix="hex", session_name=None)`
+- `find_condition(vcd_path=None, expression, start_time, direction="forward", session_name=None)`
+- `get_transitions(vcd_path=None, path, start_time, end_time, max_limit=50, session_name=None)`
+- `analyze_pattern(vcd_path=None, path, start_time, end_time, session_name=None)`
 
 Waveform semantics stay aligned with `wave_agent_cli`. In particular, backward edge search now resolves the last matching edge at or before `T`, including an edge exactly at `T`.
 For multi-bit value queries, `radix` may be `hex`, `bin`, or `dec`; the default is `hex`.
+
+### Session tools
+
+- `create_session(waveform_path, session_name, description="")`
+- `list_sessions(waveform_path=None)`
+- `get_session(session_name=None, waveform_path=None)`
+- `switch_session(session_name, waveform_path=None)`
+- `delete_session(session_name, waveform_path=None)`
+- `set_cursor(time, waveform_path=None, session_name=None)`
+- `move_cursor(delta, waveform_path=None, session_name=None)`
+- `get_cursor(waveform_path=None, session_name=None)`
+- `create_bookmark(bookmark_name, time, description="", waveform_path=None, session_name=None)`
+- `delete_bookmark(bookmark_name, waveform_path=None, session_name=None)`
+- `list_bookmarks(waveform_path=None, session_name=None)`
+- `create_signal_group(group_name, signals, description="", waveform_path=None, session_name=None)`
+- `update_signal_group(group_name, signals=None, description=None, waveform_path=None, session_name=None)`
+- `delete_signal_group(group_name, waveform_path=None, session_name=None)`
+- `list_signal_groups(waveform_path=None, session_name=None)`
+
+Session state is stored on disk under `agent_debug_automation/.session_store`.
+Each waveform gets a default `Default_Session` on first session-aware use.
+Time-taking merged tools accept either an integer time, `"Cursor"`, or `"BM_<bookmark_name>"`.
+`get_snapshot` can expand saved signal groups when `signals_are_groups=true`.
+The active session is global, but every saved session is bound to a single waveform path.
+
+Common session-aware workflow:
+
+```python
+create_session("/path/to/wave.fsdb", "debug_view", "AXI read debug")
+switch_session("debug_view", waveform_path="/path/to/wave.fsdb")
+set_cursor(307050000, waveform_path="/path/to/wave.fsdb")
+create_bookmark("rlast_edge", "Cursor", waveform_path="/path/to/wave.fsdb")
+create_signal_group(
+  "axi_read_rsp",
+  ["top...rlast", "top...rready", "top...rid[7:0]"],
+  waveform_path="/path/to/wave.fsdb",
+)
+get_snapshot(
+  vcd_path="/path/to/wave.fsdb",
+  signals=["axi_read_rsp"],
+  time="BM_rlast_edge",
+  signals_are_groups=True,
+)
+```
 
 ### Cross-link tools
 
@@ -109,6 +153,8 @@ For multi-bit value queries, `radix` may be `hex`, `bin`, or `dec`; the default 
   - Finds the relevant edge near `time`.
   - Re-runs the signal-at-time explanation at the resolved edge.
   - Returns edge context plus ranked upstream candidates.
+
+Cross-link tools also accept session time aliases, so `time` may be an integer, `"Cursor"`, or `"BM_<bookmark_name>"`.
 
 ## Cross-link behavior
 
@@ -160,3 +206,25 @@ Returned per-signal summaries include:
 - `list_signals_page` exists specifically for large FSDB designs.
 
 This is what makes the cross-link tools practical on large ASIC waveforms such as NVDLA.
+
+## Tests
+
+Portable regression:
+
+```bash
+python3 -m unittest agent_debug_automation.tests.test_cross_linking
+```
+
+The test module includes:
+- unit-style regression on the bundled `timer_tb.vcd` fixture
+- a real-environment NVDLA integration regression, auto-enabled only when these paths exist:
+  - `/home/qsun/DVT/nvdla/hw/verif/sim_vip/cc_alexnet_conv5_relu5_int16_dtest_cvsram/wave.fsdb`
+  - `/home/qsun/DVT/nvdla/hw/verif/sim_vip/rtl_trace.db`
+
+Run only the real-environment regression:
+
+```bash
+python3 -m unittest agent_debug_automation.tests.test_cross_linking.NvdlaSessionIntegrationTests
+```
+
+Because session state is persisted under `.session_store`, these tests should be run serially rather than in parallel.

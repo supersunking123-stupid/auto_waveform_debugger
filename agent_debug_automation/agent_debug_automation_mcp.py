@@ -3,6 +3,9 @@ import os
 import shlex
 import subprocess
 import uuid
+import hashlib
+import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, TypedDict
 
@@ -32,6 +35,9 @@ DEFAULT_RANK_WINDOW_BEFORE = 1000
 DEFAULT_RANK_WINDOW_AFTER = 1000
 DEFAULT_EXPLAIN_WINDOW_AFTER = 0
 DEFAULT_TRANSITION_LIMIT = 256
+SESSION_STORE_DIR = ROOT_DIR / "agent_debug_automation" / ".session_store"
+ACTIVE_SESSION_FILE = SESSION_STORE_DIR / "active_session.json"
+DEFAULT_SESSION_NAME = "Default_Session"
 
 
 class TraceOptions(TypedDict, total=False):
@@ -48,6 +54,313 @@ EdgeType = Literal["posedge", "negedge", "anyedge"]
 EdgeTypeAlias = Literal["rise", "rising", "risingedge", "fall", "falling", "fallingedge", "edge", "any"]
 Direction = Literal["forward", "backward"]
 TraceMode = Literal["drivers", "loads"]
+TimeReference = int | str
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _normalize_waveform_path(path: str) -> str:
+    return str(Path(path).expanduser().resolve())
+
+
+def _ensure_session_store() -> None:
+    SESSION_STORE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _session_waveform_id(waveform_path: str) -> str:
+    normalized = _normalize_waveform_path(waveform_path)
+    return hashlib.sha1(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def _safe_session_name(session_name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", session_name.strip())
+    return cleaned or "session"
+
+
+def _session_file_path(waveform_path: str, session_name: str) -> Path:
+    prefix = _session_waveform_id(waveform_path)
+    return SESSION_STORE_DIR / f"{prefix}__{_safe_session_name(session_name)}.json"
+
+
+def _read_json_file(path: Path) -> Dict[str, Any]:
+    with path.open("r", encoding="ascii") as f:
+        return json.load(f)
+
+
+def _write_json_file(path: Path, payload: Dict[str, Any]) -> None:
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="ascii") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+        f.write("\n")
+    tmp_path.replace(path)
+
+
+def _validate_session_name(session_name: str) -> str:
+    name = session_name.strip()
+    if not name:
+        raise ValueError("session_name must not be empty")
+    return name
+
+
+def _validate_named_entity(name: str, field_name: str) -> str:
+    value = name.strip()
+    if not value:
+        raise ValueError(f"{field_name} must not be empty")
+    if value == "Cursor":
+        raise ValueError(f"{field_name} cannot be Cursor")
+    return value
+
+
+def _default_session_payload(waveform_path: str, session_name: str = DEFAULT_SESSION_NAME, description: str = "") -> Dict[str, Any]:
+    normalized_waveform = _normalize_waveform_path(waveform_path)
+    now = _utc_now_iso()
+    return {
+        "session_name": _validate_session_name(session_name),
+        "description": description,
+        "waveform_path": normalized_waveform,
+        "cursor_time": 0,
+        "bookmarks": {},
+        "signal_groups": {},
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+def _normalize_session_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(payload)
+    normalized["session_name"] = _validate_session_name(str(normalized.get("session_name", "")))
+    normalized["waveform_path"] = _normalize_waveform_path(str(normalized.get("waveform_path", "")))
+    normalized["description"] = str(normalized.get("description", ""))
+    normalized["cursor_time"] = int(normalized.get("cursor_time", 0))
+    normalized["bookmarks"] = dict(normalized.get("bookmarks", {}))
+    normalized["signal_groups"] = dict(normalized.get("signal_groups", {}))
+    normalized["created_at"] = str(normalized.get("created_at", _utc_now_iso()))
+    normalized["updated_at"] = str(normalized.get("updated_at", normalized["created_at"]))
+    return normalized
+
+
+def _save_session_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    _ensure_session_store()
+    normalized = _normalize_session_payload(payload)
+    normalized["updated_at"] = _utc_now_iso()
+    path = _session_file_path(normalized["waveform_path"], normalized["session_name"])
+    _write_json_file(path, normalized)
+    return normalized
+
+
+def _load_session_payload(waveform_path: str, session_name: str) -> Optional[Dict[str, Any]]:
+    path = _session_file_path(waveform_path, session_name)
+    if not path.exists():
+        return None
+    return _normalize_session_payload(_read_json_file(path))
+
+
+def _list_session_payloads(waveform_path: Optional[str] = None) -> List[Dict[str, Any]]:
+    _ensure_session_store()
+    normalized_waveform = None if waveform_path is None else _normalize_waveform_path(waveform_path)
+    sessions: List[Dict[str, Any]] = []
+    for path in SESSION_STORE_DIR.glob("*.json"):
+        if path == ACTIVE_SESSION_FILE:
+            continue
+        try:
+            payload = _normalize_session_payload(_read_json_file(path))
+        except Exception:
+            continue
+        if normalized_waveform is not None and payload["waveform_path"] != normalized_waveform:
+            continue
+        sessions.append(payload)
+    sessions.sort(key=lambda item: (item["waveform_path"], item["session_name"]))
+    return sessions
+
+
+def _get_active_session_ref() -> Optional[Dict[str, str]]:
+    if not ACTIVE_SESSION_FILE.exists():
+        return None
+    try:
+        payload = _read_json_file(ACTIVE_SESSION_FILE)
+    except Exception:
+        return None
+    session_name = str(payload.get("session_name", "")).strip()
+    waveform_path = str(payload.get("waveform_path", "")).strip()
+    if not session_name or not waveform_path:
+        return None
+    return {
+        "session_name": session_name,
+        "waveform_path": _normalize_waveform_path(waveform_path),
+    }
+
+
+def _set_active_session_ref(waveform_path: str, session_name: str) -> Dict[str, str]:
+    _ensure_session_store()
+    payload = {
+        "session_name": _validate_session_name(session_name),
+        "waveform_path": _normalize_waveform_path(waveform_path),
+        "updated_at": _utc_now_iso(),
+    }
+    _write_json_file(ACTIVE_SESSION_FILE, payload)
+    return payload
+
+
+def _clear_active_session_ref() -> None:
+    if ACTIVE_SESSION_FILE.exists():
+        ACTIVE_SESSION_FILE.unlink()
+
+
+def _get_or_create_session(waveform_path: str, session_name: str = DEFAULT_SESSION_NAME, description: str = "") -> Dict[str, Any]:
+    normalized_waveform = _normalize_waveform_path(waveform_path)
+    existing = _load_session_payload(normalized_waveform, session_name)
+    if existing is not None:
+        return existing
+    return _save_session_payload(_default_session_payload(normalized_waveform, session_name=session_name, description=description))
+
+
+def _resolve_session(
+    waveform_path: Optional[str] = None,
+    session_name: Optional[str] = None,
+    create_default: bool = True,
+    set_active_on_create: bool = True,
+) -> Dict[str, Any]:
+    active_ref = _get_active_session_ref()
+    normalized_waveform = None if waveform_path is None else _normalize_waveform_path(waveform_path)
+
+    if session_name:
+        if normalized_waveform is None:
+            if active_ref and active_ref["session_name"] == session_name:
+                normalized_waveform = active_ref["waveform_path"]
+            else:
+                matches = [item for item in _list_session_payloads() if item["session_name"] == session_name]
+                if not matches:
+                    raise ValueError(f"session not found: {session_name}")
+                if len(matches) > 1:
+                    raise ValueError(f"session_name is ambiguous without waveform_path: {session_name}")
+                normalized_waveform = matches[0]["waveform_path"]
+        payload = _load_session_payload(normalized_waveform, session_name)
+        if payload is None:
+            raise ValueError(f"session not found: {session_name}")
+        return payload
+
+    if normalized_waveform is None:
+        if not active_ref:
+            raise ValueError("waveform_path or an active session is required")
+        payload = _load_session_payload(active_ref["waveform_path"], active_ref["session_name"])
+        if payload is None:
+            raise ValueError("active session reference is stale")
+        return payload
+
+    if active_ref and active_ref["waveform_path"] == normalized_waveform:
+        payload = _load_session_payload(normalized_waveform, active_ref["session_name"])
+        if payload is not None:
+            return payload
+
+    if not create_default:
+        raise ValueError(f"no active session for waveform: {normalized_waveform}")
+
+    payload = _get_or_create_session(normalized_waveform, DEFAULT_SESSION_NAME)
+    if set_active_on_create and not active_ref:
+        _set_active_session_ref(normalized_waveform, payload["session_name"])
+    return payload
+
+
+def _session_summary(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "session_name": payload["session_name"],
+        "description": payload["description"],
+        "waveform_path": payload["waveform_path"],
+        "cursor_time": payload["cursor_time"],
+        "bookmark_names": sorted(payload["bookmarks"].keys()),
+        "signal_group_names": sorted(payload["signal_groups"].keys()),
+        "created_at": payload["created_at"],
+        "updated_at": payload["updated_at"],
+    }
+
+
+def _time_resolution_info(input_value: TimeReference, resolved_time: int, session: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "input": input_value,
+        "resolved_time": resolved_time,
+        "session_name": session["session_name"],
+        "waveform_path": session["waveform_path"],
+    }
+
+
+def _resolve_time_reference(
+    time_value: TimeReference,
+    waveform_path: Optional[str] = None,
+    session_name: Optional[str] = None,
+) -> Tuple[int, Dict[str, Any], Dict[str, Any]]:
+    session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+    if isinstance(time_value, int):
+        return int(time_value), _time_resolution_info(time_value, int(time_value), session), session
+
+    raw = str(time_value).strip()
+    if not raw:
+        raise ValueError("time reference must not be empty")
+    if raw == "Cursor":
+        resolved = int(session["cursor_time"])
+        return resolved, _time_resolution_info(raw, resolved, session), session
+    if raw.startswith("BM_"):
+        bookmark_name = raw[3:]
+        bookmark = session["bookmarks"].get(bookmark_name)
+        if bookmark is None:
+            raise ValueError(f"bookmark not found: {bookmark_name}")
+        resolved = int(bookmark["time"])
+        return resolved, _time_resolution_info(raw, resolved, session), session
+    try:
+        resolved = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"unsupported time reference: {time_value}") from exc
+    return resolved, _time_resolution_info(raw, resolved, session), session
+
+
+def _resolve_time_range_reference(
+    start_time: TimeReference,
+    end_time: TimeReference,
+    waveform_path: Optional[str] = None,
+    session_name: Optional[str] = None,
+) -> Tuple[int, int, Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    start_resolved, start_info, session = _resolve_time_reference(
+        start_time,
+        waveform_path=waveform_path,
+        session_name=session_name,
+    )
+    end_resolved, end_info, _ = _resolve_time_reference(
+        end_time,
+        waveform_path=session["waveform_path"],
+        session_name=session["session_name"],
+    )
+    return start_resolved, end_resolved, start_info, end_info, session
+
+
+def _expand_signal_groups(
+    signals: Sequence[str],
+    signals_are_groups: bool,
+    waveform_path: Optional[str] = None,
+    session_name: Optional[str] = None,
+) -> Tuple[List[str], Dict[str, Any], Optional[Dict[str, Any]]]:
+    if not signals_are_groups:
+        return list(signals), {"signals_are_groups": False, "group_names": [], "expanded_signals": list(signals)}, None
+
+    session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+    expanded: List[str] = []
+    seen = set()
+    group_names: List[str] = []
+    for group_name in signals:
+        group_key = _validate_named_entity(group_name, "group_name")
+        group = session["signal_groups"].get(group_key)
+        if group is None:
+            raise ValueError(f"signal group not found: {group_key}")
+        group_names.append(group_key)
+        for signal in group.get("signals", []):
+            if signal not in seen:
+                seen.add(signal)
+                expanded.append(signal)
+    return expanded, {
+        "signals_are_groups": True,
+        "group_names": group_names,
+        "expanded_signals": expanded,
+    }, session
 
 
 def _resolve_bin(override: Optional[str], default_path: Path, fallback_name: str) -> str:
@@ -176,6 +489,13 @@ class RtlTraceServeSession:
                 self.process.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 self.process.kill()
+        for stream_name in ("stdin", "stdout", "stderr"):
+            stream = getattr(self.process, stream_name, None)
+            if stream:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
         return {"status": "success"}
 
 
@@ -350,6 +670,17 @@ class WaveformDaemon:
     def stop(self):
         if self.process.poll() is None:
             self.process.terminate()
+            try:
+                self.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+        for stream_name in ("stdin", "stdout", "stderr"):
+            stream = getattr(self.process, stream_name, None)
+            if stream:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
 
 
 wave_daemons: Dict[str, WaveformDaemon] = {}
@@ -1014,6 +1345,261 @@ def _build_explanations(
     }
 
 
+def _with_session_metadata(
+    payload: Dict[str, Any],
+    session: Optional[Dict[str, Any]] = None,
+    time_context: Optional[Dict[str, Any]] = None,
+    signal_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if session is not None:
+        payload["session"] = _session_summary(session)
+    if time_context is not None:
+        payload["resolved_time"] = time_context
+    if signal_context is not None:
+        payload["resolved_signals"] = signal_context
+    return payload
+
+
+def _require_waveform_path_from_session(
+    waveform_path: Optional[str] = None,
+    session_name: Optional[str] = None,
+) -> Tuple[str, Dict[str, Any]]:
+    session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+    return session["waveform_path"], session
+
+
+@mcp.tool()
+def create_session(waveform_path: str, session_name: str, description: str = ""):
+    """Create a waveform-bound session that stores cursor, bookmarks, and signal groups."""
+    try:
+        payload = _load_session_payload(waveform_path, session_name)
+        if payload is not None:
+            return {"status": "error", "message": f"session already exists: {session_name}"}
+        payload = _save_session_payload(_default_session_payload(waveform_path, session_name=session_name, description=description))
+        return _with_session_metadata({"status": "success", "data": _session_summary(payload)}, payload)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool()
+def list_sessions(waveform_path: Optional[str] = None):
+    """List saved sessions, optionally filtered by waveform path."""
+    try:
+        sessions = [_session_summary(item) for item in _list_session_payloads(waveform_path)]
+        active = _get_active_session_ref()
+        return {"status": "success", "data": sessions, "active_session": active}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool()
+def get_session(session_name: Optional[str] = None, waveform_path: Optional[str] = None):
+    """Get one session or the active/default session for a waveform."""
+    try:
+        payload = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+        result = dict(payload)
+        result["bookmarks"] = dict(payload["bookmarks"])
+        result["signal_groups"] = dict(payload["signal_groups"])
+        return _with_session_metadata({"status": "success", "data": result}, payload)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool()
+def switch_session(session_name: str, waveform_path: Optional[str] = None):
+    """Switch the active session."""
+    try:
+        payload = _resolve_session(waveform_path=waveform_path, session_name=session_name, create_default=False)
+        active = _set_active_session_ref(payload["waveform_path"], payload["session_name"])
+        return _with_session_metadata({"status": "success", "active_session": active}, payload)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool()
+def delete_session(session_name: str, waveform_path: Optional[str] = None):
+    """Delete a session. Default_Session is retained."""
+    try:
+        payload = _resolve_session(waveform_path=waveform_path, session_name=session_name, create_default=False)
+        if payload["session_name"] == DEFAULT_SESSION_NAME:
+            return {"status": "error", "message": "cannot delete Default_Session"}
+        path = _session_file_path(payload["waveform_path"], payload["session_name"])
+        if path.exists():
+            path.unlink()
+        active = _get_active_session_ref()
+        if active and active["waveform_path"] == payload["waveform_path"] and active["session_name"] == payload["session_name"]:
+            default_session = _get_or_create_session(payload["waveform_path"], DEFAULT_SESSION_NAME)
+            active = _set_active_session_ref(default_session["waveform_path"], default_session["session_name"])
+        return {"status": "success", "deleted_session": _session_summary(payload), "active_session": active}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool()
+def set_cursor(time: TimeReference, waveform_path: Optional[str] = None, session_name: Optional[str] = None):
+    """Set the session cursor to an absolute time or alias."""
+    try:
+        resolved_time, time_info, session = _resolve_time_reference(time, waveform_path=waveform_path, session_name=session_name)
+        session["cursor_time"] = max(0, int(resolved_time))
+        session = _save_session_payload(session)
+        return _with_session_metadata({"status": "success", "data": {"cursor_time": session["cursor_time"]}}, session, time_info)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool()
+def move_cursor(delta: int, waveform_path: Optional[str] = None, session_name: Optional[str] = None):
+    """Move the session cursor by a signed time delta."""
+    try:
+        session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+        session["cursor_time"] = max(0, int(session["cursor_time"]) + int(delta))
+        session = _save_session_payload(session)
+        return _with_session_metadata(
+            {"status": "success", "data": {"cursor_time": session["cursor_time"], "delta": int(delta)}},
+            session,
+            _time_resolution_info(f"cursor+={int(delta)}", session["cursor_time"], session),
+        )
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool()
+def get_cursor(waveform_path: Optional[str] = None, session_name: Optional[str] = None):
+    """Get the current cursor time for a session."""
+    try:
+        session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+        return _with_session_metadata(
+            {"status": "success", "data": {"cursor_time": int(session["cursor_time"])}},
+            session,
+            _time_resolution_info("Cursor", int(session["cursor_time"]), session),
+        )
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool()
+def create_bookmark(
+    bookmark_name: str,
+    time: TimeReference,
+    description: str = "",
+    waveform_path: Optional[str] = None,
+    session_name: Optional[str] = None,
+):
+    """Create or replace a bookmark in the selected session."""
+    try:
+        resolved_time, time_info, session = _resolve_time_reference(time, waveform_path=waveform_path, session_name=session_name)
+        key = _validate_named_entity(bookmark_name, "bookmark_name")
+        session["bookmarks"][key] = {"time": int(resolved_time), "description": description}
+        session = _save_session_payload(session)
+        return _with_session_metadata({"status": "success", "data": {"bookmark_name": key, **session["bookmarks"][key]}}, session, time_info)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool()
+def delete_bookmark(bookmark_name: str, waveform_path: Optional[str] = None, session_name: Optional[str] = None):
+    """Delete a bookmark from the selected session."""
+    try:
+        session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+        key = _validate_named_entity(bookmark_name, "bookmark_name")
+        if key not in session["bookmarks"]:
+            return {"status": "error", "message": f"bookmark not found: {key}"}
+        deleted = session["bookmarks"].pop(key)
+        session = _save_session_payload(session)
+        return _with_session_metadata({"status": "success", "data": {"bookmark_name": key, **deleted}}, session)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool()
+def list_bookmarks(waveform_path: Optional[str] = None, session_name: Optional[str] = None):
+    """List bookmarks for the selected session."""
+    try:
+        session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+        bookmarks = [
+            {"bookmark_name": name, "time": int(item["time"]), "description": item.get("description", "")}
+            for name, item in sorted(session["bookmarks"].items())
+        ]
+        return _with_session_metadata({"status": "success", "data": bookmarks}, session)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool()
+def create_signal_group(
+    group_name: str,
+    signals: List[str],
+    description: str = "",
+    waveform_path: Optional[str] = None,
+    session_name: Optional[str] = None,
+):
+    """Create or replace a named signal group in the selected session."""
+    try:
+        session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+        key = _validate_named_entity(group_name, "group_name")
+        ordered = list(dict.fromkeys(signals))
+        session["signal_groups"][key] = {"signals": ordered, "description": description}
+        session = _save_session_payload(session)
+        return _with_session_metadata({"status": "success", "data": {"group_name": key, **session["signal_groups"][key]}}, session)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool()
+def update_signal_group(
+    group_name: str,
+    signals: Optional[List[str]] = None,
+    description: Optional[str] = None,
+    waveform_path: Optional[str] = None,
+    session_name: Optional[str] = None,
+):
+    """Update a named signal group."""
+    try:
+        session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+        key = _validate_named_entity(group_name, "group_name")
+        group = session["signal_groups"].get(key)
+        if group is None:
+            return {"status": "error", "message": f"signal group not found: {key}"}
+        if signals is not None:
+            group["signals"] = list(dict.fromkeys(signals))
+        if description is not None:
+            group["description"] = description
+        session["signal_groups"][key] = group
+        session = _save_session_payload(session)
+        return _with_session_metadata({"status": "success", "data": {"group_name": key, **group}}, session)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool()
+def delete_signal_group(group_name: str, waveform_path: Optional[str] = None, session_name: Optional[str] = None):
+    """Delete a named signal group."""
+    try:
+        session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+        key = _validate_named_entity(group_name, "group_name")
+        if key not in session["signal_groups"]:
+            return {"status": "error", "message": f"signal group not found: {key}"}
+        deleted = session["signal_groups"].pop(key)
+        session = _save_session_payload(session)
+        return _with_session_metadata({"status": "success", "data": {"group_name": key, **deleted}}, session)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool()
+def list_signal_groups(waveform_path: Optional[str] = None, session_name: Optional[str] = None):
+    """List signal groups for the selected session."""
+    try:
+        session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+        groups = [
+            {"group_name": name, "signals": list(item.get("signals", [])), "description": item.get("description", "")}
+            for name, item in sorted(session["signal_groups"].items())
+        ]
+        return _with_session_metadata({"status": "success", "data": groups}, session)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
 @mcp.tool()
 def wave_agent_query(vcd_path: str, cmd: str, args: Optional[Dict[str, Any]] = None, wave_cli_bin: Optional[str] = None):
     """
@@ -1027,123 +1613,239 @@ def wave_agent_query(vcd_path: str, cmd: str, args: Optional[Dict[str, Any]] = N
 
 
 @mcp.tool()
-def list_signals(vcd_path: str):
+def list_signals(vcd_path: Optional[str] = None, session_name: Optional[str] = None):
     """List all hierarchical signal paths found in the VCD file."""
-    return wave_agent_query(vcd_path, "list_signals")
+    try:
+        resolved_waveform, session = _require_waveform_path_from_session(vcd_path, session_name)
+        result = wave_agent_query(resolved_waveform, "list_signals")
+        return _with_session_metadata(result, session)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 
 @mcp.tool()
-def get_signal_info(vcd_path: str, path: str):
+def get_signal_info(vcd_path: Optional[str] = None, path: str = "", session_name: Optional[str] = None):
     """Get metadata for a specific signal (width, type, etc.)."""
-    return wave_agent_query(vcd_path, "get_signal_info", {"path": path})
+    try:
+        resolved_waveform, session = _require_waveform_path_from_session(vcd_path, session_name)
+        result = wave_agent_query(resolved_waveform, "get_signal_info", {"path": path})
+        return _with_session_metadata(result, session)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 
 @mcp.tool()
-def get_snapshot(vcd_path: str, signals: List[str], time: int, radix: str = "hex"):
+def get_snapshot(
+    vcd_path: Optional[str] = None,
+    signals: Optional[List[str]] = None,
+    time: TimeReference = 0,
+    radix: str = "hex",
+    signals_are_groups: bool = False,
+    session_name: Optional[str] = None,
+):
     """Get the values of multiple signals at a specific timestamp."""
-    return wave_agent_query(vcd_path, "get_snapshot", {"signals": signals, "time": time, "radix": radix})
+    try:
+        expanded_signals, signal_info, signal_session = _expand_signal_groups(
+            signals or [],
+            signals_are_groups=signals_are_groups,
+            waveform_path=vcd_path,
+            session_name=session_name,
+        )
+        resolved_time, time_info, time_session = _resolve_time_reference(
+            time,
+            waveform_path=signal_session["waveform_path"] if signal_session else vcd_path,
+            session_name=signal_session["session_name"] if signal_session else session_name,
+        )
+        session = time_session if signal_session is None else signal_session
+        result = wave_agent_query(
+            session["waveform_path"],
+            "get_snapshot",
+            {"signals": expanded_signals, "time": resolved_time, "radix": radix},
+        )
+        return _with_session_metadata(result, session, time_info, signal_info)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 
 @mcp.tool()
-def get_value_at_time(vcd_path: str, path: str, time: int, radix: str = "hex"):
+def get_value_at_time(
+    vcd_path: Optional[str] = None,
+    path: str = "",
+    time: TimeReference = 0,
+    radix: str = "hex",
+    session_name: Optional[str] = None,
+):
     """Get the value of a single signal at a specific timestamp."""
-    return wave_agent_query(vcd_path, "get_value_at_time", {"path": path, "time": time, "radix": radix})
+    try:
+        resolved_time, time_info, session = _resolve_time_reference(time, waveform_path=vcd_path, session_name=session_name)
+        result = wave_agent_query(
+            session["waveform_path"],
+            "get_value_at_time",
+            {"path": path, "time": resolved_time, "radix": radix},
+        )
+        return _with_session_metadata(result, session, time_info)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 
 @mcp.tool()
 def find_edge(
-    vcd_path: str,
-    path: str,
-    edge_type: EdgeType | EdgeTypeAlias,
-    start_time: int,
+    vcd_path: Optional[str] = None,
+    path: str = "",
+    edge_type: EdgeType | EdgeTypeAlias = "anyedge",
+    start_time: TimeReference = 0,
     direction: Direction = "forward",
+    session_name: Optional[str] = None,
 ):
     """Search for the next/previous transition edge of a signal."""
-    edge_type = _normalize_edge_type(edge_type)
-    return wave_agent_query(
-        vcd_path,
-        "find_edge",
-        {
-            "path": path,
-            "edge_type": edge_type,
-            "start_time": start_time,
-            "direction": direction,
-        },
-    )
+    try:
+        edge_type = _normalize_edge_type(edge_type)
+        resolved_time, time_info, session = _resolve_time_reference(start_time, waveform_path=vcd_path, session_name=session_name)
+        result = wave_agent_query(
+            session["waveform_path"],
+            "find_edge",
+            {
+                "path": path,
+                "edge_type": edge_type,
+                "start_time": resolved_time,
+                "direction": direction,
+            },
+        )
+        return _with_session_metadata(result, session, time_info)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 
 @mcp.tool()
 def find_value_intervals(
-    vcd_path: str,
-    path: str,
-    value: str,
-    start_time: int,
-    end_time: int,
+    vcd_path: Optional[str] = None,
+    path: str = "",
+    value: str = "",
+    start_time: TimeReference = 0,
+    end_time: TimeReference = 0,
     radix: str = "hex",
+    session_name: Optional[str] = None,
 ):
     """Find all [start, end] intervals where a signal equals a target value within a time range."""
-    return wave_agent_query(
-        vcd_path,
-        "find_value_intervals",
-        {
-            "path": path,
-            "value": value,
-            "start_time": start_time,
-            "end_time": end_time,
-            "radix": radix,
-        },
-    )
+    try:
+        resolved_start, resolved_end, start_info, end_info, session = _resolve_time_range_reference(
+            start_time,
+            end_time,
+            waveform_path=vcd_path,
+            session_name=session_name,
+        )
+        result = wave_agent_query(
+            session["waveform_path"],
+            "find_value_intervals",
+            {
+                "path": path,
+                "value": value,
+                "start_time": resolved_start,
+                "end_time": resolved_end,
+                "radix": radix,
+            },
+        )
+        result["resolved_time_range"] = {"start": start_info, "end": end_info}
+        return _with_session_metadata(result, session)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 
 @mcp.tool()
-def find_condition(vcd_path: str, expression: str, start_time: int, direction: Direction = "forward"):
+def find_condition(
+    vcd_path: Optional[str] = None,
+    expression: str = "",
+    start_time: TimeReference = 0,
+    direction: Direction = "forward",
+    session_name: Optional[str] = None,
+):
     """Find the first timestamp where a logical condition is met."""
-    return wave_agent_query(
-        vcd_path,
-        "find_condition",
-        {
-            "expression": expression,
-            "start_time": start_time,
-            "direction": direction,
-        },
-    )
+    try:
+        resolved_time, time_info, session = _resolve_time_reference(start_time, waveform_path=vcd_path, session_name=session_name)
+        result = wave_agent_query(
+            session["waveform_path"],
+            "find_condition",
+            {
+                "expression": expression,
+                "start_time": resolved_time,
+                "direction": direction,
+            },
+        )
+        return _with_session_metadata(result, session, time_info)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 
 @mcp.tool()
-def get_transitions(vcd_path: str, path: str, start_time: int, end_time: int, max_limit: int = 50):
+def get_transitions(
+    vcd_path: Optional[str] = None,
+    path: str = "",
+    start_time: TimeReference = 0,
+    end_time: TimeReference = 0,
+    max_limit: int = 50,
+    session_name: Optional[str] = None,
+):
     """Get a compressed history of signal transitions within a time window."""
-    return wave_agent_query(
-        vcd_path,
-        "get_transitions",
-        {
-            "path": path,
-            "start_time": start_time,
-            "end_time": end_time,
-            "max_limit": max_limit,
-        },
-    )
+    try:
+        resolved_start, resolved_end, start_info, end_info, session = _resolve_time_range_reference(
+            start_time,
+            end_time,
+            waveform_path=vcd_path,
+            session_name=session_name,
+        )
+        result = wave_agent_query(
+            session["waveform_path"],
+            "get_transitions",
+            {
+                "path": path,
+                "start_time": resolved_start,
+                "end_time": resolved_end,
+                "max_limit": max_limit,
+            },
+        )
+        result["resolved_time_range"] = {"start": start_info, "end": end_info}
+        return _with_session_metadata(result, session)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 
 @mcp.tool()
-def analyze_pattern(vcd_path: str, path: str, start_time: int, end_time: int):
+def analyze_pattern(
+    vcd_path: Optional[str] = None,
+    path: str = "",
+    start_time: TimeReference = 0,
+    end_time: TimeReference = 0,
+    session_name: Optional[str] = None,
+):
     """Analyze a signal's behavior (e.g., identify clocks, static signals)."""
-    return wave_agent_query(
-        vcd_path,
-        "analyze_pattern",
-        {
-            "path": path,
-            "start_time": start_time,
-            "end_time": end_time,
-        },
-    )
+    try:
+        resolved_start, resolved_end, start_info, end_info, session = _resolve_time_range_reference(
+            start_time,
+            end_time,
+            waveform_path=vcd_path,
+            session_name=session_name,
+        )
+        result = wave_agent_query(
+            session["waveform_path"],
+            "analyze_pattern",
+            {
+                "path": path,
+                "start_time": resolved_start,
+                "end_time": resolved_end,
+            },
+        )
+        result["resolved_time_range"] = {"start": start_info, "end": end_info}
+        return _with_session_metadata(result, session)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 
 @mcp.tool()
 def trace_with_snapshot(
     db_path: str,
-    waveform_path: str,
-    signal: str,
-    time: int,
+    waveform_path: Optional[str] = None,
+    signal: str = "",
+    time: TimeReference = 0,
     mode: TraceMode = "drivers",
     trace_options: Optional[TraceOptions] = None,
     sample_offsets: Optional[List[int]] = None,
@@ -1153,14 +1855,20 @@ def trace_with_snapshot(
     rank_window_after: Optional[int] = None,
     rtl_trace_bin: Optional[str] = None,
     wave_cli_bin: Optional[str] = None,
+    session_name: Optional[str] = None,
 ):
     """Trace a signal structurally and return cone values at time T plus optional T+/-offset samples."""
     try:
+        resolved_time, time_info, session = _resolve_time_reference(
+            time,
+            waveform_path=waveform_path,
+            session_name=session_name,
+        )
         context = _build_common_context(
             db_path=db_path,
-            waveform_path=waveform_path,
+            waveform_path=session["waveform_path"],
             signal=signal,
-            time=time,
+            time=resolved_time,
             mode=mode,
             trace_options=trace_options,
             rtl_trace_bin=rtl_trace_bin,
@@ -1173,22 +1881,22 @@ def trace_with_snapshot(
             return context
 
         cone_signals = context["structure"]["cone_signals"]
-        extra_times = [time + int(offset) for offset in (sample_offsets or [])]
+        extra_times = [resolved_time + int(offset) for offset in (sample_offsets or [])]
         absolute_samples, sample_unmapped = _sample_signal_times(
-            waveform_path,
+            session["waveform_path"],
             cone_signals,
             extra_times,
             wave_cli_bin=wave_cli_bin,
         )
         cycle_data: Dict[str, Any] = {}
         if clock_path and cycle_offsets:
-            resolved_clock = _map_signal_to_waveform(waveform_path, clock_path, wave_cli_bin=wave_cli_bin)
+            resolved_clock = _map_signal_to_waveform(session["waveform_path"], clock_path, wave_cli_bin=wave_cli_bin)
             if resolved_clock is None:
                 context["warnings"].append(f"clock path not found in waveform: {clock_path}")
             else:
                 cycle_times, cycle_warnings = _cycle_sample_times(
-                    waveform_path,
-                    time,
+                    session["waveform_path"],
+                    resolved_time,
                     resolved_clock,
                     [int(offset) for offset in cycle_offsets],
                     wave_cli_bin=wave_cli_bin,
@@ -1196,7 +1904,7 @@ def trace_with_snapshot(
                 context["warnings"].extend(cycle_warnings)
                 valid_times = [t for t in cycle_times.values() if t is not None]
                 cycle_samples, cycle_unmapped = _sample_signal_times(
-                    waveform_path,
+                    session["waveform_path"],
                     cone_signals,
                     valid_times,
                     wave_cli_bin=wave_cli_bin,
@@ -1211,7 +1919,7 @@ def trace_with_snapshot(
         context["waveform"]["absolute_offset_samples"] = absolute_samples
         context["waveform"]["cycle_offset_samples"] = cycle_data
         context["unmapped_signals"].extend(sample_unmapped)
-        return context
+        return _with_session_metadata(context, session, time_info)
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -1219,23 +1927,29 @@ def trace_with_snapshot(
 @mcp.tool()
 def explain_signal_at_time(
     db_path: str,
-    waveform_path: str,
-    signal: str,
-    time: int,
+    waveform_path: Optional[str] = None,
+    signal: str = "",
+    time: TimeReference = 0,
     mode: TraceMode = "drivers",
     trace_options: Optional[TraceOptions] = None,
     rank_window_before: Optional[int] = None,
     rank_window_after: Optional[int] = None,
     rtl_trace_bin: Optional[str] = None,
     wave_cli_bin: Optional[str] = None,
+    session_name: Optional[str] = None,
 ):
     """Explain which structural drivers are most correlated with the signal state at time T."""
     try:
+        resolved_time, time_info, session = _resolve_time_reference(
+            time,
+            waveform_path=waveform_path,
+            session_name=session_name,
+        )
         context = _build_common_context(
             db_path=db_path,
-            waveform_path=waveform_path,
+            waveform_path=session["waveform_path"],
             signal=signal,
-            time=time,
+            time=resolved_time,
             mode=mode,
             trace_options=trace_options,
             rtl_trace_bin=rtl_trace_bin,
@@ -1254,7 +1968,7 @@ def explain_signal_at_time(
         target_summary = ranking_map.get(signal)
         explanations = _build_explanations(target_summary, context["structure"]["trace"], ranking_map)
         context["explanations"] = explanations
-        return context
+        return _with_session_metadata(context, session, time_info)
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -1262,22 +1976,28 @@ def explain_signal_at_time(
 @mcp.tool()
 def rank_cone_by_time(
     db_path: str,
-    waveform_path: str,
-    signal: str,
-    time: int,
+    waveform_path: Optional[str] = None,
+    signal: str = "",
+    time: TimeReference = 0,
     mode: TraceMode = "drivers",
     trace_options: Optional[TraceOptions] = None,
     window_start: Optional[int] = None,
     window_end: Optional[int] = None,
     rtl_trace_bin: Optional[str] = None,
     wave_cli_bin: Optional[str] = None,
+    session_name: Optional[str] = None,
 ):
     """Rank cone signals by recent activity and stuckness near time T."""
     try:
+        resolved_time, time_info, session = _resolve_time_reference(
+            time,
+            waveform_path=waveform_path,
+            session_name=session_name,
+        )
         if window_start is None:
-            window_start = max(0, time - DEFAULT_RANK_WINDOW_BEFORE)
+            window_start = max(0, resolved_time - DEFAULT_RANK_WINDOW_BEFORE)
         if window_end is None:
-            window_end = time + DEFAULT_RANK_WINDOW_AFTER
+            window_end = resolved_time + DEFAULT_RANK_WINDOW_AFTER
         trace_payload = _rtl_trace_json(
             db_path=db_path,
             signal=signal,
@@ -1290,19 +2010,19 @@ def rank_cone_by_time(
 
         cone_signals = _collect_cone_signals(trace_payload)
         summaries, unmapped = _build_signal_summaries(
-            waveform_path,
+            session["waveform_path"],
             cone_signals,
             mode=mode,
-            focus_time=time,
+            focus_time=resolved_time,
             start_time=window_start,
             end_time=window_end,
             wave_cli_bin=wave_cli_bin,
         )
-        return {
+        return _with_session_metadata({
             "status": "success",
             "target": signal,
             "time_context": {
-                "focus_time": time,
+                "focus_time": resolved_time,
                 "window_start": window_start,
                 "window_end": window_end,
                 "mode": mode,
@@ -1318,7 +2038,7 @@ def rank_cone_by_time(
             "explanations": {},
             "unmapped_signals": unmapped,
             "warnings": [],
-        }
+        }, session, time_info)
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -1326,9 +2046,9 @@ def rank_cone_by_time(
 @mcp.tool()
 def explain_edge_cause(
     db_path: str,
-    waveform_path: str,
-    signal: str,
-    time: int,
+    waveform_path: Optional[str] = None,
+    signal: str = "",
+    time: TimeReference = 0,
     edge_type: EdgeType | EdgeTypeAlias = "anyedge",
     direction: Direction = "backward",
     mode: TraceMode = "drivers",
@@ -1337,20 +2057,26 @@ def explain_edge_cause(
     rank_window_after: Optional[int] = None,
     rtl_trace_bin: Optional[str] = None,
     wave_cli_bin: Optional[str] = None,
+    session_name: Optional[str] = None,
 ):
     """Resolve the relevant edge for a signal, then explain the upstream cause chain at that edge."""
     try:
         edge_type = _normalize_edge_type(edge_type)
-        mapped_signal = _map_signal_to_waveform(waveform_path, signal, wave_cli_bin=wave_cli_bin)
+        resolved_time, time_info, session = _resolve_time_reference(
+            time,
+            waveform_path=waveform_path,
+            session_name=session_name,
+        )
+        mapped_signal = _map_signal_to_waveform(session["waveform_path"], signal, wave_cli_bin=wave_cli_bin)
         if mapped_signal is None:
             return {"status": "error", "message": f"signal not found in waveform: {signal}"}
         edge_result = _wave_query(
-            waveform_path,
+            session["waveform_path"],
             "find_edge",
             {
                 "path": mapped_signal,
                 "edge_type": edge_type,
-                "start_time": int(time),
+                "start_time": int(resolved_time),
                 "direction": direction,
             },
             wave_cli_bin=wave_cli_bin,
@@ -1361,12 +2087,12 @@ def explain_edge_cause(
         if edge_time in (-1, None):
             return {
                 "status": "error",
-                "message": f"no {edge_type} edge found for {signal} near {time}",
+                "message": f"no {edge_type} edge found for {signal} near {resolved_time}",
             }
         edge_time = int(edge_time)
         context = explain_signal_at_time(
             db_path=db_path,
-            waveform_path=waveform_path,
+            waveform_path=session["waveform_path"],
             signal=signal,
             time=edge_time,
             mode=mode,
@@ -1375,24 +2101,25 @@ def explain_edge_cause(
             rank_window_after=rank_window_after,
             rtl_trace_bin=rtl_trace_bin,
             wave_cli_bin=wave_cli_bin,
+            session_name=session["session_name"],
         )
         if context.get("status") != "success":
             return context
 
         before_time = max(0, edge_time - 1)
         before_after = _get_batch_snapshot(
-            waveform_path,
+            session["waveform_path"],
             [mapped_signal],
             edge_time,
             wave_cli_bin=wave_cli_bin,
         )
         before_snapshot = _get_batch_snapshot(
-            waveform_path,
+            session["waveform_path"],
             [mapped_signal],
             before_time,
             wave_cli_bin=wave_cli_bin,
         )
-        context["time_context"]["requested_time"] = time
+        context["time_context"]["requested_time"] = resolved_time
         context["time_context"]["resolved_edge_time"] = edge_time
         context["time_context"]["edge_type"] = edge_type
         context["waveform"]["edge_context"] = {
@@ -1401,7 +2128,7 @@ def explain_edge_cause(
             "value_before_edge": before_snapshot.get(mapped_signal),
             "value_at_edge": before_after.get(mapped_signal),
         }
-        return context
+        return _with_session_metadata(context, session, time_info)
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
