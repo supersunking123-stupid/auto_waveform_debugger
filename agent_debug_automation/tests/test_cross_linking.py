@@ -98,6 +98,73 @@ class CrossLinkingTests(unittest.TestCase):
         self.assertEqual(result["waveform"]["edge_context"]["value_before_edge"], "0")
         self.assertEqual(result["waveform"]["edge_context"]["value_at_edge"], "1")
 
+    def test_find_edge_normalizes_rise_alias(self):
+        calls = []
+
+        def fake_wave_agent_query(vcd_path, cmd, args=None, wave_cli_bin=None):
+            calls.append((cmd, dict(args or {})))
+            return {"status": "success", "data": 123}
+
+        with mock.patch.object(mcp_mod, "wave_agent_query", side_effect=fake_wave_agent_query):
+            result = mcp_mod.find_edge(
+                vcd_path="/tmp/mock.fsdb",
+                path="top.sig",
+                edge_type="rise",
+                start_time=100,
+                direction="backward",
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(calls, [("find_edge", {
+            "path": "top.sig",
+            "edge_type": "posedge",
+            "start_time": 100,
+            "direction": "backward",
+        })])
+
+    def test_explain_edge_cause_normalizes_rise_alias(self):
+        wave_calls = []
+
+        def fake_map_signal_to_waveform(*args, **kwargs):
+            return "top.sig"
+
+        def fake_wave_query(vcd_path, cmd, args=None, wave_cli_bin=None):
+            wave_calls.append((cmd, dict(args or {})))
+            if cmd == "find_edge":
+                return {"status": "success", "data": 100}
+            raise AssertionError(f"unexpected command {cmd}")
+
+        def fake_explain_signal_at_time(**kwargs):
+            return {
+                "status": "success",
+                "time_context": {},
+                "waveform": {},
+            }
+
+        def fake_get_batch_snapshot(*args, **kwargs):
+            return {"top.sig": {"value": "1"}}
+
+        with mock.patch.object(mcp_mod, "_map_signal_to_waveform", side_effect=fake_map_signal_to_waveform), \
+             mock.patch.object(mcp_mod, "_wave_query", side_effect=fake_wave_query), \
+             mock.patch.object(mcp_mod, "explain_signal_at_time", side_effect=fake_explain_signal_at_time), \
+             mock.patch.object(mcp_mod, "_get_batch_snapshot", side_effect=fake_get_batch_snapshot):
+            result = mcp_mod.explain_edge_cause(
+                db_path="/tmp/mock.db",
+                waveform_path="/tmp/mock.fsdb",
+                signal="top.sig",
+                time=100,
+                edge_type="rise",
+                direction="backward",
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(wave_calls, [("find_edge", {
+            "path": "top.sig",
+            "edge_type": "posedge",
+            "start_time": 100,
+            "direction": "backward",
+        })])
+
     def test_top_normalization_helper(self):
         mapped = mcp_mod._map_signal_to_waveform(self.waveform_path, "TOP.timer_tb.timeout")
         self.assertEqual(mapped, "timer_tb.timeout")
