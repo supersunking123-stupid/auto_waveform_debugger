@@ -1,0 +1,6 @@
+[submodule "standalone_trace/third_party/fmt"]
+	path = standalone_trace/third_party/fmt
+	url = https://github.com/fmtlib/fmt.git
+[submodule "standalone_trace/third_party/slang"]
+	path = standalone_trace/third_party/slang
+	url = https://github.com/MikePopoloski/slang.git
