@@ -106,6 +106,20 @@ def find_edge(vcd_path: str, path: str, edge_type: str, start_time: int, directi
         return {"status": "error", "message": str(e)}
 
 @mcp.tool()
+def find_value_intervals(vcd_path: str, path: str, value: str, start_time: int, end_time: int, radix: str = "hex"):
+    """Find all [start, end] intervals where a signal equals a target value within a time range."""
+    try:
+        return get_daemon(vcd_path).query("find_value_intervals", {
+            "path": path,
+            "value": value,
+            "start_time": start_time,
+            "end_time": end_time,
+            "radix": radix,
+        })
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@mcp.tool()
 def find_condition(vcd_path: str, expression: str, start_time: int, direction: str = "forward"):
     """
     Find the first timestamp where a logical condition is met.

@@ -99,12 +99,19 @@ Search for the next/previous transition edge.
 - **Query:** `{"cmd": "find_edge", "args": {"path": "TOP.clk", "edge_type": "posedge", "start_time": 1000}}`
 - **Types:** `posedge`, `negedge`, `anyedge`.
 
-#### 5. `analyze_pattern`
+#### 5. `find_value_intervals`
+Find all matching value intervals for one signal within a bounded time range.
+- **Query:** `{"cmd": "find_value_intervals", "args": {"path": "TOP.rid", "value": "d8", "start_time": 307050000, "end_time": 327970000, "radix": "dec"}}`
+- **Response:** `{"status": "success", "data": [{"start": 307050000, "end": 307059999}, ...]}`
+- `value` may be prefixed, for example `d8`, `h08`, or `b00001000`.
+- If `value` has no prefix, `radix` controls how it is interpreted.
+
+#### 6. `analyze_pattern`
 AI-powered heuristic analysis of a signal's behavior.
 - **Query:** `{"cmd": "analyze_pattern", "args": {"path": "TOP.clk", "start_time": 0, "end_time": 100000}}`
 - **Output:** Categorizes signals as "Clock-like", "Static", or "Dynamic" with summarized stats.
 
-#### 6. `find_condition`
+#### 7. `find_condition`
 Find the first timestamp where a logical condition is met.
 - **Query:** `{"cmd": "find_condition", "args": {"expression": "TOP.count == b00000001", "start_time": 0}}`
 
@@ -176,6 +183,7 @@ Regression-style examples for previously failing FSDB queries are recorded in
 - `get_signal_info(vcd_path, path)`
 - `get_snapshot(vcd_path, signals, time)`
 - `find_edge(vcd_path, path, edge_type, start_time, direction)`
+- `find_value_intervals(vcd_path, path, value, start_time, end_time, radix="hex")`
 - `find_condition(vcd_path, expression, start_time, direction)`
 - `get_transitions(vcd_path, path, start_time, end_time, max_limit)`
 - `analyze_pattern(vcd_path, path, start_time, end_time)`

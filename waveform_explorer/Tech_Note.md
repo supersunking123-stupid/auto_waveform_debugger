@@ -236,6 +236,12 @@ Important constraint:
 - classifies `posedge`, `negedge`, or `anyedge`
 - backward search now resolves the last matching edge at or before `start_time`, including an exact edge at `start_time`
 
+#### `find_value_intervals`
+- scans one signal over `[start_time, end_time]` and returns every matching `[start, end]` interval
+- compares against the stable raw waveform value, not the display-only `changing` marker
+- accepts prefixed query values such as `d8`, `h08`, `b00001000`
+- if the query value is unprefixed, `radix` controls how it is interpreted
+
 #### `find_condition`
 - deliberately simple parser for expressions of the form `PATH == VALUE`
 - searches timestamps where the signal already changes

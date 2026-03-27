@@ -133,6 +133,128 @@ std::string binary_bits_to_decimal(const std::string& bits) {
     return decimal;
 }
 
+std::string decimal_string_to_bits(std::string decimal) {
+    if (decimal.empty()) {
+        return "";
+    }
+
+    for (char ch : decimal) {
+        if (!std::isdigit(static_cast<unsigned char>(ch))) {
+            return "";
+        }
+    }
+
+    size_t first_non_zero = decimal.find_first_not_of('0');
+    if (first_non_zero == std::string::npos) {
+        return "0";
+    }
+    decimal = decimal.substr(first_non_zero);
+
+    std::string bits;
+    while (!decimal.empty() && decimal != "0") {
+        int carry = 0;
+        std::string quotient;
+        quotient.reserve(decimal.size());
+        for (char ch : decimal) {
+            const int cur = carry * 10 + (ch - '0');
+            const int q = cur / 2;
+            carry = cur % 2;
+            if (!quotient.empty() || q != 0) {
+                quotient.push_back(static_cast<char>('0' + q));
+            }
+        }
+        bits.push_back(static_cast<char>('0' + carry));
+        decimal = quotient.empty() ? "0" : quotient;
+    }
+    std::reverse(bits.begin(), bits.end());
+    return bits;
+}
+
+std::string normalize_query_value_to_bits(const std::string& value, uint32_t width, const std::string& radix) {
+    if (value.empty()) {
+        return "";
+    }
+
+    const size_t bit_digits = std::max<size_t>(1, static_cast<size_t>(width));
+    const char prefix = static_cast<char>(std::tolower(static_cast<unsigned char>(value.front())));
+    const std::string normalized_radix = normalize_radix(radix);
+
+    if (width <= 1) {
+        if (value == "0" || value == "1" || value == "x" || value == "z") {
+            return value;
+        }
+        if (prefix == 'b' || prefix == 'd' || prefix == 'h') {
+            return normalize_query_value_to_bits(value.substr(1), width, prefix == 'b' ? "bin" : (prefix == 'd' ? "dec" : "hex"));
+        }
+        return simplify_scalar_value(value);
+    }
+
+    if (prefix == 'b') {
+        std::string bits;
+        bits.reserve(value.size() - 1);
+        for (size_t i = 1; i < value.size(); ++i) {
+            bits.push_back(normalize_logic_char(value[i]));
+        }
+        if (bits.empty()) {
+            return "";
+        }
+        if (bits.size() < bit_digits) {
+            bits.insert(bits.begin(), bit_digits - bits.size(), '0');
+        } else if (bits.size() > bit_digits) {
+            bits = bits.substr(bits.size() - bit_digits);
+        }
+        return bits;
+    }
+
+    if (prefix == 'h') {
+        return normalize_multibit_bits(value, width);
+    }
+
+    if (prefix == 'd' || normalized_radix == "dec") {
+        const std::string decimal_digits = prefix == 'd' ? value.substr(1) : value;
+        std::string bits = decimal_string_to_bits(decimal_digits);
+        if (bits.empty()) {
+            return "";
+        }
+        if (bits.size() < bit_digits) {
+            bits.insert(bits.begin(), bit_digits - bits.size(), '0');
+        } else if (bits.size() > bit_digits) {
+            bits = bits.substr(bits.size() - bit_digits);
+        }
+        return bits;
+    }
+
+    if (normalized_radix == "bin") {
+        std::string bits;
+        bits.reserve(value.size());
+        for (char ch : value) {
+            bits.push_back(normalize_logic_char(ch));
+        }
+        if (bits.empty()) {
+            return "";
+        }
+        if (bits.size() < bit_digits) {
+            bits.insert(bits.begin(), bit_digits - bits.size(), '0');
+        } else if (bits.size() > bit_digits) {
+            bits = bits.substr(bits.size() - bit_digits);
+        }
+        return bits;
+    }
+
+    return normalize_multibit_bits("h" + value, width);
+}
+
+bool value_matches_query(const SignalInfo& info, const std::string& raw_value, const std::string& query_bits) {
+    if (query_bits.empty()) {
+        return false;
+    }
+    if (info.width <= 1) {
+        return simplify_scalar_value(raw_value) == query_bits;
+    }
+    const std::string raw_bits = normalize_multibit_bits(raw_value, info.width);
+    return raw_bits == query_bits;
+}
+
 std::string format_multibit_value(const std::string& value, uint32_t width, const std::string& radix) {
     const size_t hex_digits = std::max<size_t>(1, (static_cast<size_t>(width) + 3) / 4);
     const size_t bit_digits = std::max<size_t>(1, static_cast<size_t>(width));
@@ -353,6 +475,73 @@ json AgentAPI::find_edge(const std::string& signal_path, const std::string& edge
     }
 
     return {{"status", "success"}, {"data", -1}};
+}
+
+json AgentAPI::find_value_intervals(
+    const std::string& signal_path,
+    const std::string& value,
+    uint64_t start_time,
+    uint64_t end_time,
+    const std::string& radix) {
+    if (!db.has_signal(signal_path)) {
+        return {{"status", "error"}, {"message", "Signal not found"}};
+    }
+    if (start_time > end_time) {
+        return {{"status", "error"}, {"message", "start_time must be <= end_time"}};
+    }
+
+    const auto& info = db.get_signal_info(signal_path);
+    const std::string query_bits = normalize_query_value_to_bits(value, info.width, radix);
+    if (query_bits.empty()) {
+        return {{"status", "error"}, {"message", "failed to parse query value"}};
+    }
+
+    const auto& trans = db.get_transitions(signal_path);
+    std::string current_value = db.get_value_at_time(signal_path, start_time);
+    uint64_t interval_start = start_time;
+    json intervals = json::array();
+
+    auto emit_interval_if_match = [&](uint64_t seg_start, uint64_t seg_end, const std::string& raw_value) {
+        if (seg_start > seg_end) {
+            return;
+        }
+        if (value_matches_query(info, raw_value, query_bits)) {
+            intervals.push_back({
+                {"start", seg_start},
+                {"end", seg_end},
+            });
+        }
+    };
+
+    auto it = std::upper_bound(
+        trans.begin(),
+        trans.end(),
+        start_time,
+        [](uint64_t t, const Transition& tr) {
+            return t < tr.timestamp;
+        });
+
+    while (it != trans.end() && it->timestamp <= end_time) {
+        const uint64_t seg_end = it->timestamp == 0 ? 0 : (it->timestamp - 1);
+        emit_interval_if_match(interval_start, seg_end, current_value);
+        current_value = it->value;
+        interval_start = it->timestamp;
+        ++it;
+    }
+
+    emit_interval_if_match(interval_start, end_time, current_value);
+
+    return {
+        {"status", "success"},
+        {"data", intervals},
+        {"query", {
+            {"path", signal_path},
+            {"value", value},
+            {"start_time", start_time},
+            {"end_time", end_time},
+            {"radix", normalize_radix(radix)},
+        }},
+    };
 }
 
 json AgentAPI::find_condition(const std::string& expression, uint64_t start_time, const std::string& direction) {

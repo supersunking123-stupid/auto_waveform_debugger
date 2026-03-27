@@ -166,6 +166,13 @@ int main(int argc, char* argv[]) {
             } else if (cmd == "find_edge") {
                 response = api.find_edge(args.value("path", ""), args.value("edge_type", "anyedge"),
                                          args.value("start_time", 0ULL), args.value("direction", "forward"));
+            } else if (cmd == "find_value_intervals") {
+                response = api.find_value_intervals(
+                    args.value("path", ""),
+                    args.value("value", ""),
+                    args.value("start_time", 0ULL),
+                    args.value("end_time", 0ULL),
+                    args.value("radix", "hex"));
             } else if (cmd == "find_condition") {
                 response = api.find_condition(args.value("expression", ""), args.value("start_time", 0ULL), args.value("direction", "forward"));
             } else if (cmd == "get_transitions") {
@@ -221,6 +228,13 @@ int main(int argc, char* argv[]) {
             } else if (cmd == "find_edge") {
                 response = api.find_edge(args.value("path", ""), args.value("edge_type", "anyedge"),
                                          args.value("start_time", 0ULL), args.value("direction", "forward"));
+            } else if (cmd == "find_value_intervals") {
+                response = api.find_value_intervals(
+                    args.value("path", ""),
+                    args.value("value", ""),
+                    args.value("start_time", 0ULL),
+                    args.value("end_time", 0ULL),
+                    args.value("radix", "hex"));
             } else if (cmd == "find_condition") {
                 response = api.find_condition(args.value("expression", ""), args.value("start_time", 0ULL), args.value("direction", "forward"));
             } else if (cmd == "get_transitions") {

@@ -21,6 +21,12 @@ public:
 
     // 3. Temporal Search
     json find_edge(const std::string& signal_path, const std::string& edge_type, uint64_t start_time, const std::string& direction = "forward");
+    json find_value_intervals(
+        const std::string& signal_path,
+        const std::string& value,
+        uint64_t start_time,
+        uint64_t end_time,
+        const std::string& radix = "hex");
     
     // Simplistic expression evaluator for basic conditions (e.g. "TOP.valid == 1")
     json find_condition(const std::string& expression, uint64_t start_time, const std::string& direction = "forward");

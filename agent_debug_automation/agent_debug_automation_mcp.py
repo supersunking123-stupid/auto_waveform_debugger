@@ -1073,6 +1073,29 @@ def find_edge(
 
 
 @mcp.tool()
+def find_value_intervals(
+    vcd_path: str,
+    path: str,
+    value: str,
+    start_time: int,
+    end_time: int,
+    radix: str = "hex",
+):
+    """Find all [start, end] intervals where a signal equals a target value within a time range."""
+    return wave_agent_query(
+        vcd_path,
+        "find_value_intervals",
+        {
+            "path": path,
+            "value": value,
+            "start_time": start_time,
+            "end_time": end_time,
+            "radix": radix,
+        },
+    )
+
+
+@mcp.tool()
 def find_condition(vcd_path: str, expression: str, start_time: int, direction: Direction = "forward"):
     """Find the first timestamp where a logical condition is met."""
     return wave_agent_query(

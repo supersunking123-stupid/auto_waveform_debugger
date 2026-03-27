@@ -78,6 +78,7 @@ These keep the original `rtl_trace` command model unchanged.
 - `get_snapshot(vcd_path, signals, time, radix="hex")`
 - `get_value_at_time(vcd_path, path, time, radix="hex")`
 - `find_edge(vcd_path, path, edge_type, start_time, direction="forward")`
+- `find_value_intervals(vcd_path, path, value, start_time, end_time, radix="hex")`
 - `find_condition(vcd_path, expression, start_time, direction="forward")`
 - `get_transitions(vcd_path, path, start_time, end_time, max_limit=50)`
 - `analyze_pattern(vcd_path, path, start_time, end_time)`

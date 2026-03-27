@@ -257,6 +257,7 @@ These preserve the original backend command models.
 - `get_snapshot(...)`
 - `get_value_at_time(...)`
 - `find_edge(...)`
+- `find_value_intervals(...)`
 - `find_condition(...)`
 - `get_transitions(...)`
 - `analyze_pattern(...)`
