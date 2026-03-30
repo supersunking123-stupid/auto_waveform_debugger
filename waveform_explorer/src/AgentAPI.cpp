@@ -2,8 +2,11 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdint>
+#include <limits>
 #include <map>
 #include <sstream>
+#include <set>
 
 AgentAPI::AgentAPI(WaveDatabase& db) : db(db) {}
 
@@ -322,6 +325,305 @@ std::string format_multibit_value(const std::string& value, uint32_t width, cons
     return out;
 }
 
+struct OverviewSegment {
+    uint64_t start;
+    uint64_t end;
+    std::string state;
+    std::string value;
+    int transitions = 0;
+    int unique_values = 0;
+};
+
+bool same_overview_segment_shape(const OverviewSegment& lhs, const OverviewSegment& rhs) {
+    return lhs.state == rhs.state &&
+           lhs.value == rhs.value &&
+           lhs.transitions == rhs.transitions &&
+           lhs.unique_values == rhs.unique_values;
+}
+
+void append_overview_segment(
+    std::vector<OverviewSegment>& segments,
+    uint64_t start,
+    uint64_t end,
+    const std::string& state,
+    const std::string& value,
+    int transitions,
+    int unique_values) {
+    if (start > end) {
+        return;
+    }
+
+    OverviewSegment next{start, end, state, value, transitions, unique_values};
+    if (!segments.empty()) {
+        OverviewSegment& prev = segments.back();
+        if (prev.end + 1 == next.start && same_overview_segment_shape(prev, next)) {
+            prev.end = next.end;
+            return;
+        }
+    }
+    segments.push_back(next);
+}
+
+void append_stable_overview_segment(
+    std::vector<OverviewSegment>& segments,
+    const SignalInfo& info,
+    uint64_t start,
+    uint64_t end,
+    const std::string& raw_value,
+    const std::string& radix) {
+    if (info.width <= 1) {
+        append_overview_segment(segments, start, end, simplify_scalar_value(raw_value), "", 0, 0);
+        return;
+    }
+    append_overview_segment(segments, start, end, "stable", format_multibit_value(raw_value, info.width, radix), 0, 0);
+}
+
+std::vector<Transition> get_window_transitions(
+    const std::vector<Transition>& all_transitions,
+    uint64_t start_time,
+    uint64_t end_time) {
+    std::vector<Transition> window;
+    auto it = std::upper_bound(
+        all_transitions.begin(),
+        all_transitions.end(),
+        start_time,
+        [](uint64_t t, const Transition& tr) {
+            return t < tr.timestamp;
+        });
+    while (it != all_transitions.end() && it->timestamp <= end_time) {
+        window.push_back(*it);
+        ++it;
+    }
+    return window;
+}
+
+std::vector<OverviewSegment> build_signal_overview_segments(
+    const SignalInfo& info,
+    const std::vector<Transition>& window_transitions,
+    uint64_t start_time,
+    uint64_t end_time,
+    uint64_t resolution,
+    const std::string& start_value,
+    const std::string& radix) {
+    std::vector<OverviewSegment> segments;
+    uint64_t cursor = start_time;
+    std::string current_value = start_value;
+
+    size_t i = 0;
+    while (i < window_transitions.size()) {
+        const Transition& current = window_transitions[i];
+
+        if (i + 1 < window_transitions.size() &&
+            window_transitions[i + 1].timestamp >= current.timestamp &&
+            window_transitions[i + 1].timestamp - current.timestamp < resolution) {
+            size_t j = i + 1;
+            while (j + 1 < window_transitions.size() &&
+                   window_transitions[j + 1].timestamp >= window_transitions[j].timestamp &&
+                   window_transitions[j + 1].timestamp - window_transitions[j].timestamp < resolution) {
+                ++j;
+            }
+
+            if (cursor < current.timestamp) {
+                append_stable_overview_segment(segments, info, cursor, current.timestamp - 1, current_value, radix);
+            }
+
+            std::set<std::string> unique_values_seen;
+            unique_values_seen.insert(current_value);
+            for (size_t k = i; k <= j; ++k) {
+                unique_values_seen.insert(window_transitions[k].value);
+            }
+
+            uint64_t flipping_end = window_transitions[j].timestamp;
+            if (window_transitions[j].timestamp > current.timestamp) {
+                flipping_end = window_transitions[j].timestamp - 1;
+            }
+            if (flipping_end < current.timestamp) {
+                flipping_end = current.timestamp;
+            }
+
+            if (info.width <= 1) {
+                append_overview_segment(
+                    segments,
+                    current.timestamp,
+                    flipping_end,
+                    "flipping",
+                    "",
+                    static_cast<int>(j - i + 1),
+                    0);
+            } else {
+                append_overview_segment(
+                    segments,
+                    current.timestamp,
+                    flipping_end,
+                    "flipping",
+                    "",
+                    static_cast<int>(j - i + 1),
+                    static_cast<int>(unique_values_seen.size()));
+            }
+
+            current_value = window_transitions[j].value;
+            cursor = window_transitions[j].timestamp;
+            if (flipping_end == cursor) {
+                if (cursor == std::numeric_limits<uint64_t>::max()) {
+                    break;
+                }
+                ++cursor;
+            }
+            i = j + 1;
+            continue;
+        }
+
+        if (cursor < current.timestamp) {
+            append_stable_overview_segment(segments, info, cursor, current.timestamp - 1, current_value, radix);
+        }
+        current_value = current.value;
+        cursor = current.timestamp;
+        ++i;
+    }
+
+    if (cursor <= end_time) {
+        append_stable_overview_segment(segments, info, cursor, end_time, current_value, radix);
+    }
+
+    return segments;
+}
+
+json overview_segments_to_json(const std::vector<OverviewSegment>& segments) {
+    json out = json::array();
+    for (const auto& segment : segments) {
+        json item = {
+            {"start", segment.start},
+            {"end", segment.end},
+            {"state", segment.state},
+        };
+        if (!segment.value.empty()) {
+            item["value"] = segment.value;
+        }
+        if (segment.transitions > 0) {
+            item["transitions"] = segment.transitions;
+        }
+        if (segment.unique_values > 0) {
+            item["unique_values"] = segment.unique_values;
+        }
+        out.push_back(item);
+    }
+    return out;
+}
+
+json parse_overview_resolution(const json& resolution_arg, std::string& requested_kind) {
+    if (resolution_arg.is_number_integer() || resolution_arg.is_number_unsigned()) {
+        const auto value = resolution_arg.get<int64_t>();
+        if (value <= 0) {
+            return {{"status", "error"}, {"message", "resolution must be > 0"}};
+        }
+        requested_kind = std::to_string(value);
+        return {{"status", "success"}, {"resolution", static_cast<uint64_t>(value)}};
+    }
+
+    if (resolution_arg.is_string()) {
+        const std::string raw = resolution_arg.get<std::string>();
+        std::string lowered;
+        lowered.reserve(raw.size());
+        for (char ch : raw) {
+            lowered.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+        }
+        if (lowered == "auto") {
+            requested_kind = "auto";
+            return {{"status", "success"}, {"resolution", "auto"}};
+        }
+        try {
+            const auto value = std::stoll(raw);
+            if (value <= 0) {
+                return {{"status", "error"}, {"message", "resolution must be > 0"}};
+            }
+            requested_kind = raw;
+            return {{"status", "success"}, {"resolution", static_cast<uint64_t>(value)}};
+        } catch (...) {
+            return {{"status", "error"}, {"message", "resolution must be an integer or 'auto'"}};
+        }
+    }
+
+    return {{"status", "error"}, {"message", "resolution must be an integer or 'auto'"}};
+}
+
+uint64_t choose_auto_resolution(
+    const std::vector<Transition>& window_transitions,
+    uint64_t start_time,
+    uint64_t end_time) {
+    constexpr size_t kTargetSegments = 20;
+
+    if (window_transitions.empty()) {
+        return 1;
+    }
+
+    auto estimated_segment_count_for = [&](uint64_t resolution) -> size_t {
+        size_t count = 0;
+        uint64_t cursor = start_time;
+
+        for (size_t i = 0; i < window_transitions.size();) {
+            const Transition& current = window_transitions[i];
+            if (i + 1 < window_transitions.size() &&
+                window_transitions[i + 1].timestamp >= current.timestamp &&
+                window_transitions[i + 1].timestamp - current.timestamp < resolution) {
+                size_t j = i + 1;
+                while (j + 1 < window_transitions.size() &&
+                       window_transitions[j + 1].timestamp >= window_transitions[j].timestamp &&
+                       window_transitions[j + 1].timestamp - window_transitions[j].timestamp < resolution) {
+                    ++j;
+                }
+
+                if (cursor < current.timestamp) {
+                    ++count;
+                }
+                ++count;
+
+                uint64_t flipping_end = window_transitions[j].timestamp;
+                if (window_transitions[j].timestamp > current.timestamp) {
+                    flipping_end = window_transitions[j].timestamp - 1;
+                }
+                if (flipping_end < current.timestamp) {
+                    flipping_end = current.timestamp;
+                }
+
+                cursor = window_transitions[j].timestamp;
+                if (flipping_end == cursor && cursor != std::numeric_limits<uint64_t>::max()) {
+                    ++cursor;
+                }
+                i = j + 1;
+                continue;
+            }
+
+            if (cursor < current.timestamp) {
+                ++count;
+            }
+            cursor = current.timestamp;
+            ++i;
+        }
+
+        if (cursor <= end_time) {
+            ++count;
+        }
+        return count;
+    };
+
+    const uint64_t span = end_time >= start_time ? (end_time - start_time + 1) : 1;
+    uint64_t low = 1;
+    uint64_t high = std::max<uint64_t>(1, span);
+    if (estimated_segment_count_for(low) <= kTargetSegments) {
+        return low;
+    }
+
+    while (low < high) {
+        const uint64_t mid = low + (high - low) / 2;
+        if (estimated_segment_count_for(mid) <= kTargetSegments) {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    return low;
+}
+
 json format_signal_value_at_time(WaveDatabase& db, const std::string& signal_path, uint64_t time, const std::string& radix) {
     if (!db.has_signal(signal_path)) {
         return "x";
@@ -549,7 +851,7 @@ json AgentAPI::find_condition(const std::string& expression, uint64_t start_time
     // For a real tool, we'd use a proper AST parser.
     std::istringstream iss(expression);
     std::string path, op, val;
-    if (!(iss >> path >> op >> val)) {
+    if (!(iss >> path >> op >> val) || op != "==") {
         return {{"status", "error"}, {"message", "Invalid expression format. Use 'PATH == VALUE'"}};
     }
 
@@ -572,8 +874,28 @@ json AgentAPI::find_condition(const std::string& expression, uint64_t start_time
             if (it->value == val) return {{"status", "success"}, {"data", it->timestamp}};
             ++it;
         }
+    } else if (direction == "backward") {
+        if (db.get_value_at_time(path, start_time) == val) return {{"status", "success"}, {"data", start_time}};
+
+        auto it = std::upper_bound(trans.begin(), trans.end(), start_time,
+            [](uint64_t t, const Transition& tr) {
+                return t < tr.timestamp;
+            });
+
+        if (it == trans.begin()) {
+            return {{"status", "success"}, {"data", -1}};
+        }
+        --it;
+
+        while (true) {
+            if (it->value == val) return {{"status", "success"}, {"data", it->timestamp}};
+            if (it == trans.begin()) break;
+            --it;
+        }
+    } else {
+        return {{"status", "error"}, {"message", "direction must be forward or backward"}};
     }
-    
+
     return {{"status", "success"}, {"data", -1}};
 }
 
@@ -603,6 +925,61 @@ json AgentAPI::get_transitions(const std::string& signal_path, uint64_t start_ti
         {"status", "success"},
         {"data", history},
         {"truncated", it != trans.end() && it->timestamp <= end_time}
+    };
+}
+
+json AgentAPI::get_signal_overview(
+    const std::string& signal_path,
+    uint64_t start_time,
+    uint64_t end_time,
+    const json& resolution,
+    const std::string& radix) {
+    if (!db.has_signal(signal_path)) {
+        return {{"status", "error"}, {"message", "Signal not found"}};
+    }
+    if (start_time > end_time) {
+        return {{"status", "error"}, {"message", "start_time must be <= end_time"}};
+    }
+
+    std::string requested_resolution;
+    const json parsed_resolution = parse_overview_resolution(resolution, requested_resolution);
+    if (parsed_resolution.value("status", "error") != "success") {
+        return parsed_resolution;
+    }
+
+    const auto& info = db.get_signal_info(signal_path);
+    const auto& all_transitions = db.get_transitions(signal_path);
+    const std::vector<Transition> window_transitions = get_window_transitions(all_transitions, start_time, end_time);
+    const std::string start_value = db.get_value_at_time(signal_path, start_time);
+
+    uint64_t resolved_resolution = 0;
+    if (parsed_resolution["resolution"].is_string()) {
+        resolved_resolution = choose_auto_resolution(
+            window_transitions,
+            start_time,
+            end_time);
+    } else {
+        resolved_resolution = parsed_resolution["resolution"].get<uint64_t>();
+    }
+
+    const auto segments = build_signal_overview_segments(
+        info,
+        window_transitions,
+        start_time,
+        end_time,
+        resolved_resolution,
+        start_value,
+        radix);
+
+    return {
+        {"status", "success"},
+        {"requested_resolution", requested_resolution == "auto" ? json("auto") : json(resolution)},
+        {"resolution", resolved_resolution},
+        {"timescale", db.get_timescale()},
+        {"signal", info.path},
+        {"width", info.width},
+        {"radix", info.width <= 1 ? json(nullptr) : json(normalize_radix(radix))},
+        {"segments", overview_segments_to_json(segments)},
     };
 }
 

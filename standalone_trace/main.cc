@@ -1,3 +1,4 @@
+#include "AssignmentUtils.h"
 #include "slang/ast/ASTVisitor.h"
 #include "slang/ast/Compilation.h"
 #include "slang/ast/EvalContext.h"
@@ -24,9 +25,11 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <fcntl.h>
 #include <functional>
 #include "slang/util/Hash.h"
 #include <ctime>
+#include <sys/file.h>
 #include <sys/resource.h>
 #include <unistd.h>
 
@@ -324,6 +327,37 @@ bool ReadBinaryVector(std::ifstream &in, std::vector<T> &items, size_t count) {
   return in.good();
 }
 
+class ScopedFileLock {
+ public:
+  ScopedFileLock() = default;
+  ScopedFileLock(const ScopedFileLock &) = delete;
+  ScopedFileLock &operator=(const ScopedFileLock &) = delete;
+
+  ~ScopedFileLock() { Release(); }
+
+  bool Acquire(const std::string &path) {
+    Release();
+    fd_ = ::open(path.c_str(), O_RDWR | O_CREAT, 0666);
+    if (fd_ < 0) return false;
+    if (::flock(fd_, LOCK_EX) != 0) {
+      Release();
+      return false;
+    }
+    return true;
+  }
+
+  void Release() {
+    if (fd_ >= 0) {
+      ::flock(fd_, LOCK_UN);
+      ::close(fd_);
+      fd_ = -1;
+    }
+  }
+
+ private:
+  int fd_ = -1;
+};
+
 enum class OutputFormat { kText, kJson };
 
 struct TraceOptions {
@@ -392,9 +426,6 @@ const SymbolRefList &GetCachedStatementLhsSignals(
     const slang::ast::Statement &stmt, TraceCompileCache &cache);
 EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManager &sm,
                                   bool drivers_mode, TraceCompileCache *cache);
-std::vector<std::string> InferAssignmentLhsPathsFromText(const std::string &endpoint_path,
-                                                         std::string_view assignment_text);
-
 const slang::ast::InstanceBodySymbol *GetContainingInstance(const slang::ast::Symbol *sym) {
   while (sym != nullptr && sym->kind != slang::ast::SymbolKind::InstanceBody) {
     if (sym->kind == slang::ast::SymbolKind::Root) return nullptr;
@@ -1817,6 +1848,8 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &key
   header.global_sink_count = graph.global_sinks.size();
 
   const auto t_write_start = Clock::now();
+  ScopedFileLock db_lock;
+  if (!db_lock.Acquire(db_path)) return false;
   std::ofstream out(db_path, std::ios::binary | std::ios::trunc);
   if (!out.is_open()) return false;
   if (!WriteBinaryValue(out, header) || !WriteBinaryVector(out, string_offsets)) return false;
@@ -1839,6 +1872,48 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &key
     logger->Log("save_graph_db: done elapsed_s=" +
                 fmt_seconds(t_total_start, Clock::now()));
   }
+  return true;
+}
+
+bool ValidateGraphRange(uint32_t begin, uint32_t count, size_t size) {
+  return static_cast<uint64_t>(begin) + static_cast<uint64_t>(count) <=
+         static_cast<uint64_t>(size);
+}
+
+bool ValidateGraphDb(const GraphDb &graph) {
+  for (const GraphSignalRecord &gs : graph.signals) {
+    if (!ValidateGraphRange(gs.driver_begin, gs.driver_count, graph.endpoints.size())) return false;
+    if (!ValidateGraphRange(gs.load_begin, gs.load_count, graph.endpoints.size())) return false;
+  }
+
+  for (const GraphEndpointRecord &ge : graph.endpoints) {
+    if (!ValidateGraphRange(ge.lhs_begin, ge.lhs_count, graph.signal_refs.size())) return false;
+    if (!ValidateGraphRange(ge.rhs_begin, ge.rhs_count, graph.signal_refs.size())) return false;
+  }
+
+  auto validate_path_ref_ranges =
+      [&](const std::vector<GraphPathRefRange> &ranges, const std::vector<uint32_t> &flat_refs) {
+        for (const GraphPathRefRange &range : ranges) {
+          if (!ValidateGraphRange(range.begin, range.count, flat_refs.size())) return false;
+        }
+        for (uint32_t sig_id : flat_refs) {
+          if (sig_id >= graph.signals.size()) return false;
+        }
+        return true;
+      };
+
+  if (!validate_path_ref_ranges(graph.load_ref_ranges, graph.load_ref_signal_ids)) return false;
+  if (!validate_path_ref_ranges(graph.driver_ref_ranges, graph.driver_ref_signal_ids)) return false;
+  if (!validate_path_ref_ranges(graph.assignment_lhs_ref_ranges, graph.assignment_lhs_ref_signal_ids)) return false;
+
+  for (const GraphHierarchyRecord &gh : graph.hierarchy) {
+    if (!ValidateGraphRange(gh.child_begin, gh.child_count, graph.hierarchy_children.size())) return false;
+  }
+
+  for (const GraphGlobalNetRecord &gg : graph.global_nets) {
+    if (!ValidateGraphRange(gg.sink_begin, gg.sink_count, graph.global_sinks.size())) return false;
+  }
+
   return true;
 }
 
@@ -1889,6 +1964,7 @@ bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db)
       !ReadBinaryVector(in, graph.global_sinks, static_cast<size_t>(header.global_sink_count))) {
     return false;
   }
+  if (!ValidateGraphDb(graph)) return false;
 
   compat_db.db_dir = std::filesystem::path(db_path).parent_path().string();
   compat_db.signals.clear();
@@ -1982,10 +2058,12 @@ std::optional<uint32_t> LookupSignalId(const TraceSession &session, std::string_
 }
 
 const std::string &SessionSignalName(const TraceSession &session, uint32_t id) {
+  if (id >= session.signal_names_by_id.size()) throw std::out_of_range("invalid signal id");
   return *session.signal_names_by_id[id];
 }
 
 const SignalRecord &SessionSignalRecord(TraceSession &session, uint32_t id) {
+  if (id >= session.graph->signals.size()) throw std::out_of_range("invalid signal id");
   auto cached = session.materialized_signal_records.find(id);
   if (cached != session.materialized_signal_records.end()) return cached->second;
   const GraphDb &graph = *session.graph;
@@ -2031,6 +2109,9 @@ std::vector<uint32_t> SessionBridgeRefs(const TraceSession &session, bool use_lo
   auto it = index.find(path_id);
   if (it == index.end()) return {};
   const GraphPathRefRange &range = ranges[it->second];
+  if (!ValidateGraphRange(range.begin, range.count, flat.size())) {
+    throw std::out_of_range("invalid path-ref range");
+  }
   return std::vector<uint32_t>(flat.begin() + range.begin, flat.begin() + range.begin + range.count);
 }
 
@@ -2040,6 +2121,9 @@ std::vector<uint32_t> SessionAssignmentLhsRefs(const TraceSession &session, uint
   if (it == graph.assignment_lhs_ref_index.end()) return {};
   const GraphPathRefRange &range = graph.assignment_lhs_ref_ranges[it->second];
   const auto &flat = graph.assignment_lhs_ref_signal_ids;
+  if (!ValidateGraphRange(range.begin, range.count, flat.size())) {
+    throw std::out_of_range("invalid assignment-lhs range");
+  }
   return std::vector<uint32_t>(flat.begin() + range.begin, flat.begin() + range.begin + range.count);
 }
 
@@ -2127,6 +2211,22 @@ std::optional<OutputFormat> ParseOutputFormat(const std::string &s) {
   if (lower == "text") return OutputFormat::kText;
   if (lower == "json") return OutputFormat::kJson;
   return std::nullopt;
+}
+
+bool ParseUnsignedCliValue(const std::string &flag, const std::string &value, size_t &out) {
+  try {
+    size_t pos = 0;
+    const unsigned long long parsed = std::stoull(value, &pos, 10);
+    if (pos != value.size()) {
+      std::cerr << "Invalid " << flag << ": " << value << "\n";
+      return false;
+    }
+    out = static_cast<size_t>(parsed);
+    return true;
+  } catch (...) {
+    std::cerr << "Invalid " << flag << ": " << value << "\n";
+    return false;
+  }
 }
 
 std::string JsonEscape(std::string_view s) {
@@ -2819,31 +2919,6 @@ std::string FetchSourceSlice(TraceSession &session, const EndpointRecord &e) {
   return text.substr(start, end - start);
 }
 
-std::string TrimWhitespace(std::string_view text) {
-  size_t begin = 0;
-  while (begin < text.size() && std::isspace(static_cast<unsigned char>(text[begin]))) ++begin;
-  size_t end = text.size();
-  while (end > begin && std::isspace(static_cast<unsigned char>(text[end - 1]))) --end;
-  return std::string(text.substr(begin, end - begin));
-}
-
-std::vector<std::string> InferAssignmentLhsPathsFromText(const std::string &endpoint_path,
-                                                         std::string_view assignment_text) {
-  if (assignment_text.empty()) return {};
-  const size_t eq = assignment_text.find('=');
-  if (eq == std::string::npos) return {};
-
-  std::string lhs = TrimWhitespace(assignment_text.substr(0, eq));
-  if (lhs.rfind("assign ", 0) == 0) lhs = TrimWhitespace(std::string_view(lhs).substr(7));
-  if (lhs.empty()) return {};
-
-  if (lhs.rfind("top.", 0) == 0) return {lhs};
-
-  const size_t dot = endpoint_path.rfind('.');
-  if (dot == std::string::npos) return {};
-  return {endpoint_path.substr(0, dot) + "." + lhs};
-}
-
 std::vector<std::string> InferAssignmentLhsPaths(TraceSession &session, EndpointRecord &e) {
   if (!e.lhs_signals.empty()) return e.lhs_signals;
   if (e.kind != EndpointKind::kExpr) return {};
@@ -3231,7 +3306,7 @@ ParseStatus ParseTraceArgs(const std::vector<std::string> &args, std::optional<s
         std::cerr << "Missing value for --depth\n";
         return ParseStatus::kError;
       }
-      opts.depth_limit = std::stoull(args[++i]);
+      if (!ParseUnsignedCliValue("--depth", args[++i], opts.depth_limit)) return ParseStatus::kError;
       continue;
     }
     if (arg == "--cone-level") {
@@ -3264,7 +3339,7 @@ ParseStatus ParseTraceArgs(const std::vector<std::string> &args, std::optional<s
         std::cerr << "Missing value for --max-nodes\n";
         return ParseStatus::kError;
       }
-      opts.max_nodes = std::stoull(args[++i]);
+      if (!ParseUnsignedCliValue("--max-nodes", args[++i], opts.max_nodes)) return ParseStatus::kError;
       continue;
     }
     if (arg == "--prefer-port-hop") {
@@ -3354,12 +3429,12 @@ ParseStatus ParseHierArgs(const std::vector<std::string> &args, std::optional<st
     }
     if (arg == "--depth") {
       if (i + 1 >= args.size()) return std::cerr << "Missing value for --depth\n", ParseStatus::kError;
-      opts.depth_limit = std::stoull(args[++i]);
+      if (!ParseUnsignedCliValue("--depth", args[++i], opts.depth_limit)) return ParseStatus::kError;
       continue;
     }
     if (arg == "--max-nodes") {
       if (i + 1 >= args.size()) return std::cerr << "Missing value for --max-nodes\n", ParseStatus::kError;
-      opts.max_nodes = std::stoull(args[++i]);
+      if (!ParseUnsignedCliValue("--max-nodes", args[++i], opts.max_nodes)) return ParseStatus::kError;
       continue;
     }
     if (arg == "--format") {
@@ -3406,7 +3481,7 @@ ParseStatus ParseFindArgs(const std::vector<std::string> &args, std::optional<st
     }
     if (arg == "--limit") {
       if (i + 1 >= args.size()) return std::cerr << "Missing value for --limit\n", ParseStatus::kError;
-      opts.limit = std::stoull(args[++i]);
+      if (!ParseUnsignedCliValue("--limit", args[++i], opts.limit)) return ParseStatus::kError;
       continue;
     }
     if (arg == "--format") {

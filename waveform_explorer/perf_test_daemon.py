@@ -1,36 +1,11 @@
 import time
-import json
-import subprocess
 import os
+from daemon_client import WaveformDaemon
 
 # Paths
-CLI_PATH = os.path.join(os.path.dirname(__file__), "build", "wave_agent_cli")
 VCD_PATH = os.path.join(os.path.dirname(__file__), "timer_tb.vcd")
 LARGE_VCD_PATH = "/home/qsun/AI_PROJ/auto_waveform_debugger/Cores-VeeR-EH1/sim.vcd"
 FST_PATH = "/home/qsun/AI_PROJ/auto_waveform_debugger/Cores-VeeR-EH1/sim.fst"
-
-class WaveformDaemon:
-    def __init__(self, vcd_path: str):
-        self.vcd_path = vcd_path
-        self.process = subprocess.Popen(
-            [CLI_PATH, vcd_path],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1
-        )
-    
-    def query(self, cmd: str, args: dict = None) -> dict:
-        query_obj = {"cmd": cmd, "args": args or {}}
-        query_str = json.dumps(query_obj)
-        self.process.stdin.write(query_str + "\n")
-        self.process.stdin.flush()
-        line = self.process.stdout.readline()
-        return json.loads(line)
-
-    def terminate(self):
-        self.process.terminate()
 
 def test_performance(vcd_path):
     print(f"--- Benchmarking (Daemon Mode): {vcd_path} ---")
@@ -40,7 +15,7 @@ def test_performance(vcd_path):
 
     # 1. Start Daemon (Includes initial load time)
     start_load = time.perf_counter()
-    daemon = WaveformDaemon(vcd_path)
+    daemon = WaveformDaemon(os.path.join(os.path.dirname(__file__), "build", "wave_agent_cli"), vcd_path)
     # Trigger first query to ensure it's loaded
     daemon.query("list_signals")
     end_load = time.perf_counter()
@@ -68,7 +43,7 @@ def test_performance(vcd_path):
 
     print(f"Total time for 4 subsequent queries: {total_query_time:.4f}s")
     print(f"Average query latency: {total_query_time / len(cmds):.4f}s\n")
-    daemon.terminate()
+    daemon.close()
 
 if __name__ == "__main__":
     test_performance(VCD_PATH)

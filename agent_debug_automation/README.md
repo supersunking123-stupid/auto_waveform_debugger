@@ -53,6 +53,30 @@ python agent_debug_automation_mcp.py
 
 If you are not using the repo virtualenv, replace `command` with your system `python3`.
 
+## Waveform View Model
+
+The session-aware tools expose a simple waveform-view model:
+
+- `Session`
+  - A saved waveform view bound to one waveform file.
+  - A Session stores the current `Cursor`, named `Bookmarks`, and named `Signal Groups`.
+  - Each waveform auto-creates a `Default_Session` on first session-aware use.
+- `Cursor`
+  - The current focus time in a Session.
+  - Query tools may use `time="Cursor"` instead of an integer timestamp.
+- `Bookmark`
+  - A named saved time in a Session.
+  - Query tools may use `time="BM_<bookmark_name>"`.
+- `Signal Group`
+  - A named saved signal list in a Session.
+  - `get_snapshot(...)` expands group names when `signals_are_groups=True`.
+
+Default resolution rules:
+
+- If `vcd_path` is omitted on a session-aware waveform tool, the active Session selects the waveform file.
+- The active Session is global, but each saved Session is bound to a single waveform path.
+- Session state persists on disk under `agent_debug_automation/.session_store`.
+
 ## Exposed tools
 
 ### `standalone_trace` passthrough
@@ -81,10 +105,12 @@ These keep the original `rtl_trace` command model unchanged.
 - `find_value_intervals(vcd_path=None, path, value, start_time, end_time, radix="hex", session_name=None)`
 - `find_condition(vcd_path=None, expression, start_time, direction="forward", session_name=None)`
 - `get_transitions(vcd_path=None, path, start_time, end_time, max_limit=50, session_name=None)`
+- `get_signal_overview(vcd_path=None, path, start_time, end_time, resolution="auto", radix="hex", session_name=None)`
 - `analyze_pattern(vcd_path=None, path, start_time, end_time, session_name=None)`
 
 Waveform semantics stay aligned with `wave_agent_cli`. In particular, backward edge search now resolves the last matching edge at or before `T`, including an edge exactly at `T`.
 For multi-bit value queries, `radix` may be `hex`, `bin`, or `dec`; the default is `hex`.
+`get_signal_overview` provides a zoomed-out, resolution-aware summary of one signal and also accepts `resolution="auto"` for an overview capped to a manageable number of segments.
 
 ### Session tools
 
@@ -107,8 +133,8 @@ For multi-bit value queries, `radix` may be `hex`, `bin`, or `dec`; the default 
 Session state is stored on disk under `agent_debug_automation/.session_store`.
 Each waveform gets a default `Default_Session` on first session-aware use.
 Time-taking merged tools accept either an integer time, `"Cursor"`, or `"BM_<bookmark_name>"`.
-`get_snapshot` can expand saved signal groups when `signals_are_groups=true`.
-The active session is global, but every saved session is bound to a single waveform path.
+`get_snapshot` can expand saved Signal Groups when `signals_are_groups=true`.
+The active Session is global, but every saved Session is bound to a single waveform path.
 
 Common session-aware workflow:
 
@@ -127,6 +153,13 @@ get_snapshot(
   signals=["axi_read_rsp"],
   time="BM_rlast_edge",
   signals_are_groups=True,
+)
+get_signal_overview(
+  vcd_path="/path/to/wave.fsdb",
+  path="top...rid[7:0]",
+  start_time="Cursor",
+  end_time="BM_rlast_edge",
+  resolution="auto",
 )
 ```
 
@@ -212,6 +245,7 @@ This is what makes the cross-link tools practical on large ASIC waveforms such a
 Portable regression:
 
 ```bash
+python3 -m unittest waveform_explorer.tests.test_signal_overview
 python3 -m unittest agent_debug_automation.tests.test_cross_linking
 ```
 

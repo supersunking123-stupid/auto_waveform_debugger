@@ -48,6 +48,15 @@ def assert_any(endpoints, pred, msg):
         raise AssertionError(msg)
 
 
+def assert_invalid_arg(rtl_trace, args, expected_fragment):
+    proc = run_cmd([str(rtl_trace)] + args, expect=1)
+    if expected_fragment not in proc.stderr:
+        raise AssertionError(
+            f"expected error fragment {expected_fragment!r} in stderr for {' '.join(args)}\n"
+            f"stderr:\n{proc.stderr}"
+        )
+
+
 def main():
     ap = argparse.ArgumentParser(description="Standalone trace semantic regression suite")
     ap.add_argument("--rtl-trace", required=True, help="Path to rtl_trace binary")
@@ -106,6 +115,12 @@ def main():
             l_endpoints,
             lambda e: e.get("assignment") == "" and e.get("bit_map") == "[0]" and "semantic_top.flag" in e.get("lhs", []),
             "missing loads condition-context LHS for semantic_top.data[0]",
+        )
+        hit_loads = run_trace_json(rtl_trace, db, "loads", "semantic_top.hit")
+        assert_any(
+            hit_loads.get("endpoints", []),
+            lambda e: e.get("assignment") == "flag <= hit" and "semantic_top.flag" in e.get("lhs", []),
+            "missing nonblocking assignment LHS for semantic_top.hit loads",
         )
 
         # 4) bit-level precision and bit-select query filtering
@@ -192,6 +207,23 @@ def main():
         )
         if "signals: incremental-cache-hit" not in inc2.stdout:
             raise AssertionError(f"incremental cache hit missing:\n{inc2.stdout}")
+
+        # 8) invalid numeric args should return a parse error instead of terminating
+        assert_invalid_arg(
+            rtl_trace,
+            ["trace", "--db", str(db), "--mode", "drivers", "--signal", "semantic_top.hit", "--depth", "abc"],
+            "Invalid --depth: abc",
+        )
+        assert_invalid_arg(
+            rtl_trace,
+            ["hier", "--db", str(db), "--max-nodes", "oops"],
+            "Invalid --max-nodes: oops",
+        )
+        assert_invalid_arg(
+            rtl_trace,
+            ["find", "--db", str(db), "--query", "semantic_top.hit", "--limit", "bad"],
+            "Invalid --limit: bad",
+        )
 
         print("semantic_regression: PASS")
     finally:

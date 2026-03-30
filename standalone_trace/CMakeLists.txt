@@ -19,8 +19,11 @@ set(SLANG_USE_CPPTRACE OFF CACHE BOOL "")
 
 add_subdirectory(third_party/slang)
 
-add_executable(rtl_trace main.cc)
+add_executable(rtl_trace main.cc AssignmentUtils.cc)
 target_link_libraries(rtl_trace PRIVATE slang::slang)
+
+add_executable(assignment_utils_test tests/assignment_utils_test.cc AssignmentUtils.cc)
+target_include_directories(assignment_utils_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 enable_testing()
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
@@ -32,3 +35,5 @@ add_test(
           --rtl-trace $<TARGET_FILE:rtl_trace>
           --source-dir ${CMAKE_CURRENT_SOURCE_DIR}
 )
+
+add_test(NAME assignment_utils_test COMMAND assignment_utils_test)

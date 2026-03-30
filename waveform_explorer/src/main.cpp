@@ -8,6 +8,74 @@
 
 using json = nlohmann::json;
 
+namespace {
+json dispatch_query(AgentAPI& api, WaveDatabase& db, const json& q) {
+    std::string cmd = q.value("cmd", "");
+    json args = q.value("args", json::object());
+    json response;
+
+    if (cmd == "get_signal_info") {
+        response = api.get_signal_info(args.value("path", ""));
+    } else if (cmd == "list_signals_page") {
+        response = api.list_signals_page(
+            args.value("prefix", ""),
+            args.value("cursor", ""),
+            args.value("limit", 1000ULL));
+    } else if (cmd == "get_snapshot") {
+        response = api.get_snapshot(
+            args.value("signals", std::vector<std::string>()),
+            args.value("time", 0ULL),
+            args.value("radix", "hex"));
+    } else if (cmd == "get_value_at_time") {
+        response = api.get_value_at_time(
+            args.value("path", ""),
+            args.value("time", 0ULL),
+            args.value("radix", "hex"));
+    } else if (cmd == "find_edge") {
+        response = api.find_edge(args.value("path", ""), args.value("edge_type", "anyedge"),
+                                 args.value("start_time", 0ULL), args.value("direction", "forward"));
+    } else if (cmd == "find_value_intervals") {
+        response = api.find_value_intervals(
+            args.value("path", ""),
+            args.value("value", ""),
+            args.value("start_time", 0ULL),
+            args.value("end_time", 0ULL),
+            args.value("radix", "hex"));
+    } else if (cmd == "find_condition") {
+        response = api.find_condition(args.value("expression", ""), args.value("start_time", 0ULL), args.value("direction", "forward"));
+    } else if (cmd == "get_transitions") {
+        response = api.get_transitions(args.value("path", ""), args.value("start_time", 0ULL),
+                                       args.value("end_time", 0ULL), args.value("max_limit", 50));
+    } else if (cmd == "get_signal_overview") {
+        response = api.get_signal_overview(
+            args.value("path", ""),
+            args.value("start_time", 0ULL),
+            args.value("end_time", 0ULL),
+            args.contains("resolution") ? args["resolution"] : json("auto"),
+            args.value("radix", "hex"));
+    } else if (cmd == "analyze_pattern") {
+        response = api.analyze_pattern(args.value("path", ""), args.value("start_time", 0ULL), args.value("end_time", 0ULL));
+    } else if (cmd == "list_signals") {
+        json signals = json::array();
+        for (const auto& pair : db.get_all_signals()) {
+            signals.push_back(pair.first);
+        }
+        response = {{"status", "success"}, {"data", signals}};
+    } else {
+        response = {{"status", "error"}, {"message", "Unknown command: " + cmd}};
+    }
+    return response;
+}
+
+json execute_query(AgentAPI& api, WaveDatabase& db, const json& q) {
+    try {
+        return dispatch_query(api, db, q);
+    } catch (const std::exception& e) {
+        return {{"status", "error"}, {"message", std::string("Query failed: ") + e.what()}};
+    }
+}
+} // namespace
+
 class StdoutLineFilter {
 public:
     StdoutLineFilter() {
@@ -141,58 +209,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        auto dispatch = [&](const json& q) {
-            std::string cmd = q.value("cmd", "");
-            json args = q.value("args", json::object());
-            json response;
-
-            if (cmd == "get_signal_info") {
-                response = api.get_signal_info(args.value("path", ""));
-            } else if (cmd == "list_signals_page") {
-                response = api.list_signals_page(
-                    args.value("prefix", ""),
-                    args.value("cursor", ""),
-                    args.value("limit", 1000ULL));
-            } else if (cmd == "get_snapshot") {
-                response = api.get_snapshot(
-                    args.value("signals", std::vector<std::string>()),
-                    args.value("time", 0ULL),
-                    args.value("radix", "hex"));
-            } else if (cmd == "get_value_at_time") {
-                response = api.get_value_at_time(
-                    args.value("path", ""),
-                    args.value("time", 0ULL),
-                    args.value("radix", "hex"));
-            } else if (cmd == "find_edge") {
-                response = api.find_edge(args.value("path", ""), args.value("edge_type", "anyedge"),
-                                         args.value("start_time", 0ULL), args.value("direction", "forward"));
-            } else if (cmd == "find_value_intervals") {
-                response = api.find_value_intervals(
-                    args.value("path", ""),
-                    args.value("value", ""),
-                    args.value("start_time", 0ULL),
-                    args.value("end_time", 0ULL),
-                    args.value("radix", "hex"));
-            } else if (cmd == "find_condition") {
-                response = api.find_condition(args.value("expression", ""), args.value("start_time", 0ULL), args.value("direction", "forward"));
-            } else if (cmd == "get_transitions") {
-                response = api.get_transitions(args.value("path", ""), args.value("start_time", 0ULL),
-                                               args.value("end_time", 0ULL), args.value("max_limit", 50));
-            } else if (cmd == "analyze_pattern") {
-                response = api.analyze_pattern(args.value("path", ""), args.value("start_time", 0ULL), args.value("end_time", 0ULL));
-            } else if (cmd == "list_signals") {
-                json signals = json::array();
-                for (const auto& pair : db.get_all_signals()) {
-                    signals.push_back(pair.first);
-                }
-                response = {{"status", "success"}, {"data", signals}};
-            } else {
-                response = {{"status", "error"}, {"message", "Unknown command: " + cmd}};
-            }
-            return response;
-        };
-
-        std::cout << dispatch(query).dump() << std::endl;
+        std::cout << execute_query(api, db, query).dump() << std::endl;
         return 0;
     }
 
@@ -204,55 +221,7 @@ int main(int argc, char* argv[]) {
 
         try {
             json query = json::parse(line);
-            std::string cmd = query.value("cmd", "");
-            json args = query.value("args", json::object());
-            json response;
-
-            if (cmd == "get_signal_info") {
-                response = api.get_signal_info(args.value("path", ""));
-            } else if (cmd == "list_signals_page") {
-                response = api.list_signals_page(
-                    args.value("prefix", ""),
-                    args.value("cursor", ""),
-                    args.value("limit", 1000ULL));
-            } else if (cmd == "get_snapshot") {
-                response = api.get_snapshot(
-                    args.value("signals", std::vector<std::string>()),
-                    args.value("time", 0ULL),
-                    args.value("radix", "hex"));
-            } else if (cmd == "get_value_at_time") {
-                response = api.get_value_at_time(
-                    args.value("path", ""),
-                    args.value("time", 0ULL),
-                    args.value("radix", "hex"));
-            } else if (cmd == "find_edge") {
-                response = api.find_edge(args.value("path", ""), args.value("edge_type", "anyedge"),
-                                         args.value("start_time", 0ULL), args.value("direction", "forward"));
-            } else if (cmd == "find_value_intervals") {
-                response = api.find_value_intervals(
-                    args.value("path", ""),
-                    args.value("value", ""),
-                    args.value("start_time", 0ULL),
-                    args.value("end_time", 0ULL),
-                    args.value("radix", "hex"));
-            } else if (cmd == "find_condition") {
-                response = api.find_condition(args.value("expression", ""), args.value("start_time", 0ULL), args.value("direction", "forward"));
-            } else if (cmd == "get_transitions") {
-                response = api.get_transitions(args.value("path", ""), args.value("start_time", 0ULL),
-                                               args.value("end_time", 0ULL), args.value("max_limit", 50));
-            } else if (cmd == "analyze_pattern") {
-                response = api.analyze_pattern(args.value("path", ""), args.value("start_time", 0ULL), args.value("end_time", 0ULL));
-            } else if (cmd == "list_signals") {
-                json signals = json::array();
-                for (const auto& pair : db.get_all_signals()) {
-                    signals.push_back(pair.first);
-                }
-                response = {{"status", "success"}, {"data", signals}};
-            } else {
-                response = {{"status", "error"}, {"message", "Unknown command: " + cmd}};
-            }
-
-            std::cout << response.dump() << std::endl;
+            std::cout << execute_query(api, db, query).dump() << std::endl;
         } catch (const std::exception& e) {
             std::cout << json({{"status", "error"}, {"message", "Invalid JSON query: " + std::string(e.what())}}).dump() << std::endl;
         }

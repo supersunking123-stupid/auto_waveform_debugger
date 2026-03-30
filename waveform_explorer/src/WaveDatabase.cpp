@@ -451,7 +451,12 @@ bool WaveDatabase::load_vcd(const std::string& filepath) {
                 }
             }
         } else if (*p == '#') {
-            current_time = std::stoull(p + 1);
+            try {
+                current_time = std::stoull(p + 1);
+            } catch (const std::exception&) {
+                std::cerr << "Malformed VCD timestamp: " << line << std::endl;
+                return false;
+            }
         } else {
             // Value change
             std::string value;
@@ -659,7 +664,13 @@ bool WaveDatabase::ensure_fsdb_signal_loaded(const SignalInfo& info) const {
     if (fsdb_obj == nullptr) return false;
     if (fsdb_loaded_signal_ids.find(info.signal_id) != fsdb_loaded_signal_ids.end()) return true;
 
-    const fsdbVarIdcode idcode = static_cast<fsdbVarIdcode>(std::stoll(info.signal_id));
+    fsdbVarIdcode idcode = 0;
+    try {
+        idcode = static_cast<fsdbVarIdcode>(std::stoll(info.signal_id));
+    } catch (const std::exception&) {
+        std::cerr << "Invalid FSDB signal id: " << info.signal_id << std::endl;
+        return false;
+    }
     std::vector<Transition> transitions;
     bool ok = true;
 

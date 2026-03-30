@@ -79,6 +79,7 @@ It implements the query semantics for:
 - `find_edge`
 - `find_condition`
 - `get_transitions`
+- `get_signal_overview`
 - `analyze_pattern`
 
 ## Major working flows
@@ -230,6 +231,15 @@ Important constraint:
 #### `get_transitions`
 - bounded window query over transition history
 - returns a truncated flag if `max_limit` is hit
+
+#### `get_signal_overview`
+- builds a resolution-aware summary of one signal over `[start_time, end_time]`
+- uses raw transitions plus width metadata, not the point-sample display layer
+- stable single-bit segments return direct logic states
+- stable multi-bit segments return `state: "stable"` plus formatted `value`
+- dense activity collapses to `state: "flipping"`
+- multi-bit flipping segments also report `unique_values` and `transitions`
+- `resolution="auto"` searches for the smallest resolution that keeps the result to about 20 segments
 
 #### `find_edge`
 - searches transition history forward or backward

@@ -1,64 +1,51 @@
 import json
-import subprocess
 import os
-import sys
-from typing import List, Optional, Dict
+import atexit
+import threading
+from typing import List, Optional, Dict, Union
 from mcp.server.fastmcp import FastMCP
+from daemon_client import WaveformDaemon
 
 # Initialize FastMCP server
 mcp = FastMCP("Waveform Explorer")
 
-# Path to the C++ executable
 CLI_PATH = os.path.join(os.path.dirname(__file__), "build", "wave_agent_cli")
-
-class WaveformDaemon:
-    def __init__(self, vcd_path: str):
-        self.vcd_path = vcd_path
-        self.process = subprocess.Popen(
-            [CLI_PATH, vcd_path],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1  # Line buffered
-        )
-    
-    def query(self, cmd: str, args: dict = None) -> dict:
-        query_obj = {"cmd": cmd, "args": args or {}}
-        query_str = json.dumps(query_obj)
-        
-        try:
-            self.process.stdin.write(query_str + "\n")
-            self.process.stdin.flush()
-            
-            line = self.process.stdout.readline()
-            if not line:
-                # Process might have crashed, check stderr
-                stderr = self.process.stderr.read()
-                return {"status": "error", "message": f"Daemon crashed. Stderr: {stderr}"}
-                
-            return json.loads(line)
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
-
-    def __del__(self):
-        if hasattr(self, 'process'):
-            self.process.terminate()
 
 # Cache for daemons: vcd_path -> WaveformDaemon
 daemons: Dict[str, WaveformDaemon] = {}
+_daemons_lock = threading.RLock()
+
+
+def _close_all_daemons() -> None:
+    with _daemons_lock:
+        current = list(daemons.values())
+        daemons.clear()
+    for daemon in current:
+        daemon.close()
+
+
+atexit.register(_close_all_daemons)
 
 def get_daemon(vcd_path: str) -> WaveformDaemon:
     vcd_path = os.path.abspath(vcd_path)
-    if vcd_path not in daemons:
+    with _daemons_lock:
+        daemon = daemons.get(vcd_path)
+        if daemon is not None and daemon.process.poll() is None:
+            return daemon
+        if daemon is not None:
+            daemon.close()
         if not os.path.exists(vcd_path):
             raise FileNotFoundError(f"VCD file not found: {vcd_path}")
-        daemons[vcd_path] = WaveformDaemon(vcd_path)
-    return daemons[vcd_path]
+        daemons[vcd_path] = WaveformDaemon(CLI_PATH, vcd_path)
+        return daemons[vcd_path]
 
 @mcp.tool()
 def list_signals(vcd_path: str):
-    """List all hierarchical signal paths found in the VCD file."""
+    """List all waveform signal paths for one concrete waveform file.
+
+    This standalone MCP is stateless. It does not support Sessions, Cursor,
+    Bookmarks, or Signal Groups.
+    """
     try:
         return get_daemon(vcd_path).query("list_signals")
     except Exception as e:
@@ -66,7 +53,7 @@ def list_signals(vcd_path: str):
 
 @mcp.tool()
 def get_signal_info(vcd_path: str, path: str):
-    """Get metadata for a specific signal (width, type, etc.)."""
+    """Get metadata for one signal in one concrete waveform file."""
     try:
         return get_daemon(vcd_path).query("get_signal_info", {"path": path})
     except Exception as e:
@@ -74,7 +61,11 @@ def get_signal_info(vcd_path: str, path: str):
 
 @mcp.tool()
 def get_snapshot(vcd_path: str, signals: List[str], time: int, radix: str = "hex"):
-    """Get the values of multiple signals at a specific timestamp."""
+    """Get values for multiple signals at one integer timestamp.
+
+    Unlike the merged MCP, this standalone server does not resolve session
+    aliases such as "Cursor" or "BM_<name>" and does not expand Signal Groups.
+    """
     try:
         return get_daemon(vcd_path).query("get_snapshot", {"signals": signals, "time": time, "radix": radix})
     except Exception as e:
@@ -82,7 +73,7 @@ def get_snapshot(vcd_path: str, signals: List[str], time: int, radix: str = "hex
 
 @mcp.tool()
 def get_value_at_time(vcd_path: str, path: str, time: int, radix: str = "hex"):
-    """Get the value of a single signal at a specific timestamp."""
+    """Get one signal value at one integer timestamp."""
     try:
         return get_daemon(vcd_path).query("get_value_at_time", {"path": path, "time": time, "radix": radix})
     except Exception as e:
@@ -91,7 +82,9 @@ def get_value_at_time(vcd_path: str, path: str, time: int, radix: str = "hex"):
 @mcp.tool()
 def find_edge(vcd_path: str, path: str, edge_type: str, start_time: int, direction: str = "forward"):
     """
-    Search for the next/previous transition edge of a signal.
+    Search for the next or previous transition edge from one integer start time.
+
+    This standalone server does not resolve session time aliases.
     edge_type: 'posedge', 'negedge', or 'anyedge'
     direction: 'forward' or 'backward'
     """
@@ -107,7 +100,7 @@ def find_edge(vcd_path: str, path: str, edge_type: str, start_time: int, directi
 
 @mcp.tool()
 def find_value_intervals(vcd_path: str, path: str, value: str, start_time: int, end_time: int, radix: str = "hex"):
-    """Find all [start, end] intervals where a signal equals a target value within a time range."""
+    """Find all matching value intervals in one explicit integer time range."""
     try:
         return get_daemon(vcd_path).query("find_value_intervals", {
             "path": path,
@@ -122,7 +115,7 @@ def find_value_intervals(vcd_path: str, path: str, value: str, start_time: int, 
 @mcp.tool()
 def find_condition(vcd_path: str, expression: str, start_time: int, direction: str = "forward"):
     """
-    Find the first timestamp where a logical condition is met.
+    Find the first timestamp where a logical condition is met from one integer start time.
     expression format: 'PATH == VALUE' (e.g., 'TOP.timer_tb.count == b00000001')
     """
     try:
@@ -136,7 +129,7 @@ def find_condition(vcd_path: str, expression: str, start_time: int, direction: s
 
 @mcp.tool()
 def get_transitions(vcd_path: str, path: str, start_time: int, end_time: int, max_limit: int = 50):
-    """Get a compressed history of signal transitions within a time window."""
+    """Get a compressed transition history in one explicit integer time window."""
     try:
         return get_daemon(vcd_path).query("get_transitions", {
             "path": path, 
@@ -148,8 +141,38 @@ def get_transitions(vcd_path: str, path: str, start_time: int, end_time: int, ma
         return {"status": "error", "message": str(e)}
 
 @mcp.tool()
+def get_signal_overview(
+    vcd_path: str,
+    path: str,
+    start_time: int,
+    end_time: int,
+    resolution: Union[int, str],
+    radix: str = "hex",
+):
+    """Summarize one signal over a time window using a resolution-aware overview.
+
+    Inputs are explicit and stateless:
+    - `vcd_path` selects the waveform file
+    - `start_time` and `end_time` are integer timestamps
+    - `resolution` may be an integer or `"auto"`
+
+    This standalone server does not resolve Sessions, Cursor, Bookmarks, or
+    Signal Groups.
+    """
+    try:
+        return get_daemon(vcd_path).query("get_signal_overview", {
+            "path": path,
+            "start_time": start_time,
+            "end_time": end_time,
+            "resolution": resolution,
+            "radix": radix,
+        })
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@mcp.tool()
 def analyze_pattern(vcd_path: str, path: str, start_time: int, end_time: int):
-    """Analyze a signal's behavior (e.g., identify clocks, static signals)."""
+    """Analyze one signal over one explicit integer time window."""
     try:
         return get_daemon(vcd_path).query("analyze_pattern", {
             "path": path, 

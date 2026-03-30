@@ -1,7 +1,10 @@
+import concurrent.futures
 import importlib
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -15,11 +18,90 @@ sys.path.insert(0, str(ROOT))
 from agent_debug_automation import agent_debug_automation_mcp as mcp_mod
 
 
+OVERVIEW_FIXTURE_VCD = """$date
+  today
+$end
+$version
+  signal overview fixture
+$end
+$timescale 1ns $end
+$scope module TOP $end
+$scope module tb $end
+$var wire 1 ! sig $end
+$var wire 4 " bus[3:0] $end
+$var wire 1 # fast $end
+$upscope $end
+$upscope $end
+$enddefinitions $end
+#0
+$dumpvars
+0!
+b0000 "
+0#
+$end
+#2
+1#
+#4
+0#
+#6
+1#
+#8
+0#
+#10
+1!
+1#
+#12
+0#
+#14
+1#
+#16
+0#
+#18
+1#
+#20
+0!
+0#
+#22
+1#
+#24
+0#
+#25
+1!
+#26
+1#
+#28
+0#
+#30
+0!
+1#
+#32
+0#
+#34
+1#
+#36
+0#
+#38
+1#
+#40
+b0001 "
+0#
+#44
+b0010 "
+#48
+b0011 "
+#70
+b0100 "
+"""
+
+
 class CrossLinkingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.db_path = "/tmp/agent_debug_automation_test.db"
         cls.waveform_path = str(ROOT / "waveform_explorer" / "timer_tb.vcd")
+        cls.temp_dir = tempfile.TemporaryDirectory()
+        cls.overview_waveform_path = str(Path(cls.temp_dir.name) / "overview_fixture.vcd")
+        Path(cls.overview_waveform_path).write_text(OVERVIEW_FIXTURE_VCD, encoding="ascii")
         cls.rtl_trace_bin = str(ROOT / "standalone_trace" / "build" / "rtl_trace")
         cls.wave_cli_bin = str(ROOT / "waveform_explorer" / "build" / "wave_agent_cli")
         fixture_dir = ROOT / "standalone_trace" / "test_case0"
@@ -39,6 +121,10 @@ class CrossLinkingTests(unittest.TestCase):
             text=True,
             capture_output=True,
         )
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temp_dir.cleanup()
 
     def setUp(self):
         for daemon in mcp_mod.wave_daemons.values():
@@ -162,6 +248,114 @@ class CrossLinkingTests(unittest.TestCase):
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["resolved_time"]["resolved_time"], 75000)
         self.assertEqual(result["time_context"]["focus_time"], 75000)
+
+    def test_get_signal_overview_resolves_session_time_aliases(self):
+        mcp_mod.create_session(
+            waveform_path=self.overview_waveform_path,
+            session_name="overview_view",
+            description="signal overview alias regression",
+        )
+        mcp_mod.switch_session("overview_view", waveform_path=self.overview_waveform_path)
+        mcp_mod.set_cursor(0, waveform_path=self.overview_waveform_path)
+        mcp_mod.create_bookmark(
+            "bus_end",
+            80,
+            waveform_path=self.overview_waveform_path,
+            session_name="overview_view",
+            description="overview range end",
+        )
+
+        result = mcp_mod.get_signal_overview(
+            vcd_path=self.overview_waveform_path,
+            path="tb.bus[3:0]",
+            start_time="Cursor",
+            end_time="BM_bus_end",
+            resolution=10,
+            session_name="overview_view",
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["session"]["session_name"], "overview_view")
+        self.assertEqual(result["resolved_time_range"]["start"]["resolved_time"], 0)
+        self.assertEqual(result["resolved_time_range"]["end"]["resolved_time"], 80)
+        self.assertEqual(result["segments"], [
+            {"start": 0, "end": 39, "state": "stable", "value": "h0"},
+            {"start": 40, "end": 47, "state": "flipping", "unique_values": 4, "transitions": 3},
+            {"start": 48, "end": 69, "state": "stable", "value": "h3"},
+            {"start": 70, "end": 80, "state": "stable", "value": "h4"},
+        ])
+
+    def test_get_signal_overview_supports_auto_resolution(self):
+        result = mcp_mod.get_signal_overview(
+            vcd_path=self.overview_waveform_path,
+            path="tb.fast",
+            start_time=0,
+            end_time=40,
+            resolution="auto",
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["requested_resolution"], "auto")
+        self.assertIsInstance(result["resolution"], int)
+        self.assertGreaterEqual(result["resolution"], 3)
+        self.assertLessEqual(len(result["segments"]), 20)
+
+    def test_concurrent_rtl_session_lookup_reuses_single_session(self):
+        created = []
+
+        class FakeProcess:
+            def poll(self):
+                return None
+
+        class FakeSession:
+            def __init__(self, bin_path, serve_args):
+                time.sleep(0.05)
+                self.bin_path = bin_path
+                self.serve_args = serve_args
+                self.process = FakeProcess()
+                self.startup = {"status": "success"}
+                created.append((bin_path, tuple(serve_args)))
+
+            def stop(self):
+                return {"status": "success"}
+
+        with mock.patch.object(mcp_mod, "RtlTraceServeSession", FakeSession), \
+             mock.patch.object(mcp_mod, "_resolve_bin", return_value="/tmp/fake_rtl_trace"):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                sessions = list(pool.map(lambda _: mcp_mod._get_rtl_serve_session("/tmp/shared.db"), range(2)))
+
+        self.assertEqual(len(created), 1)
+        self.assertIs(sessions[0], sessions[1])
+        self.assertEqual(len(mcp_mod.rtl_serve_sessions), 1)
+        self.assertEqual(len(mcp_mod.rtl_session_ids_by_key), 1)
+
+    def test_concurrent_wave_daemon_lookup_reuses_single_daemon(self):
+        created = []
+
+        class FakeProcess:
+            def poll(self):
+                return None
+
+        class FakeDaemon:
+            def __init__(self, wave_cli_path, waveform_path):
+                time.sleep(0.05)
+                self.wave_cli_path = wave_cli_path
+                self.waveform_path = waveform_path
+                self.process = FakeProcess()
+                created.append((wave_cli_path, waveform_path))
+
+            def stop(self):
+                return None
+
+        with mock.patch.object(mcp_mod, "WaveformDaemon", FakeDaemon), \
+             mock.patch.object(mcp_mod, "_resolve_bin", return_value="/tmp/fake_wave_agent_cli"), \
+             mock.patch.object(mcp_mod.os.path, "exists", return_value=True):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                daemons = list(pool.map(lambda _: mcp_mod._get_wave_daemon("/tmp/shared.vcd"), range(2)))
+
+        self.assertEqual(len(created), 1)
+        self.assertIs(daemons[0], daemons[1])
+        self.assertEqual(len(mcp_mod.wave_daemons), 1)
 
     def test_trace_with_snapshot(self):
         result = mcp_mod.trace_with_snapshot(

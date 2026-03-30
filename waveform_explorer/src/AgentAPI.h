@@ -33,6 +33,12 @@ public:
 
     // 4. Compressed Transitions
     json get_transitions(const std::string& signal_path, uint64_t start_time, uint64_t end_time, int max_limit = 50);
+    json get_signal_overview(
+        const std::string& signal_path,
+        uint64_t start_time,
+        uint64_t end_time,
+        const json& resolution,
+        const std::string& radix = "hex");
 
     // 5. Pattern Analysis
     json analyze_pattern(const std::string& signal_path, uint64_t start_time, uint64_t end_time);

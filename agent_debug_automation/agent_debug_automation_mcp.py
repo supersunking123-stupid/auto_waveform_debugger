@@ -1,7 +1,10 @@
+import atexit
 import json
 import os
+import queue
 import shlex
 import subprocess
+import threading
 import uuid
 import hashlib
 import re
@@ -35,9 +38,11 @@ DEFAULT_RANK_WINDOW_BEFORE = 1000
 DEFAULT_RANK_WINDOW_AFTER = 1000
 DEFAULT_EXPLAIN_WINDOW_AFTER = 0
 DEFAULT_TRANSITION_LIMIT = 256
+DEFAULT_BACKEND_READ_TIMEOUT_SEC = 300
 SESSION_STORE_DIR = ROOT_DIR / "agent_debug_automation" / ".session_store"
 ACTIVE_SESSION_FILE = SESSION_STORE_DIR / "active_session.json"
 DEFAULT_SESSION_NAME = "Default_Session"
+runtime_state_lock = threading.RLock()
 
 
 class TraceOptions(TypedDict, total=False):
@@ -55,6 +60,7 @@ EdgeTypeAlias = Literal["rise", "rising", "risingedge", "fall", "falling", "fall
 Direction = Literal["forward", "backward"]
 TraceMode = Literal["drivers", "loads"]
 TimeReference = int | str
+ResolutionReference = int | str
 
 
 def _utc_now_iso() -> str:
@@ -85,14 +91,14 @@ def _session_file_path(waveform_path: str, session_name: str) -> Path:
 
 
 def _read_json_file(path: Path) -> Dict[str, Any]:
-    with path.open("r", encoding="ascii") as f:
+    with path.open("r", encoding="utf-8") as f:
         return json.load(f)
 
 
 def _write_json_file(path: Path, payload: Dict[str, Any]) -> None:
     tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="ascii") as f:
-        json.dump(payload, f, indent=2, sort_keys=True)
+    with tmp_path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, sort_keys=True, ensure_ascii=False)
         f.write("\n")
     tmp_path.replace(path)
 
@@ -157,7 +163,10 @@ def _load_session_payload(waveform_path: str, session_name: str) -> Optional[Dic
     return _normalize_session_payload(_read_json_file(path))
 
 
-def _list_session_payloads(waveform_path: Optional[str] = None) -> List[Dict[str, Any]]:
+def _list_session_payloads(
+    waveform_path: Optional[str] = None,
+    diagnostics: Optional[List[Dict[str, str]]] = None,
+) -> List[Dict[str, Any]]:
     _ensure_session_store()
     normalized_waveform = None if waveform_path is None else _normalize_waveform_path(waveform_path)
     sessions: List[Dict[str, Any]] = []
@@ -166,7 +175,9 @@ def _list_session_payloads(waveform_path: Optional[str] = None) -> List[Dict[str
             continue
         try:
             payload = _normalize_session_payload(_read_json_file(path))
-        except Exception:
+        except Exception as exc:
+            if diagnostics is not None:
+                diagnostics.append({"path": str(path), "message": str(exc)})
             continue
         if normalized_waveform is not None and payload["waveform_path"] != normalized_waveform:
             continue
@@ -399,6 +410,26 @@ def _run_cmd(args: List[str], timeout_sec: int = 300) -> Dict[str, Any]:
         return {"status": "error", "message": str(e)}
 
 
+def _read_line_with_timeout(stream: Any, timeout_sec: float) -> str:
+    result_queue: queue.Queue = queue.Queue(maxsize=1)
+
+    def _reader() -> None:
+        try:
+            result_queue.put((True, stream.readline()))
+        except Exception as exc:
+            result_queue.put((False, exc))
+
+    reader = threading.Thread(target=_reader, daemon=True)
+    reader.start()
+    try:
+        ok, payload = result_queue.get(timeout=timeout_sec)
+    except queue.Empty as exc:
+        raise TimeoutError(f"backend read timed out after {timeout_sec}s") from exc
+    if ok:
+        return payload
+    raise payload
+
+
 def _as_int(value: Optional[int], default: int) -> int:
     return default if value is None else int(value)
 
@@ -433,6 +464,26 @@ def _normalize_edge_type(edge_type: str) -> EdgeType:
     return alias_map.get(normalized, "anyedge")
 
 
+def _stop_process(process: subprocess.Popen[Any]) -> None:
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+    for stream_name in ("stdin", "stdout", "stderr"):
+        stream = getattr(process, stream_name, None)
+        if stream:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+
 class RtlTraceServeSession:
     def __init__(self, bin_path: str, serve_args: List[str]):
         self.bin_path = bin_path
@@ -452,10 +503,15 @@ class RtlTraceServeSession:
             err = self.process.stderr.read() if self.process.stderr else ""
             return {"status": "error", "message": "rtl_trace serve exited", "stderr": err}
 
-        assert self.process.stdout is not None
+        if self.process.stdout is None:
+            return {"status": "error", "message": "rtl_trace serve stdout is unavailable"}
         out_lines: List[str] = []
         while True:
-            s = self.process.stdout.readline()
+            try:
+                s = _read_line_with_timeout(self.process.stdout, DEFAULT_BACKEND_READ_TIMEOUT_SEC)
+            except TimeoutError as exc:
+                self.stop()
+                return {"status": "error", "message": str(exc), "stdout": "".join(out_lines)}
             if not s:
                 err = self.process.stderr.read() if self.process.stderr else ""
                 return {
@@ -475,27 +531,19 @@ class RtlTraceServeSession:
             return {"status": "error", "message": "rtl_trace serve exited", "stderr": err}
 
         try:
-            assert self.process.stdin is not None
+            if self.process.stdin is None or self.process.stdout is None:
+                return {"status": "error", "message": "rtl_trace serve pipes are unavailable"}
             self.process.stdin.write(line + "\n")
             self.process.stdin.flush()
             return self._read_until_end()
+        except TimeoutError as e:
+            self.stop()
+            return {"status": "error", "message": str(e)}
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
     def stop(self) -> Dict[str, Any]:
-        if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-        for stream_name in ("stdin", "stdout", "stderr"):
-            stream = getattr(self.process, stream_name, None)
-            if stream:
-                try:
-                    stream.close()
-                except Exception:
-                    pass
+        _stop_process(self.process)
         return {"status": "success"}
 
 
@@ -503,22 +551,64 @@ rtl_serve_sessions: Dict[str, RtlTraceServeSession] = {}
 rtl_session_ids_by_key: Dict[Tuple[str, str], str] = {}
 
 
+def _cleanup_runtime_state() -> None:
+    with runtime_state_lock:
+        sessions = list(rtl_serve_sessions.values())
+        daemons = list(wave_daemons.values())
+        rtl_serve_sessions.clear()
+        rtl_session_ids_by_key.clear()
+        wave_daemons.clear()
+        wave_signal_cache.clear()
+        wave_signal_resolution_cache.clear()
+        wave_prefix_page_cache.clear()
+
+    for session in sessions:
+        try:
+            session.stop()
+        except Exception:
+            pass
+
+    for daemon in daemons:
+        try:
+            daemon.stop()
+        except Exception:
+            pass
+
+
+atexit.register(_cleanup_runtime_state)
+
+
+def _extract_db_path_from_serve_args(serve_args: Sequence[str]) -> Optional[str]:
+    for i, arg in enumerate(serve_args):
+        if arg == "--db" and i + 1 < len(serve_args):
+            return str(Path(serve_args[i + 1]).expanduser().resolve())
+        if arg.startswith("--db="):
+            value = arg.split("=", 1)[1]
+            if value:
+                return str(Path(value).expanduser().resolve())
+    return None
+
+
 def _get_rtl_serve_session(db_path: str, rtl_trace_bin: Optional[str] = None) -> RtlTraceServeSession:
     resolved_db = str(Path(db_path).expanduser().resolve())
     bin_path = _resolve_bin(rtl_trace_bin, DEFAULT_RTL_TRACE_BIN, "rtl_trace")
     key = (bin_path, resolved_db)
-    sid = rtl_session_ids_by_key.get(key)
-    if sid:
-        sess = rtl_serve_sessions.get(sid)
-        if sess and sess.process.poll() is None:
-            return sess
-    session_id = str(uuid.uuid4())
-    sess = RtlTraceServeSession(bin_path, ["--db", resolved_db])
-    if sess.startup.get("status") != "success":
-        raise RuntimeError(sess.startup.get("message", "failed to start rtl_trace serve"))
-    rtl_serve_sessions[session_id] = sess
-    rtl_session_ids_by_key[key] = session_id
-    return sess
+    with runtime_state_lock:
+        sid = rtl_session_ids_by_key.get(key)
+        if sid:
+            sess = rtl_serve_sessions.get(sid)
+            if sess and sess.process.poll() is None:
+                return sess
+            rtl_session_ids_by_key.pop(key, None)
+            if sid in rtl_serve_sessions:
+                rtl_serve_sessions.pop(sid, None)
+        session_id = str(uuid.uuid4())
+        sess = RtlTraceServeSession(bin_path, ["--db", resolved_db])
+        if sess.startup.get("status") != "success":
+            raise RuntimeError(sess.startup.get("message", "failed to start rtl_trace serve"))
+        rtl_serve_sessions[session_id] = sess
+        rtl_session_ids_by_key[key] = session_id
+        return sess
 
 
 def _append_trace_options(args: List[str], trace_options: Optional[TraceOptions]) -> None:
@@ -605,13 +695,26 @@ def rtl_trace_serve_start(serve_args: Optional[List[str]] = None, rtl_trace_bin:
     """
     args = serve_args or []
     bin_path = _resolve_bin(rtl_trace_bin, DEFAULT_RTL_TRACE_BIN, "rtl_trace")
-    sid = str(uuid.uuid4())
-    try:
-        session = RtlTraceServeSession(bin_path, args)
-        rtl_serve_sessions[sid] = session
-        return {"status": "success", "session_id": sid, "startup": session.startup}
-    except Exception as e:
-        return {"status": "error", "message": str(e)}
+    db_path = _extract_db_path_from_serve_args(args)
+    with runtime_state_lock:
+        if db_path is not None:
+            key = (bin_path, db_path)
+            sid = rtl_session_ids_by_key.get(key)
+            if sid:
+                sess = rtl_serve_sessions.get(sid)
+                if sess and sess.process.poll() is None:
+                    return {"status": "success", "session_id": sid, "startup": sess.startup}
+                rtl_session_ids_by_key.pop(key, None)
+                rtl_serve_sessions.pop(sid, None)
+        sid = str(uuid.uuid4())
+        try:
+            session = RtlTraceServeSession(bin_path, args)
+            rtl_serve_sessions[sid] = session
+            if db_path is not None:
+                rtl_session_ids_by_key[(bin_path, db_path)] = sid
+            return {"status": "success", "session_id": sid, "startup": session.startup}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
 
 
 @mcp.tool()
@@ -619,7 +722,8 @@ def rtl_trace_serve_query(session_id: str, command_line: str):
     """
     Send one line command to an existing rtl_trace serve session.
     """
-    sess = rtl_serve_sessions.get(session_id)
+    with runtime_state_lock:
+        sess = rtl_serve_sessions.get(session_id)
     if not sess:
         return {"status": "error", "message": f"session not found: {session_id}"}
     return sess.query(command_line)
@@ -630,12 +734,14 @@ def rtl_trace_serve_stop(session_id: str):
     """
     Stop a running rtl_trace serve session.
     """
-    sess = rtl_serve_sessions.pop(session_id, None)
+    with runtime_state_lock:
+        sess = rtl_serve_sessions.pop(session_id, None)
+        if sess:
+            for key, sid in list(rtl_session_ids_by_key.items()):
+                if sid == session_id:
+                    rtl_session_ids_by_key.pop(key, None)
     if not sess:
         return {"status": "error", "message": f"session not found: {session_id}"}
-    for key, sid in list(rtl_session_ids_by_key.items()):
-        if sid == session_id:
-            rtl_session_ids_by_key.pop(key, None)
     return sess.stop()
 
 
@@ -655,32 +761,23 @@ class WaveformDaemon:
         query_obj = {"cmd": cmd, "args": args or {}}
         query_str = json.dumps(query_obj)
         try:
-            assert self.process.stdin is not None
-            assert self.process.stdout is not None
+            if self.process.stdin is None or self.process.stdout is None:
+                return {"status": "error", "message": "wave_agent_cli daemon pipes are unavailable"}
             self.process.stdin.write(query_str + "\n")
             self.process.stdin.flush()
-            line = self.process.stdout.readline()
+            line = _read_line_with_timeout(self.process.stdout, DEFAULT_BACKEND_READ_TIMEOUT_SEC)
             if not line:
                 err = self.process.stderr.read() if self.process.stderr else ""
                 return {"status": "error", "message": f"wave_agent_cli daemon crashed: {err}"}
             return json.loads(line)
+        except TimeoutError as e:
+            self.stop()
+            return {"status": "error", "message": str(e)}
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
     def stop(self):
-        if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-        for stream_name in ("stdin", "stdout", "stderr"):
-            stream = getattr(self.process, stream_name, None)
-            if stream:
-                try:
-                    stream.close()
-                except Exception:
-                    pass
+        _stop_process(self.process)
 
 
 wave_daemons: Dict[str, WaveformDaemon] = {}
@@ -691,12 +788,18 @@ wave_prefix_page_cache: Dict[Tuple[str, str], List[str]] = {}
 
 def _get_wave_daemon(vcd_path: str, wave_cli: Optional[str] = None) -> WaveformDaemon:
     normalized = str(Path(vcd_path).expanduser().resolve())
-    if normalized not in wave_daemons:
+    with runtime_state_lock:
+        daemon = wave_daemons.get(normalized)
+        if daemon is not None and daemon.process.poll() is None:
+            return daemon
+        if daemon is not None:
+            daemon.stop()
+            wave_daemons.pop(normalized, None)
         if not os.path.exists(normalized):
             raise FileNotFoundError(f"waveform file not found: {normalized}")
         cli_path = _resolve_bin(wave_cli, DEFAULT_WAVE_CLI, "wave_agent_cli")
         wave_daemons[normalized] = WaveformDaemon(cli_path, normalized)
-    return wave_daemons[normalized]
+        return wave_daemons[normalized]
 
 
 def _wave_query(vcd_path: str, cmd: str, args: Optional[dict] = None, wave_cli_bin: Optional[str] = None) -> Dict[str, Any]:
@@ -705,7 +808,9 @@ def _wave_query(vcd_path: str, cmd: str, args: Optional[dict] = None, wave_cli_b
 
 def _get_wave_signals(vcd_path: str, wave_cli_bin: Optional[str] = None) -> List[str]:
     normalized = str(Path(vcd_path).expanduser().resolve())
-    if normalized not in wave_signal_cache:
+    with runtime_state_lock:
+        cached_signals = wave_signal_cache.get(normalized)
+    if cached_signals is None:
         if normalized.lower().endswith(".fsdb"):
             signals: List[str] = []
             cursor = ""
@@ -725,13 +830,16 @@ def _get_wave_signals(vcd_path: str, wave_cli_bin: Optional[str] = None) -> List
                 cursor = result.get("next_cursor", "")
                 if not cursor:
                     break
-            wave_signal_cache[normalized] = signals
+            with runtime_state_lock:
+                wave_signal_cache[normalized] = signals
         else:
             result = _wave_query(normalized, "list_signals", wave_cli_bin=wave_cli_bin)
             if result.get("status") != "success":
                 raise RuntimeError(result.get("message", "failed to list waveform signals"))
-            wave_signal_cache[normalized] = list(result.get("data", []))
-    return wave_signal_cache[normalized]
+            with runtime_state_lock:
+                wave_signal_cache[normalized] = list(result.get("data", []))
+    with runtime_state_lock:
+        return list(wave_signal_cache[normalized])
 
 
 def _strip_bit_suffix(path: str) -> str:
@@ -767,8 +875,10 @@ def _wave_get_signal_info(vcd_path: str, path: str, wave_cli_bin: Optional[str] 
 def _get_fsdb_signals_by_prefix(vcd_path: str, prefix: str, wave_cli_bin: Optional[str] = None) -> List[str]:
     normalized = str(Path(vcd_path).expanduser().resolve())
     cache_key = (normalized, prefix)
-    if cache_key in wave_prefix_page_cache:
-        return wave_prefix_page_cache[cache_key]
+    with runtime_state_lock:
+        cached_page = wave_prefix_page_cache.get(cache_key)
+    if cached_page is not None:
+        return list(cached_page)
 
     signals: List[str] = []
     cursor = ""
@@ -788,22 +898,25 @@ def _get_fsdb_signals_by_prefix(vcd_path: str, prefix: str, wave_cli_bin: Option
         cursor = result.get("next_cursor", "")
         if not cursor:
             break
-    wave_prefix_page_cache[cache_key] = signals
-    return signals
+    with runtime_state_lock:
+        wave_prefix_page_cache[cache_key] = signals
+        return list(signals)
 
 
 def _map_signal_to_waveform(vcd_path: str, signal: str, wave_cli_bin: Optional[str] = None) -> Optional[str]:
     normalized_wave = str(Path(vcd_path).expanduser().resolve())
     cache_key = (normalized_wave, signal)
-    if cache_key in wave_signal_resolution_cache:
-        return wave_signal_resolution_cache[cache_key]
+    with runtime_state_lock:
+        if cache_key in wave_signal_resolution_cache:
+            return wave_signal_resolution_cache[cache_key]
 
     if normalized_wave.lower().endswith(".fsdb"):
         for candidate in _normalize_top_variants(signal):
             info = _wave_get_signal_info(normalized_wave, candidate, wave_cli_bin=wave_cli_bin)
             if info is not None:
                 resolved = info.get("path", candidate)
-                wave_signal_resolution_cache[cache_key] = resolved
+                with runtime_state_lock:
+                    wave_signal_resolution_cache[cache_key] = resolved
                 return resolved
 
         candidate_variants = _normalize_top_variants(signal)
@@ -814,22 +927,27 @@ def _map_signal_to_waveform(vcd_path: str, signal: str, wave_cli_bin: Optional[s
                 exact_set = set(scoped_signals)
                 for variant in candidate_variants:
                     if variant in exact_set:
-                        wave_signal_resolution_cache[cache_key] = variant
+                        with runtime_state_lock:
+                            wave_signal_resolution_cache[cache_key] = variant
                         return variant
                 for item in scoped_signals:
                     if _strip_bit_suffix(item) in base_variants:
-                        wave_signal_resolution_cache[cache_key] = item
+                        with runtime_state_lock:
+                            wave_signal_resolution_cache[cache_key] = item
                         return item
 
-        wave_signal_resolution_cache[cache_key] = None
+        with runtime_state_lock:
+            wave_signal_resolution_cache[cache_key] = None
         return None
 
     known = set(_get_wave_signals(normalized_wave, wave_cli_bin=wave_cli_bin))
     for candidate in _normalize_top_variants(signal):
         if candidate in known:
-            wave_signal_resolution_cache[cache_key] = candidate
+            with runtime_state_lock:
+                wave_signal_resolution_cache[cache_key] = candidate
             return candidate
-    wave_signal_resolution_cache[cache_key] = None
+    with runtime_state_lock:
+        wave_signal_resolution_cache[cache_key] = None
     return None
 
 
@@ -1370,7 +1488,15 @@ def _require_waveform_path_from_session(
 
 @mcp.tool()
 def create_session(waveform_path: str, session_name: str, description: str = ""):
-    """Create a waveform-bound session that stores cursor, bookmarks, and signal groups."""
+    """Create a waveform-bound Session.
+
+    A Session is a saved waveform view for one waveform file. It stores:
+    - the current Cursor time
+    - named Bookmarks, which are saved times referenced as BM_<name>
+    - named Signal Groups, which are saved signal lists
+
+    The active Session is used when session-aware waveform tools omit vcd_path.
+    """
     try:
         payload = _load_session_payload(waveform_path, session_name)
         if payload is not None:
@@ -1383,18 +1509,20 @@ def create_session(waveform_path: str, session_name: str, description: str = "")
 
 @mcp.tool()
 def list_sessions(waveform_path: Optional[str] = None):
-    """List saved sessions, optionally filtered by waveform path."""
+    """List saved Sessions, optionally filtered by waveform path."""
     try:
-        sessions = [_session_summary(item) for item in _list_session_payloads(waveform_path)]
+        invalid_sessions: List[Dict[str, str]] = []
+        sessions = [_session_summary(item) for item in _list_session_payloads(waveform_path, diagnostics=invalid_sessions)]
+        invalid_sessions.sort(key=lambda item: item["path"])
         active = _get_active_session_ref()
-        return {"status": "success", "data": sessions, "active_session": active}
+        return {"status": "success", "data": sessions, "active_session": active, "invalid_sessions": invalid_sessions}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 
 @mcp.tool()
 def get_session(session_name: Optional[str] = None, waveform_path: Optional[str] = None):
-    """Get one session or the active/default session for a waveform."""
+    """Get one Session or resolve the active/default Session for a waveform."""
     try:
         payload = _resolve_session(waveform_path=waveform_path, session_name=session_name)
         result = dict(payload)
@@ -1407,7 +1535,7 @@ def get_session(session_name: Optional[str] = None, waveform_path: Optional[str]
 
 @mcp.tool()
 def switch_session(session_name: str, waveform_path: Optional[str] = None):
-    """Switch the active session."""
+    """Switch the active Session used by session-aware waveform tools."""
     try:
         payload = _resolve_session(waveform_path=waveform_path, session_name=session_name, create_default=False)
         active = _set_active_session_ref(payload["waveform_path"], payload["session_name"])
@@ -1418,7 +1546,7 @@ def switch_session(session_name: str, waveform_path: Optional[str] = None):
 
 @mcp.tool()
 def delete_session(session_name: str, waveform_path: Optional[str] = None):
-    """Delete a session. Default_Session is retained."""
+    """Delete a Session. Default_Session is retained for each waveform."""
     try:
         payload = _resolve_session(waveform_path=waveform_path, session_name=session_name, create_default=False)
         if payload["session_name"] == DEFAULT_SESSION_NAME:
@@ -1437,7 +1565,11 @@ def delete_session(session_name: str, waveform_path: Optional[str] = None):
 
 @mcp.tool()
 def set_cursor(time: TimeReference, waveform_path: Optional[str] = None, session_name: Optional[str] = None):
-    """Set the session cursor to an absolute time or alias."""
+    """Set the Session Cursor.
+
+    The Cursor is the current focus time for a Session. Session-aware tools can
+    refer to it by passing time="Cursor" instead of an integer timestamp.
+    """
     try:
         resolved_time, time_info, session = _resolve_time_reference(time, waveform_path=waveform_path, session_name=session_name)
         session["cursor_time"] = max(0, int(resolved_time))
@@ -1449,7 +1581,7 @@ def set_cursor(time: TimeReference, waveform_path: Optional[str] = None, session
 
 @mcp.tool()
 def move_cursor(delta: int, waveform_path: Optional[str] = None, session_name: Optional[str] = None):
-    """Move the session cursor by a signed time delta."""
+    """Move the Session Cursor by a signed time delta."""
     try:
         session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
         session["cursor_time"] = max(0, int(session["cursor_time"]) + int(delta))
@@ -1465,7 +1597,7 @@ def move_cursor(delta: int, waveform_path: Optional[str] = None, session_name: O
 
 @mcp.tool()
 def get_cursor(waveform_path: Optional[str] = None, session_name: Optional[str] = None):
-    """Get the current cursor time for a session."""
+    """Get the current Session Cursor time."""
     try:
         session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
         return _with_session_metadata(
@@ -1485,7 +1617,11 @@ def create_bookmark(
     waveform_path: Optional[str] = None,
     session_name: Optional[str] = None,
 ):
-    """Create or replace a bookmark in the selected session."""
+    """Create or replace a Bookmark in the selected Session.
+
+    A Bookmark is a named saved time. Session-aware tools can refer to it by
+    passing time="BM_<bookmark_name>" instead of an integer timestamp.
+    """
     try:
         resolved_time, time_info, session = _resolve_time_reference(time, waveform_path=waveform_path, session_name=session_name)
         key = _validate_named_entity(bookmark_name, "bookmark_name")
@@ -1498,7 +1634,7 @@ def create_bookmark(
 
 @mcp.tool()
 def delete_bookmark(bookmark_name: str, waveform_path: Optional[str] = None, session_name: Optional[str] = None):
-    """Delete a bookmark from the selected session."""
+    """Delete a Bookmark from the selected Session."""
     try:
         session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
         key = _validate_named_entity(bookmark_name, "bookmark_name")
@@ -1513,7 +1649,7 @@ def delete_bookmark(bookmark_name: str, waveform_path: Optional[str] = None, ses
 
 @mcp.tool()
 def list_bookmarks(waveform_path: Optional[str] = None, session_name: Optional[str] = None):
-    """List bookmarks for the selected session."""
+    """List Bookmarks for the selected Session."""
     try:
         session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
         bookmarks = [
@@ -1533,7 +1669,11 @@ def create_signal_group(
     waveform_path: Optional[str] = None,
     session_name: Optional[str] = None,
 ):
-    """Create or replace a named signal group in the selected session."""
+    """Create or replace a Signal Group in the selected Session.
+
+    A Signal Group is a named saved list of signals. Session-aware snapshot
+    tools can expand groups by passing signals_are_groups=True.
+    """
     try:
         session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
         key = _validate_named_entity(group_name, "group_name")
@@ -1553,7 +1693,7 @@ def update_signal_group(
     waveform_path: Optional[str] = None,
     session_name: Optional[str] = None,
 ):
-    """Update a named signal group."""
+    """Update a named Signal Group in the selected Session."""
     try:
         session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
         key = _validate_named_entity(group_name, "group_name")
@@ -1573,7 +1713,7 @@ def update_signal_group(
 
 @mcp.tool()
 def delete_signal_group(group_name: str, waveform_path: Optional[str] = None, session_name: Optional[str] = None):
-    """Delete a named signal group."""
+    """Delete a named Signal Group from the selected Session."""
     try:
         session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
         key = _validate_named_entity(group_name, "group_name")
@@ -1588,7 +1728,7 @@ def delete_signal_group(group_name: str, waveform_path: Optional[str] = None, se
 
 @mcp.tool()
 def list_signal_groups(waveform_path: Optional[str] = None, session_name: Optional[str] = None):
-    """List signal groups for the selected session."""
+    """List Signal Groups for the selected Session."""
     try:
         session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
         groups = [
@@ -1614,7 +1754,10 @@ def wave_agent_query(vcd_path: str, cmd: str, args: Optional[Dict[str, Any]] = N
 
 @mcp.tool()
 def list_signals(vcd_path: Optional[str] = None, session_name: Optional[str] = None):
-    """List all hierarchical signal paths found in the VCD file."""
+    """List all waveform signal paths.
+
+    If vcd_path is omitted, the active Session selects the waveform file.
+    """
     try:
         resolved_waveform, session = _require_waveform_path_from_session(vcd_path, session_name)
         result = wave_agent_query(resolved_waveform, "list_signals")
@@ -1625,7 +1768,7 @@ def list_signals(vcd_path: Optional[str] = None, session_name: Optional[str] = N
 
 @mcp.tool()
 def get_signal_info(vcd_path: Optional[str] = None, path: str = "", session_name: Optional[str] = None):
-    """Get metadata for a specific signal (width, type, etc.)."""
+    """Get metadata for one signal in the active or selected Session waveform."""
     try:
         resolved_waveform, session = _require_waveform_path_from_session(vcd_path, session_name)
         result = wave_agent_query(resolved_waveform, "get_signal_info", {"path": path})
@@ -1643,7 +1786,13 @@ def get_snapshot(
     signals_are_groups: bool = False,
     session_name: Optional[str] = None,
 ):
-    """Get the values of multiple signals at a specific timestamp."""
+    """Get values for multiple signals at one time.
+
+    For session-aware use:
+    - time may be an integer, "Cursor", or "BM_<bookmark_name>"
+    - signals may be Signal Group names when signals_are_groups=True
+    - if vcd_path is omitted, the active Session selects the waveform
+    """
     try:
         expanded_signals, signal_info, signal_session = _expand_signal_groups(
             signals or [],
@@ -1675,7 +1824,11 @@ def get_value_at_time(
     radix: str = "hex",
     session_name: Optional[str] = None,
 ):
-    """Get the value of a single signal at a specific timestamp."""
+    """Get one signal value at one time.
+
+    For session-aware use, time may be an integer, "Cursor", or
+    "BM_<bookmark_name>".
+    """
     try:
         resolved_time, time_info, session = _resolve_time_reference(time, waveform_path=vcd_path, session_name=session_name)
         result = wave_agent_query(
@@ -1697,7 +1850,7 @@ def find_edge(
     direction: Direction = "forward",
     session_name: Optional[str] = None,
 ):
-    """Search for the next/previous transition edge of a signal."""
+    """Search for the next or previous signal edge from a time reference."""
     try:
         edge_type = _normalize_edge_type(edge_type)
         resolved_time, time_info, session = _resolve_time_reference(start_time, waveform_path=vcd_path, session_name=session_name)
@@ -1726,7 +1879,7 @@ def find_value_intervals(
     radix: str = "hex",
     session_name: Optional[str] = None,
 ):
-    """Find all [start, end] intervals where a signal equals a target value within a time range."""
+    """Find all matching value intervals in a session-aware time range."""
     try:
         resolved_start, resolved_end, start_info, end_info, session = _resolve_time_range_reference(
             start_time,
@@ -1759,7 +1912,7 @@ def find_condition(
     direction: Direction = "forward",
     session_name: Optional[str] = None,
 ):
-    """Find the first timestamp where a logical condition is met."""
+    """Find the first timestamp where a simple condition is met."""
     try:
         resolved_time, time_info, session = _resolve_time_reference(start_time, waveform_path=vcd_path, session_name=session_name)
         result = wave_agent_query(
@@ -1785,7 +1938,7 @@ def get_transitions(
     max_limit: int = 50,
     session_name: Optional[str] = None,
 ):
-    """Get a compressed history of signal transitions within a time window."""
+    """Get a compressed transition history in a session-aware time window."""
     try:
         resolved_start, resolved_end, start_info, end_info, session = _resolve_time_range_reference(
             start_time,
@@ -1801,6 +1954,47 @@ def get_transitions(
                 "start_time": resolved_start,
                 "end_time": resolved_end,
                 "max_limit": max_limit,
+            },
+        )
+        result["resolved_time_range"] = {"start": start_info, "end": end_info}
+        return _with_session_metadata(result, session)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool()
+def get_signal_overview(
+    vcd_path: Optional[str] = None,
+    path: str = "",
+    start_time: TimeReference = 0,
+    end_time: TimeReference = 0,
+    resolution: ResolutionReference = "auto",
+    radix: str = "hex",
+    session_name: Optional[str] = None,
+):
+    """Summarize one signal over a time window using a resolution-aware overview.
+
+    For session-aware use:
+    - start_time and end_time may be integers, "Cursor", or "BM_<bookmark_name>"
+    - if vcd_path is omitted, the active Session selects the waveform
+    - resolution may be an integer or "auto"
+    """
+    try:
+        resolved_start, resolved_end, start_info, end_info, session = _resolve_time_range_reference(
+            start_time,
+            end_time,
+            waveform_path=vcd_path,
+            session_name=session_name,
+        )
+        result = wave_agent_query(
+            session["waveform_path"],
+            "get_signal_overview",
+            {
+                "path": path,
+                "start_time": resolved_start,
+                "end_time": resolved_end,
+                "resolution": resolution,
+                "radix": radix,
             },
         )
         result["resolved_time_range"] = {"start": start_info, "end": end_info}

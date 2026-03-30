@@ -290,6 +290,7 @@ These preserve the original backend command models.
 - `find_value_intervals(...)`
 - `find_condition(...)`
 - `get_transitions(...)`
+- `get_signal_overview(...)`
 - `analyze_pattern(...)`
 
 These merged waveform tools are no longer purely stateless wrappers. They first resolve session context, time aliases, and optional signal-group expansion, then delegate to the underlying `wave_agent_cli` command.
@@ -313,14 +314,16 @@ These merged waveform tools are no longer purely stateless wrappers. They first 
 - `list_signal_groups(...)`
 
 This tool group is the Python-only waveform-view layer. It is intentionally implemented in `agent_debug_automation` and not pushed into the C++ waveform backend.
-- `find_condition(...)`
-- `get_transitions(...)`
-- `analyze_pattern(...)`
 
 `get_snapshot(...)` and `get_value_at_time(...)` accept an optional `radix` for multi-bit stable values:
 - `hex` default
 - `bin`
 - `dec`
+
+`get_signal_overview(...)` also accepts:
+- session-aware `start_time` / `end_time` aliases such as `"Cursor"` and `"BM_name"`
+- integer `resolution` or `"auto"`
+- `radix` for stable multi-bit segment values
 
 ### High-level cross-link tools
 

@@ -94,6 +94,16 @@ Get a compressed history of signal flips within a time window.
 - **Query:** `{"cmd": "get_transitions", "args": {"path": "TOP.clk", "start_time": 0, "end_time": 20000, "max_limit": 10}}`
 - **Response:** Includes timestamps and values, with `glitch: true` if multiple changes occur at the same timestamp.
 
+#### 3b. `get_signal_overview`
+Get a resolution-aware overview of one signal over a time window.
+- **Query:** `{"cmd": "get_signal_overview", "args": {"path": "TOP.bus[7:0]", "start_time": 0, "end_time": 20000, "resolution": "auto", "radix": "hex"}}`
+- **Response:** returns `resolution`, `timescale`, `signal`, `width`, and ordered `segments`.
+- Single-bit stable segments use direct logic states such as `0`, `1`, `x`, `z`.
+- Single-bit dense activity uses `{"state": "flipping", "transitions": N}`.
+- Multi-bit stable segments use `{"state": "stable", "value": "h3f"}`.
+- Multi-bit dense activity uses `{"state": "flipping", "unique_values": N, "transitions": N}`.
+- `resolution` may be an integer or `"auto"`. Auto chooses a coarse enough resolution to keep the overview navigable.
+
 #### 4. `find_edge`
 Search for the next/previous transition edge.
 - **Query:** `{"cmd": "find_edge", "args": {"path": "TOP.clk", "edge_type": "posedge", "start_time": 1000}}`
@@ -182,6 +192,7 @@ Regression-style examples for previously failing FSDB queries are recorded in
 
 - `get_signal_info(vcd_path, path)`
 - `get_snapshot(vcd_path, signals, time)`
+- `get_signal_overview(vcd_path, path, start_time, end_time, resolution, radix="hex")`
 - `find_edge(vcd_path, path, edge_type, start_time, direction)`
 - `find_value_intervals(vcd_path, path, value, start_time, end_time, radix="hex")`
 - `find_condition(vcd_path, expression, start_time, direction)`
