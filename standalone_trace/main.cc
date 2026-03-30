@@ -118,6 +118,8 @@ struct SignalRecord {
 
 struct HierNodeRecord {
   std::string module;
+  std::string source_file;
+  uint32_t source_line = 0;
   std::vector<std::string> children;
 };
 
@@ -169,6 +171,15 @@ struct GraphPathRefRange {
 };
 
 struct GraphHierarchyRecord {
+  uint32_t path_str_id = std::numeric_limits<uint32_t>::max();
+  uint32_t module_str_id = std::numeric_limits<uint32_t>::max();
+  uint32_t file_str_id = std::numeric_limits<uint32_t>::max();
+  uint32_t line = 0;
+  uint32_t child_begin = 0;
+  uint32_t child_count = 0;
+};
+
+struct GraphHierarchyRecordV2 {
   uint32_t path_str_id = std::numeric_limits<uint32_t>::max();
   uint32_t module_str_id = std::numeric_limits<uint32_t>::max();
   uint32_t child_begin = 0;
@@ -279,7 +290,7 @@ constexpr char kGraphDbMagic[kGraphDbMagicSize] = {
 
 struct GraphDbFileHeader {
   char magic[kGraphDbMagicSize];
-  uint32_t version = 2;
+  uint32_t version = 3;
   uint32_t reserved = 0;
   uint64_t string_count = 0;
   uint64_t string_blob_size = 0;
@@ -393,6 +404,12 @@ struct HierOptions {
   size_t depth_limit = 8;
   size_t max_nodes = 5000;
   OutputFormat format = OutputFormat::kText;
+  bool show_source = false;
+};
+
+struct WhereInstanceOptions {
+  std::string instance;
+  OutputFormat format = OutputFormat::kText;
 };
 
 struct FindOptions {
@@ -405,6 +422,8 @@ struct FindOptions {
 struct HierTreeNode {
   std::string path;
   std::string module;
+  std::string source_file;
+  uint32_t source_line = 0;
   std::vector<HierTreeNode> children;
 };
 
@@ -415,6 +434,13 @@ struct HierRunResult {
   bool truncated = false;
   std::vector<std::string> stops;
   std::optional<HierTreeNode> tree;
+};
+
+struct WhereInstanceResult {
+  std::string instance;
+  std::string module;
+  std::string source_file;
+  uint32_t source_line = 0;
 };
 
 SymbolRefList CollectLhsSignalsFromStatement(const slang::ast::Statement &stmt);
@@ -1424,12 +1450,25 @@ void CollectTraceableSymbols(const slang::ast::RootSymbol &root,
   }
 }
 
-void CollectInstanceHierarchy(const slang::ast::RootSymbol &root, TraceDb &db) {
-  slang::flat_hash_map<std::string, std::string> modules;
+void CollectInstanceHierarchy(const slang::ast::RootSymbol &root, const slang::SourceManager &sm,
+                              TraceDb &db) {
+  struct HierInstanceInfo {
+    std::string module;
+    std::string source_file;
+    uint32_t source_line = 0;
+  };
+
+  slang::flat_hash_map<std::string, HierInstanceInfo> modules;
   modules.reserve(2000000); // Pre-allocate to prevent rehash fragmentation
   auto note_instance = [&](const slang::ast::InstanceSymbol &inst) {
-    modules.try_emplace(std::string(inst.getHierarchicalPath()),
-                        std::string(inst.getDefinition().name));
+    HierInstanceInfo info;
+    info.module = std::string(inst.getDefinition().name);
+    const auto loc = inst.getDefinition().location;
+    if (loc.valid()) {
+      info.source_file = std::string(sm.getFileName(loc));
+      info.source_line = sm.getLineNumber(loc);
+    }
+    modules.try_emplace(std::string(inst.getHierarchicalPath()), std::move(info));
   };
 
   auto visit_structural = [&](auto &self, const slang::ast::Scope &scope) -> void {
@@ -1461,9 +1500,11 @@ void CollectInstanceHierarchy(const slang::ast::RootSymbol &root, TraceDb &db) {
     visit_structural(visit_structural, top->body);
   }
 
-  for (const auto &[path, module] : modules) {
+  for (const auto &[path, info] : modules) {
     auto &node = db.hierarchy[path];
-    node.module = module;
+    node.module = info.module;
+    node.source_file = info.source_file;
+    node.source_line = info.source_line;
   }
   for (const auto &[path, _] : db.hierarchy) {
     std::string_view parent = ParentPath(path);
@@ -1790,6 +1831,9 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &key
     gh.path_str_id = intern(path);
     gh.module_str_id =
         it->second.module.empty() ? std::numeric_limits<uint32_t>::max() : intern(it->second.module);
+    gh.file_str_id =
+        it->second.source_file.empty() ? std::numeric_limits<uint32_t>::max() : intern(it->second.source_file);
+    gh.line = it->second.source_line;
     gh.child_begin = static_cast<uint32_t>(graph.hierarchy_children.size());
     gh.child_count = static_cast<uint32_t>(it->second.children.size());
     for (const std::string &child : it->second.children)
@@ -1924,7 +1968,7 @@ bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db)
   GraphDbFileHeader header;
   if (!ReadBinaryValue(in, header)) return false;
   if (std::memcmp(header.magic, kGraphDbMagic, sizeof(header.magic)) != 0) return false;
-  if (header.version != 1 && header.version != 2) return false;
+  if (header.version != 1 && header.version != 2 && header.version != 3) return false;
 
   std::vector<uint32_t> string_offsets;
   if (!ReadBinaryVector(in, string_offsets, static_cast<size_t>(header.string_count + 1))) return false;
@@ -1958,8 +2002,26 @@ bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db)
       return false;
     }
   }
-  if (!ReadBinaryVector(in, graph.hierarchy, static_cast<size_t>(header.hierarchy_count)) ||
-      !ReadBinaryVector(in, graph.hierarchy_children, static_cast<size_t>(header.hierarchy_child_count)) ||
+  if (header.version >= 3) {
+    if (!ReadBinaryVector(in, graph.hierarchy, static_cast<size_t>(header.hierarchy_count))) {
+      return false;
+    }
+  } else {
+    std::vector<GraphHierarchyRecordV2> hierarchy_v2;
+    if (!ReadBinaryVector(in, hierarchy_v2, static_cast<size_t>(header.hierarchy_count))) {
+      return false;
+    }
+    graph.hierarchy.reserve(hierarchy_v2.size());
+    for (const GraphHierarchyRecordV2 &old_rec : hierarchy_v2) {
+      GraphHierarchyRecord rec;
+      rec.path_str_id = old_rec.path_str_id;
+      rec.module_str_id = old_rec.module_str_id;
+      rec.child_begin = old_rec.child_begin;
+      rec.child_count = old_rec.child_count;
+      graph.hierarchy.push_back(rec);
+    }
+  }
+  if (!ReadBinaryVector(in, graph.hierarchy_children, static_cast<size_t>(header.hierarchy_child_count)) ||
       !ReadBinaryVector(in, graph.global_nets, static_cast<size_t>(header.global_net_count)) ||
       !ReadBinaryVector(in, graph.global_sinks, static_cast<size_t>(header.global_sink_count))) {
     return false;
@@ -1986,6 +2048,10 @@ bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db)
     const std::string &path = GraphString(graph, gh.path_str_id);
     auto &node = compat_db.hierarchy[path];
     node.module = GraphString(graph, gh.module_str_id);
+    if (header.version >= 3 && gh.file_str_id != std::numeric_limits<uint32_t>::max()) {
+      node.source_file = GraphString(graph, gh.file_str_id);
+      node.source_line = gh.line;
+    }
     node.children.reserve(gh.child_count);
     for (uint32_t i = 0; i < gh.child_count; ++i)
       node.children.push_back(GraphString(graph, graph.hierarchy_children[gh.child_begin + i]));
@@ -2591,7 +2657,9 @@ void PrintGeneralHelp() {
                "[--depth <N>] [--max-nodes <N>] [--include <regex>] [--exclude <regex>] "
                "[--stop-at <regex>] [--format <text|json>]\n";
   std::cout << "  rtl_trace hier --db <file> [--root <hier.path>] [--depth <N>] "
-               "[--max-nodes <N>] [--format <text|json>]\n";
+               "[--max-nodes <N>] [--format <text|json>] [--show-source]\n";
+  std::cout << "  rtl_trace whereis-instance --db <file> --instance <hier.path> "
+               "[--format <text|json>]\n";
   std::cout << "  rtl_trace find --db <file> --query <text|regex> [--regex] [--limit <N>] "
                "[--format <text|json>]\n";
   std::cout << "  rtl_trace serve [--db <file>]\n";
@@ -2607,7 +2675,12 @@ void PrintTraceHelp() {
 
 void PrintHierHelp() {
   std::cout << "Usage: rtl_trace hier --db <file> [--root <hier.path>] [--depth <N>] "
-               "[--max-nodes <N>] [--format <text|json>]\n";
+               "[--max-nodes <N>] [--format <text|json>] [--show-source]\n";
+}
+
+void PrintWhereInstanceHelp() {
+  std::cout << "Usage: rtl_trace whereis-instance --db <file> --instance <hier.path> "
+               "[--format <text|json>]\n";
 }
 
 void PrintFindHelp() {
@@ -2624,7 +2697,8 @@ void PrintServeHelp() {
   std::cout << "  close\n";
   std::cout << "  find --query <text> [--regex] [--limit <N>] [--format <text|json>]\n";
   std::cout << "  trace --mode <drivers|loads> --signal <hier.path> [trace options]\n";
-  std::cout << "  hier [--root <hier.path>] [--depth <N>] [--max-nodes <N>] [--format <text|json>]\n";
+  std::cout << "  hier [--root <hier.path>] [--depth <N>] [--max-nodes <N>] [--format <text|json>] [--show-source]\n";
+  std::cout << "  whereis-instance --instance <hier.path> [--format <text|json>]\n";
   std::cout << "  quit\n";
   std::cout << "\nEach response is followed by a line containing <<END>>.\n";
 }
@@ -2834,7 +2908,7 @@ int RunCompile(int argc, char *argv[]) {
   TraceDb hier_db;
   logger.Log("step: collect instance hierarchy");
   LogMem("MemBeforeCollectHierarchy");
-  CollectInstanceHierarchy(root, hier_db);
+  CollectInstanceHierarchy(root, sm, hier_db);
   LogMem("MemAfterCollectHierarchy");
 
   std::vector<PartitionRecord> parts;
@@ -2917,6 +2991,11 @@ std::string FetchSourceSlice(TraceSession &session, const EndpointRecord &e) {
   const size_t end = static_cast<size_t>(e.assignment_end);
   if (start >= text.size() || end > text.size() || end <= start) return "";
   return text.substr(start, end - start);
+}
+
+std::string ResolveHierarchySourcePath(const TraceDb &db, const HierNodeRecord &node) {
+  if (node.source_file.empty()) return "";
+  return ResolveSourcePath(db, node.source_file);
 }
 
 std::vector<std::string> InferAssignmentLhsPaths(TraceSession &session, EndpointRecord &e) {
@@ -3444,10 +3523,54 @@ ParseStatus ParseHierArgs(const std::vector<std::string> &args, std::optional<st
       opts.format = *fmt;
       continue;
     }
+    if (arg == "--show-source") {
+      opts.show_source = true;
+      continue;
+    }
     return std::cerr << "Unknown option: " << arg << "\n", ParseStatus::kError;
   }
   if (require_db && (db_path == nullptr || !db_path->has_value())) {
     return std::cerr << "Missing required args: --db\n", ParseStatus::kError;
+  }
+  return ParseStatus::kOk;
+}
+
+ParseStatus ParseWhereInstanceArgs(const std::vector<std::string> &args,
+                                   std::optional<std::string> *db_path,
+                                   WhereInstanceOptions &opts, bool require_db) {
+  opts = WhereInstanceOptions{};
+  for (size_t i = 0; i < args.size(); ++i) {
+    const std::string &arg = args[i];
+    if (arg == "-h" || arg == "--help") {
+      PrintWhereInstanceHelp();
+      return ParseStatus::kExitSuccess;
+    }
+    if (arg == "--db") {
+      if (db_path == nullptr) {
+        std::cerr << "--db is not accepted in this context\n";
+        return ParseStatus::kError;
+      }
+      if (i + 1 >= args.size()) return std::cerr << "Missing value for --db\n", ParseStatus::kError;
+      *db_path = args[++i];
+      continue;
+    }
+    if (arg == "--instance") {
+      if (i + 1 >= args.size()) return std::cerr << "Missing value for --instance\n", ParseStatus::kError;
+      opts.instance = args[++i];
+      continue;
+    }
+    if (arg == "--format") {
+      if (i + 1 >= args.size()) return std::cerr << "Missing value for --format\n", ParseStatus::kError;
+      auto fmt = ParseOutputFormat(args[++i]);
+      if (!fmt.has_value()) return std::cerr << "Invalid --format (expected text|json)\n", ParseStatus::kError;
+      opts.format = *fmt;
+      continue;
+    }
+    return std::cerr << "Unknown option: " << arg << "\n", ParseStatus::kError;
+  }
+  if ((require_db && (db_path == nullptr || !db_path->has_value())) || opts.instance.empty()) {
+    return std::cerr << "Missing required args: " << (require_db ? "--db " : "") << "--instance\n",
+           ParseStatus::kError;
   }
   return ParseStatus::kOk;
 }
@@ -3521,8 +3644,11 @@ int RunTraceWithSession(TraceSession &session, const TraceOptions &opts) {
 std::vector<std::string> HierRoots(const TraceDb &db);
 std::vector<std::string> TopHierarchySuggestions(const TraceDb &db, const std::string &needle, size_t limit);
 HierRunResult RunHierQuery(const TraceDb &db, const HierOptions &opts);
-void PrintHierText(const HierRunResult &result);
-void PrintHierJson(const HierRunResult &result);
+void PrintHierText(const TraceDb &db, const HierRunResult &result, bool show_source);
+void PrintHierJson(const TraceDb &db, const HierRunResult &result, bool show_source);
+std::optional<WhereInstanceResult> LookupWhereInstance(const TraceDb &db, const std::string &instance);
+void PrintWhereInstanceText(const TraceDb &db, const WhereInstanceResult &result);
+void PrintWhereInstanceJson(const TraceDb &db, const WhereInstanceResult &result);
 
 int RunHierWithSession(TraceSession &session, const HierOptions &opts_in) {
   EnsureSessionHierarchy(session);
@@ -3542,9 +3668,28 @@ int RunHierWithSession(TraceSession &session, const HierOptions &opts_in) {
   }
   HierRunResult result = RunHierQuery(session.db, opts);
   if (opts.format == OutputFormat::kJson) {
-    PrintHierJson(result);
+    PrintHierJson(session.db, result, opts.show_source);
   } else {
-    PrintHierText(result);
+    PrintHierText(session.db, result, opts.show_source);
+  }
+  return 0;
+}
+
+int RunWhereInstanceWithSession(TraceSession &session, const WhereInstanceOptions &opts) {
+  EnsureSessionHierarchy(session);
+  if (session.db.hierarchy.empty()) return std::cerr << "No hierarchy data in DB\n", 1;
+  std::optional<WhereInstanceResult> result = LookupWhereInstance(session.db, opts.instance);
+  if (!result.has_value()) {
+    std::cerr << "Instance not found: " << opts.instance << "\n";
+    for (const std::string &s : TopHierarchySuggestions(session.db, opts.instance, 5)) {
+      std::cerr << "  suggestion: " << s << "\n";
+    }
+    return 2;
+  }
+  if (opts.format == OutputFormat::kJson) {
+    PrintWhereInstanceJson(session.db, *result);
+  } else {
+    PrintWhereInstanceText(session.db, *result);
   }
   return 0;
 }
@@ -3733,6 +3878,8 @@ HierRunResult RunHierQuery(const TraceDb &db, const HierOptions &opts) {
     HierTreeNode node;
     node.path = path;
     node.module = it->second.module;
+    node.source_file = it->second.source_file;
+    node.source_line = it->second.source_line;
     result.node_count++;
 
     if (depth >= opts.depth_limit) {
@@ -3762,24 +3909,27 @@ HierRunResult RunHierQuery(const TraceDb &db, const HierOptions &opts) {
   return result;
 }
 
-void PrintHierTreeText(const HierTreeNode &node, size_t indent) {
+void PrintHierTreeText(const TraceDb &db, const HierTreeNode &node, size_t indent, bool show_source) {
   std::string lead(indent * 2, ' ');
   std::cout << lead << LeafName(node.path);
   if (!node.module.empty()) std::cout << " (module=" << node.module << ")";
+  if (show_source && !node.source_file.empty()) {
+    std::cout << " @ " << ResolveSourcePath(db, node.source_file) << ":" << node.source_line;
+  }
   std::cout << "\n";
   for (const auto &child : node.children) {
-    PrintHierTreeText(child, indent + 1);
+    PrintHierTreeText(db, child, indent + 1, show_source);
   }
 }
 
-void PrintHierText(const HierRunResult &result) {
+void PrintHierText(const TraceDb &db, const HierRunResult &result, bool show_source) {
   std::cout << "root: " << result.root << "\n";
   std::cout << "depth: " << result.depth_limit << "\n";
   std::cout << "nodes: " << result.node_count << "\n";
   if (result.truncated) std::cout << "truncated: true\n";
   if (result.tree.has_value()) {
     std::cout << "\n";
-    PrintHierTreeText(*result.tree, 0);
+    PrintHierTreeText(db, *result.tree, 0, show_source);
   }
   if (!result.stops.empty()) {
     std::cout << "stops: " << result.stops.size() << "\n";
@@ -3789,22 +3939,27 @@ void PrintHierText(const HierRunResult &result) {
   }
 }
 
-void PrintHierTreeJson(const HierTreeNode &node) {
+void PrintHierTreeJson(const TraceDb &db, const HierTreeNode &node, bool show_source) {
   std::cout << "{\"path\":\"" << JsonEscape(node.path) << "\",\"module\":\"" << JsonEscape(node.module)
-            << "\",\"children\":[";
+            << "\"";
+  if (show_source && !node.source_file.empty()) {
+    std::cout << ",\"source\":{\"file\":\"" << JsonEscape(ResolveSourcePath(db, node.source_file))
+              << "\",\"line\":" << node.source_line << "}";
+  }
+  std::cout << ",\"children\":[";
   for (size_t i = 0; i < node.children.size(); ++i) {
     if (i) std::cout << ",";
-    PrintHierTreeJson(node.children[i]);
+    PrintHierTreeJson(db, node.children[i], show_source);
   }
   std::cout << "]}";
 }
 
-void PrintHierJson(const HierRunResult &result) {
+void PrintHierJson(const TraceDb &db, const HierRunResult &result, bool show_source) {
   std::cout << "{\"root\":\"" << JsonEscape(result.root) << "\",\"depth_limit\":" << result.depth_limit
             << ",\"node_count\":" << result.node_count
             << ",\"truncated\":" << (result.truncated ? "true" : "false") << ",\"tree\":";
   if (result.tree.has_value()) {
-    PrintHierTreeJson(*result.tree);
+    PrintHierTreeJson(db, *result.tree, show_source);
   } else {
     std::cout << "null";
   }
@@ -3814,6 +3969,39 @@ void PrintHierJson(const HierRunResult &result) {
     std::cout << "\"" << JsonEscape(result.stops[i]) << "\"";
   }
   std::cout << "]}\n";
+}
+
+std::optional<WhereInstanceResult> LookupWhereInstance(const TraceDb &db, const std::string &instance) {
+  const auto it = db.hierarchy.find(instance);
+  if (it == db.hierarchy.end()) return std::nullopt;
+  WhereInstanceResult result;
+  result.instance = instance;
+  result.module = it->second.module;
+  result.source_file = it->second.source_file;
+  result.source_line = it->second.source_line;
+  return result;
+}
+
+void PrintWhereInstanceText(const TraceDb &db, const WhereInstanceResult &result) {
+  std::cout << "instance: " << result.instance << "\n";
+  std::cout << "module: " << result.module << "\n";
+  if (!result.source_file.empty()) {
+    std::cout << "source: " << ResolveSourcePath(db, result.source_file) << ":" << result.source_line << "\n";
+  } else {
+    std::cout << "source: <unavailable>\n";
+  }
+}
+
+void PrintWhereInstanceJson(const TraceDb &db, const WhereInstanceResult &result) {
+  std::cout << "{\"instance\":\"" << JsonEscape(result.instance) << "\",\"module\":\""
+            << JsonEscape(result.module) << "\"";
+  if (!result.source_file.empty()) {
+    std::cout << ",\"source\":{\"file\":\"" << JsonEscape(ResolveSourcePath(db, result.source_file))
+              << "\",\"line\":" << result.source_line << "}";
+  } else {
+    std::cout << ",\"source\":null";
+  }
+  std::cout << "}\n";
 }
 
 int RunHier(int argc, char *argv[]) {
@@ -3828,6 +4016,20 @@ int RunHier(int argc, char *argv[]) {
     return 1;
   }
   return RunHierWithSession(session, opts);
+}
+
+int RunWhereInstance(int argc, char *argv[]) {
+  std::optional<std::string> db_path;
+  WhereInstanceOptions opts;
+  ParseStatus status = ParseWhereInstanceArgs(ArgvToVector(argc, argv), &db_path, opts, true);
+  if (status == ParseStatus::kExitSuccess) return 0;
+  if (status == ParseStatus::kError) return 1;
+  TraceSession session;
+  if (!OpenTraceSession(*db_path, session, kSessionHierarchy)) {
+    std::cerr << "Failed to read DB: " << *db_path << "\n";
+    return 1;
+  }
+  return RunWhereInstanceWithSession(session, opts);
 }
 
 int RunFind(int argc, char *argv[]) {
@@ -3924,6 +4126,8 @@ int RunServe(int argc, char *argv[]) {
         PrintFindHelp();
       } else if (args[0] == "hier") {
         PrintHierHelp();
+      } else if (args[0] == "whereis-instance") {
+        PrintWhereInstanceHelp();
       } else if (args[0] == "serve") {
         PrintServeHelp();
       } else {
@@ -4021,6 +4225,13 @@ int RunServe(int argc, char *argv[]) {
       finish_response();
       continue;
     }
+    if (cmd == "whereis-instance") {
+      WhereInstanceOptions opts;
+      ParseStatus status = ParseWhereInstanceArgs(args, nullptr, opts, false);
+      if (status == ParseStatus::kOk) (void)RunWhereInstanceWithSession(*session, opts);
+      finish_response();
+      continue;
+    }
 
     std::cerr << "Unknown command: " << cmd << "\n";
     finish_response();
@@ -4049,6 +4260,9 @@ int main(int argc, char *argv[]) {
   }
   if (subcmd == "hier") {
     return RunHier(argc - 2, argv + 2);
+  }
+  if (subcmd == "whereis-instance") {
+    return RunWhereInstance(argc - 2, argv + 2);
   }
   if (subcmd == "find") {
     return RunFind(argc - 2, argv + 2);

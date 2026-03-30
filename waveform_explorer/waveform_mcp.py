@@ -40,14 +40,23 @@ def get_daemon(vcd_path: str) -> WaveformDaemon:
         return daemons[vcd_path]
 
 @mcp.tool()
-def list_signals(vcd_path: str):
-    """List all waveform signal paths for one concrete waveform file.
+def list_signals(vcd_path: str, pattern: str = "", types: Optional[List[str]] = None):
+    """List waveform signal paths for one concrete waveform file.
 
     This standalone MCP is stateless. It does not support Sessions, Cursor,
     Bookmarks, or Signal Groups.
+
+    Default behavior lists only signals declared in the top module.
+    Pass `pattern="*"` to enumerate the full waveform namespace, or use a
+    hierarchy-aware wildcard such as `top.u_axi.ar_*` to narrow the result.
+    `types` may include any combination of `input`, `output`, `inout`,
+    `net`, and `register`.
     """
     try:
-        return get_daemon(vcd_path).query("list_signals")
+        return get_daemon(vcd_path).query("list_signals", {
+            "pattern": pattern,
+            "types": list(types or []),
+        })
     except Exception as e:
         return {"status": "error", "message": str(e)}
 

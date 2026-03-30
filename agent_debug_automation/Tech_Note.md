@@ -164,7 +164,7 @@ Behavior:
 - try exact path match and `TOP.` variants first
 - for FSDB, if exact lookup fails, page only the relevant hierarchy prefixes using `list_signals_page`
 - support bit-select to bus fallback by comparing base signal names without the bracket suffix
-- for VCD/FST, fall back to the full `list_signals` path cache
+- for VCD/FST, fall back to the full `list_signals(pattern="*")` path cache because the user-facing default now limits `list_signals` to top-module signals
 
 This avoids enumerating the entire FSDB namespace for common cases.
 
@@ -282,7 +282,7 @@ These preserve the original backend command models.
 
 `wave_agent_cli` side:
 - `wave_agent_query(...)`
-- `list_signals(...)`
+- `list_signals(pattern="", types=None, ...)`
 - `get_signal_info(...)`
 - `get_snapshot(...)`
 - `get_value_at_time(...)`

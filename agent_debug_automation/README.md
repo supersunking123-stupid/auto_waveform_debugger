@@ -97,7 +97,7 @@ These keep the original `rtl_trace` command model unchanged.
 ### `waveform_explorer` passthrough
 
 - `wave_agent_query(vcd_path, cmd, args=None, wave_cli_bin=None)`
-- `list_signals(vcd_path)`
+- `list_signals(vcd_path=None, pattern="", types=None, session_name=None)`
 - `get_signal_info(vcd_path, path)`
 - `get_snapshot(vcd_path=None, signals, time, radix="hex", signals_are_groups=False, session_name=None)`
 - `get_value_at_time(vcd_path=None, path, time, radix="hex", session_name=None)`
@@ -111,6 +111,7 @@ These keep the original `rtl_trace` command model unchanged.
 Waveform semantics stay aligned with `wave_agent_cli`. In particular, backward edge search now resolves the last matching edge at or before `T`, including an edge exactly at `T`.
 For multi-bit value queries, `radix` may be `hex`, `bin`, or `dec`; the default is `hex`.
 `get_signal_overview` provides a zoomed-out, resolution-aware summary of one signal and also accepts `resolution="auto"` for an overview capped to a manageable number of segments.
+`list_signals` now defaults to top-module-only output. Pass `pattern="*"` for the full namespace, a narrower wildcard such as `top.nvdla_top.nvdla_core2cvsram_ar_*`, and optionally `types=["input","output","net"]` to filter by signal category.
 
 ### Session tools
 
@@ -196,7 +197,7 @@ Cross-link tools also accept session time aliases, so `time` may be an integer, 
 - Structural-to-waveform path normalization only auto-handles a leading `TOP.`.
 - For FSDB, the mapper first tries exact `get_signal_info` lookups.
 - If exact lookup fails, FSDB falls back to prefix-scoped `list_signals_page` queries instead of enumerating the full waveform namespace.
-- VCD and FST keep the original `list_signals` behavior.
+- Internal VCD/FST mapping still requests `list_signals(pattern="*")` so cross-link path resolution keeps full visibility even though the user-facing default is now top-module-only.
 
 ### Time windows
 

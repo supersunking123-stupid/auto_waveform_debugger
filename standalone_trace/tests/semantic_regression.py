@@ -57,6 +57,18 @@ def assert_invalid_arg(rtl_trace, args, expected_fragment):
         )
 
 
+def run_json_cmd(cmd, cwd=None, expect=0):
+    proc = run_cmd(cmd, cwd=cwd, expect=expect)
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(f"Invalid JSON output for command {' '.join(cmd)}: {proc.stdout}") from exc
+
+
+def normalize_reported_path(path_str):
+    return str(Path(path_str).resolve())
+
+
 def main():
     ap = argparse.ArgumentParser(description="Standalone trace semantic regression suite")
     ap.add_argument("--rtl-trace", required=True, help="Path to rtl_trace binary")
@@ -224,6 +236,73 @@ def main():
             ["find", "--db", str(db), "--query", "semantic_top.hit", "--limit", "bad"],
             "Invalid --limit: bad",
         )
+
+        # 9) hierarchy query can optionally expose definition source locations
+        hier_with_source = run_json_cmd(
+            [
+                str(rtl_trace),
+                "hier",
+                "--db",
+                str(db),
+                "--root",
+                "semantic_top.u_cons",
+                "--depth",
+                "0",
+                "--format",
+                "json",
+                "--show-source",
+            ]
+        )
+        tree = hier_with_source.get("tree", {})
+        if tree.get("module") != "consumer":
+            raise AssertionError(f"unexpected hier module info: {hier_with_source}")
+        source = tree.get("source")
+        if (
+            source is None
+            or normalize_reported_path(source.get("file", "")) != str(fixture)
+            or source.get("line") != 15
+        ):
+            raise AssertionError(f"unexpected hier source info: {hier_with_source}")
+
+        hier_without_source = run_json_cmd(
+            [
+                str(rtl_trace),
+                "hier",
+                "--db",
+                str(db),
+                "--root",
+                "semantic_top.u_cons",
+                "--depth",
+                "0",
+                "--format",
+                "json",
+            ]
+        )
+        if "source" in hier_without_source.get("tree", {}):
+            raise AssertionError(f"hier should omit source unless requested: {hier_without_source}")
+
+        # 10) whereis-instance provides quick module/source lookup for one instance
+        whereis = run_json_cmd(
+            [
+                str(rtl_trace),
+                "whereis-instance",
+                "--db",
+                str(db),
+                "--instance",
+                "semantic_top.u_cons",
+                "--format",
+                "json",
+            ]
+        )
+        if whereis.get("module") != "consumer":
+            raise AssertionError(f"unexpected whereis module info: {whereis}")
+        whereis_source = whereis.get("source")
+        if (
+            whereis_source is None
+            or normalize_reported_path(whereis_source.get("file", "")) != str(fixture)
+            or whereis_source.get("line") != 15
+        ):
+            raise AssertionError(f"unexpected whereis source info: {whereis}")
 
         print("semantic_regression: PASS")
     finally:

@@ -49,6 +49,8 @@ rtl_trace(args=["trace", "--db", "rtl_trace.db", "--mode", "drivers", "--signal"
 rtl_trace(args=["trace", "--db", "rtl_trace.db", "--mode", "loads", "--signal", "top.u0.bus[7:4]", "--format", "json"])
 rtl_trace(args=["find", "--db", "rtl_trace.db", "--query", "foo.bar"])
 rtl_trace(args=["hier", "--db", "rtl_trace.db", "--root", "top.u0", "--depth", "2", "--format", "json"])
+rtl_trace(args=["hier", "--db", "rtl_trace.db", "--root", "top.u0", "--depth", "0", "--format", "json", "--show-source"])
+rtl_trace(args=["whereis-instance", "--db", "rtl_trace.db", "--instance", "top.u0", "--format", "json"])
 ```
 
 Supported subcommands:
@@ -58,6 +60,7 @@ compile
 trace
 find
 hier
+whereis-instance
 ```
 
 Important note:
@@ -136,7 +139,7 @@ Browse the structural instance hierarchy.
 Typical form:
 
 ```text
-rtl_trace hier --db <db_path> [--root <hier.path>] [--depth N] [--max-nodes N] [--format text|json]
+rtl_trace hier --db <db_path> [--root <hier.path>] [--depth N] [--max-nodes N] [--format text|json] [--show-source]
 ```
 
 Common flags:
@@ -145,6 +148,29 @@ Common flags:
 - `--depth <N>`
 - `--max-nodes <N>`
 - `--format text|json`
+- `--show-source`
+
+`--show-source` is optional and off by default. When present, `hier` also emits the instantiated module definition file and line when that source metadata is available in the DB.
+
+#### `whereis_instance` / `whereis-instance`
+
+Quick lookup for one hierarchy node.
+
+CLI form:
+
+```text
+rtl_trace whereis-instance --db <db_path> --instance <hier.path> [--format text|json]
+```
+
+Common flags:
+- `--db <db_path>`
+- `--instance <hier.path>`
+- `--format text|json`
+
+Behavior:
+- returns the instance path
+- returns the instantiated module type
+- returns the module definition source file and line when available in the DB
 
 #### Serve mode tools
 
@@ -163,6 +189,7 @@ rtl_trace_serve_start(serve_args=["--db", "rtl_trace.db"])
 rtl_trace_serve_query(session_id="<sid>", command_line="find --query timeout --limit 5")
 rtl_trace_serve_query(session_id="<sid>", command_line="trace --mode drivers --signal top.u0.sig --format json")
 rtl_trace_serve_query(session_id="<sid>", command_line="hier --root top.u0 --depth 2")
+rtl_trace_serve_query(session_id="<sid>", command_line="whereis-instance --instance top.u0 --format json")
 rtl_trace_serve_stop(session_id="<sid>")
 ```
 
@@ -170,7 +197,7 @@ rtl_trace_serve_stop(session_id="<sid>")
 
 ```python
 wave_agent_query(vcd_path: str, cmd: str, args: Optional[Dict[str, Any]] = None, wave_cli_bin: Optional[str] = None)
-list_signals(vcd_path: Optional[str] = None, session_name: Optional[str] = None)
+list_signals(vcd_path: Optional[str] = None, pattern: str = "", types: Optional[List[str]] = None, session_name: Optional[str] = None)
 get_signal_info(vcd_path: Optional[str] = None, path: str = "", session_name: Optional[str] = None)
 get_snapshot(vcd_path: Optional[str] = None, signals: Optional[List[str]] = None, time: TimeReference = 0, radix: str = "hex", signals_are_groups: bool = False, session_name: Optional[str] = None)
 get_value_at_time(vcd_path: Optional[str] = None, path: str = "", time: TimeReference = 0, radix: str = "hex", session_name: Optional[str] = None)
@@ -181,6 +208,17 @@ get_transitions(vcd_path: Optional[str] = None, path: str = "", start_time: Time
 get_signal_overview(vcd_path: Optional[str] = None, path: str = "", start_time: TimeReference = 0, end_time: TimeReference = 0, resolution: ResolutionReference = "auto", radix: str = "hex", session_name: Optional[str] = None)
 analyze_pattern(vcd_path: Optional[str] = None, path: str = "", start_time: TimeReference = 0, end_time: TimeReference = 0, session_name: Optional[str] = None)
 ```
+
+`list_signals(...)` options:
+- `pattern`
+  - Default `""`: list only signals declared directly in the top module.
+  - `"*"`: list the full waveform namespace.
+  - Hierarchical wildcard such as `"top.nvdla_top.nvdla_core2cvsram_ar_*"`: narrow by path prefix/pattern.
+  - `"regex:<expr>"`: use a raw regular expression instead of glob-style matching.
+- `types`
+  - Optional list of signal categories used as an OR filter.
+  - Supported values: `input`, `output`, `inout`, `net`, `register`.
+  - Example: `types=["input", "net"]` returns both input ports and net-style signals.
 
 ### Session tools
 
@@ -282,7 +320,7 @@ explain_edge_cause(
 Source: [`waveform_explorer/waveform_mcp.py`](/home/qsun/AI_PROJ/auto_waveform_debugger/waveform_explorer/waveform_mcp.py)
 
 ```python
-list_signals(vcd_path: str)
+list_signals(vcd_path: str, pattern: str = "", types: Optional[List[str]] = None)
 get_signal_info(vcd_path: str, path: str)
 get_snapshot(vcd_path: str, signals: List[str], time: int, radix: str = "hex")
 get_value_at_time(vcd_path: str, path: str, time: int, radix: str = "hex")
@@ -294,9 +332,19 @@ get_signal_overview(vcd_path: str, path: str, start_time: int, end_time: int, re
 analyze_pattern(vcd_path: str, path: str, start_time: int, end_time: int)
 ```
 
+`list_signals(...)` options are the same here:
+- `pattern=""` means top-module-only output.
+- `pattern="*"` means full-namespace output.
+- wildcard forms such as `"top.u_axi.ar_*"` narrow by hierarchy/path.
+- `pattern="regex:<expr>"` enables regex matching.
+- `types` accepts any combination of `input`, `output`, `inout`, `net`, and `register`.
+
 ## Quick Examples
 
 ```python
+list_signals(vcd_path="wave.fsdb")
+list_signals(vcd_path="wave.fsdb", pattern="top.nvdla_top.nvdla_core2cvsram_ar_*", types=["net"])
+list_signals(vcd_path="wave.fsdb", pattern="*", types=["input", "output"])
 get_snapshot(vcd_path="wave.fsdb", signals=["top.a", "top.b"], time=100, radix="hex")
 get_value_at_time(vcd_path="wave.fsdb", path="top.addr", time=100, radix="dec")
 find_value_intervals(vcd_path="wave.fsdb", path="top.rid", value="d8", start_time=307050000, end_time=327970000, radix="dec")

@@ -833,7 +833,7 @@ def _get_wave_signals(vcd_path: str, wave_cli_bin: Optional[str] = None) -> List
             with runtime_state_lock:
                 wave_signal_cache[normalized] = signals
         else:
-            result = _wave_query(normalized, "list_signals", wave_cli_bin=wave_cli_bin)
+            result = _wave_query(normalized, "list_signals", {"pattern": "*"}, wave_cli_bin=wave_cli_bin)
             if result.get("status") != "success":
                 raise RuntimeError(result.get("message", "failed to list waveform signals"))
             with runtime_state_lock:
@@ -1753,14 +1753,28 @@ def wave_agent_query(vcd_path: str, cmd: str, args: Optional[Dict[str, Any]] = N
 
 
 @mcp.tool()
-def list_signals(vcd_path: Optional[str] = None, session_name: Optional[str] = None):
-    """List all waveform signal paths.
+def list_signals(
+    vcd_path: Optional[str] = None,
+    pattern: str = "",
+    types: Optional[List[str]] = None,
+    session_name: Optional[str] = None,
+):
+    """List waveform signal paths.
 
     If vcd_path is omitted, the active Session selects the waveform file.
+    Default behavior lists only signals declared in the waveform's top module.
+    Pass `pattern="*"` to enumerate the full namespace, or a narrower
+    wildcard such as `top.nvdla_top.nvdla_core2cvsram_ar_*`.
+    `types` may include any combination of `input`, `output`, `inout`,
+    `net`, and `register`.
     """
     try:
         resolved_waveform, session = _require_waveform_path_from_session(vcd_path, session_name)
-        result = wave_agent_query(resolved_waveform, "list_signals")
+        result = wave_agent_query(
+            resolved_waveform,
+            "list_signals",
+            {"pattern": pattern, "types": list(types or [])},
+        )
         return _with_session_metadata(result, session)
     except Exception as e:
         return {"status": "error", "message": str(e)}

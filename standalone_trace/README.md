@@ -39,7 +39,8 @@ build/rtl_trace trace --db rtl_trace.db --mode drivers --signal top.u0.sig[3] \
   [--cone-level N] [--prefer-port-hop] [--depth N] [--max-nodes N] [--include RE] [--exclude RE] [--stop-at RE] [--format text|json]
 build/rtl_trace trace --db rtl_trace.db --mode loads --signal top.u0.sig[7:4] \
   [--cone-level N] [--prefer-port-hop] [--depth N] [--max-nodes N] [--include RE] [--exclude RE] [--stop-at RE] [--format text|json]
-build/rtl_trace hier --db rtl_trace.db [--root top.u0] [--depth N] [--max-nodes N] [--format text|json]
+build/rtl_trace hier --db rtl_trace.db [--root top.u0] [--depth N] [--max-nodes N] [--format text|json] [--show-source]
+build/rtl_trace whereis-instance --db rtl_trace.db --instance top.u0 [--format text|json]
 build/rtl_trace find --db rtl_trace.db --query "foo.bar" [--regex] [--limit N] [--format text|json]
 build/rtl_trace serve [--db rtl_trace.db]
 ```
@@ -55,7 +56,7 @@ Notes:
 - `compile --compile-log <file>` writes key compile-stage steps and partition information into a log file while still printing to the console. During DB generation it also records `save_graph_db` sub-step timings such as `build_graph` and `write_file`.
 - The `trace` phase only queries the DB and does not parse RTL again.
 - The current DB format is a binary graph DB.
-- The current graph DB file version is `v2`.
+- The current graph DB file version is `v3`.
 - The old V7 / V8 text DB format is no longer supported. Re-run `compile` to generate the current graph DB.
 - If you previously generated an old graph DB (`v1`), you also need to re-run `compile`, because the new version persists assignment-LHS reverse references to accelerate `drivers` queries on interface members.
 - `serve` is intended for interactive debugging on large designs: the DB is loaded once, and later `find` / `trace` / `hier` commands reuse the resident session.
@@ -75,10 +76,12 @@ Additional `trace` output details:
   - `lhs <hierarchical_path>` (LHS signal list)
 - `--format json`: output includes `summary`, `endpoints`, and `stops`, which is convenient for agents / scripts.
 - Bit-select queries are supported: `--signal top.sig[3]`, `--signal top.sig[7:4]`.
-- `hier`: prints the instance hierarchy tree (supports `--root`, `--depth`, `--max-nodes`, `--format json`).
+- `hier`: prints the instance hierarchy tree (supports `--root`, `--depth`, `--max-nodes`, `--format json`, `--show-source`).
+- `hier --show-source`: also prints the instantiated module definition file and line when available in the DB.
+- `whereis-instance`: quick lookup for one hierarchy node; prints the instance path, module type, and definition source location when available.
 - `--cone-level N`: automatic logic-cone expansion depth (default 1; `drivers` walks backward along RHS, `loads` walks forward along LHS).
 - `--prefer-port-hop`: when the hit is a port-binding expression and there is no expandable RHS / LHS, prefer continuing the trace across the port bridge.
-- `serve`: starts the interactive backend. Commands are entered one line at a time, and each response ends with `<<END>>`.
+- `serve`: starts the interactive backend. Commands are entered one line at a time, and each response ends with `<<END>>`. Interactive mode supports `whereis-instance` too.
 
 ## TODO
 
@@ -86,7 +89,7 @@ Additional `trace` output details:
 
 ## Automated Semantic Regression
 
-The project includes CTest semantic regression cases covering cross-port tracing, `loads` context LHS, bit filtering, depth / node stops, `find` suggestions, and incremental cache hits:
+The project includes CTest semantic regression cases covering cross-port tracing, `loads` context LHS, bit filtering, depth / node stops, `find` suggestions, incremental cache hits, optional hierarchy-source reporting, and `whereis-instance` lookup:
 
 ```bash
 cd standalone_trace

@@ -83,6 +83,45 @@ b0011 "
 b0100 "
 """
 
+SIGNAL_LIST_FIXTURE_VCD = """$date
+  today
+$end
+$version
+  signal list fixture
+$end
+$timescale 1ns $end
+$scope module TOP $end
+$scope module top $end
+$var input 1 ! clk $end
+$var output 1 " done $end
+$var reg 8 # data[7:0] $end
+$var wire 1 $ ready $end
+$var inout 1 % bidir $end
+$scope module u_axi $end
+$var wire 1 & nvdla_core2cvsram_ar_valid $end
+$var wire 32 ' nvdla_core2cvsram_ar_addr[31:0] $end
+$var reg 1 ( inner_reg $end
+$upscope $end
+$scope module u_other $end
+$var wire 1 ) other_sig $end
+$upscope $end
+$upscope $end
+$upscope $end
+$enddefinitions $end
+#0
+$dumpvars
+0!
+0"
+b00000000 #
+0$
+z%
+0&
+b00000000000000000000000000000000 '
+0(
+0)
+$end
+"""
+
 
 @unittest.skipUnless(CLI.exists(), "wave_agent_cli not built")
 class SignalOverviewCliTests(unittest.TestCase):
@@ -204,6 +243,62 @@ $enddefinitions $end
             result = json.loads(completed.stdout)
             self.assertEqual(result["status"], "error")
             self.assertIn("Failed to load waveform file", result["message"])
+
+
+@unittest.skipUnless(CLI.exists(), "wave_agent_cli not built")
+class SignalListingCliTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temp_dir = tempfile.TemporaryDirectory()
+        cls.vcd_path = Path(cls.temp_dir.name) / "signal_list_fixture.vcd"
+        cls.vcd_path.write_text(SIGNAL_LIST_FIXTURE_VCD, encoding="ascii")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temp_dir.cleanup()
+
+    def _query(self, pattern="", types=None):
+        query = {"cmd": "list_signals", "args": {"pattern": pattern, "types": types or []}}
+        completed = subprocess.run(
+            [str(CLI), str(self.vcd_path), json.dumps(query)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return json.loads(completed.stdout)
+
+    def test_list_signals_defaults_to_top_module_only(self):
+        result = self._query()
+
+        self.assertEqual(result["status"], "success")
+        self.assertTrue(result["top_module_only"])
+        self.assertEqual(result["data"], [
+            "top.bidir",
+            "top.clk",
+            "top.data[7:0]",
+            "top.done",
+            "top.ready",
+        ])
+
+    def test_list_signals_supports_hierarchical_wildcard_patterns(self):
+        result = self._query(pattern="top.u_axi.nvdla_core2cvsram_ar_*")
+
+        self.assertEqual(result["status"], "success")
+        self.assertFalse(result["top_module_only"])
+        self.assertEqual(result["data"], [
+            "top.u_axi.nvdla_core2cvsram_ar_addr[31:0]",
+            "top.u_axi.nvdla_core2cvsram_ar_valid",
+        ])
+
+    def test_list_signals_supports_multiple_type_filters(self):
+        result = self._query(pattern="*", types=["input", "register"])
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["data"], [
+            "top.clk",
+            "top.data[7:0]",
+            "top.u_axi.inner_reg",
+        ])
 
 
 if __name__ == "__main__":

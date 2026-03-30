@@ -63,15 +63,21 @@ to the uniquely matching packed-vector signal when possible.
 ### Supported Commands
 
 #### 1. `list_signals`
-List all hierarchical signal paths found in the waveform file.
+List waveform signal paths with optional hierarchy and type filtering.
 - **Query:** `{"cmd": "list_signals"}`
-- **Response:** `{"status": "success", "data": ["TOP.clk", "TOP.dut.rst_n", ...]}`
+- **Default behavior:** returns only signals declared directly in the top module.
+- **Full namespace:** pass `{"cmd": "list_signals", "args": {"pattern": "*"}}`
+- **Hierarchy wildcard:** pass `{"cmd": "list_signals", "args": {"pattern": "top.nvdla_top.nvdla_core2cvsram_ar_*"}}`
+- **Type filter:** pass `{"cmd": "list_signals", "args": {"pattern": "*", "types": ["input", "output", "net"]}}`
+- **Response:** includes `data`, `pattern`, `types`, and `top_module_only`.
+- `types` may include any combination of `input`, `output`, `inout`, `net`, and `register`.
+- For advanced matching, `pattern` also accepts `regex:<expr>`.
 
 #### 1b. `list_signals_page` (FSDB only)
 List hierarchical signal paths in a paged, prefix-filtered way for large FSDB waveforms.
 - **Query:** `{"cmd": "list_signals_page", "args": {"prefix": "top.mem0_", "cursor": "", "limit": 200}}`
 - **Response:** includes `data`, `has_more`, and `next_cursor`.
-- `list_signals` remains unchanged for all formats.
+- `list_signals` now defaults to top-module-only output.
 - `list_signals_page` is intended for large FSDB designs to avoid massive one-shot JSON payloads.
 
 #### 2. `get_snapshot`
@@ -187,7 +193,7 @@ Regression-style examples for previously failing FSDB queries are recorded in
 `/home/qsun/AI_PROJ/auto_waveform_debugger/failure_history.md`.
 
 ### Exposed Tools
-- `list_signals(vcd_path)`
+- `list_signals(vcd_path, pattern="", types=None)`
 ...
 
 - `get_signal_info(vcd_path, path)`

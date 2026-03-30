@@ -56,11 +56,9 @@ json dispatch_query(AgentAPI& api, WaveDatabase& db, const json& q) {
     } else if (cmd == "analyze_pattern") {
         response = api.analyze_pattern(args.value("path", ""), args.value("start_time", 0ULL), args.value("end_time", 0ULL));
     } else if (cmd == "list_signals") {
-        json signals = json::array();
-        for (const auto& pair : db.get_all_signals()) {
-            signals.push_back(pair.first);
-        }
-        response = {{"status", "success"}, {"data", signals}};
+        response = api.list_signals(
+            args.value("pattern", ""),
+            args.value("types", std::vector<std::string>()));
     } else {
         response = {{"status", "error"}, {"message", "Unknown command: " + cmd}};
     }

@@ -209,7 +209,11 @@ Purpose:
 
 Important constraint:
 - `list_signals_page` is FSDB-only by design
-- `list_signals` remains the old full dump path
+- `list_signals` is now the filtered user-facing path:
+  - default scope is top-module signals only
+  - `pattern="*"` requests the full namespace
+  - wildcard patterns such as `top.u_axi.ar_*` narrow the result
+  - `types=["input","net"]` filters by normalized signal category
 
 ### 7. JSON query semantics in `AgentAPI`
 

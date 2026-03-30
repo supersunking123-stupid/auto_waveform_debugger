@@ -45,6 +45,8 @@ Files:
   - load-side assignment context and LHS propagation
   - bit/range query filtering
   - traversal controls such as `--depth` and `--max-nodes`
+  - `hier --show-source` hierarchy source-location reporting
+  - `whereis-instance` module/source lookup
   - `find` typo suggestions
   - incremental compile cache hit behavior
   - invalid numeric CLI argument handling
@@ -80,6 +82,9 @@ Files:
 - [waveform_explorer/tests/test_signal_overview.py](/home/qsun/AI_PROJ/auto_waveform_debugger/waveform_explorer/tests/test_signal_overview.py)
   CLI-oriented regression suite for `wave_agent_cli`.
   Covers:
+  - `list_signals` default top-module-only behavior
+  - `list_signals` hierarchy wildcard filtering
+  - `list_signals` multi-type filtering
   - single-bit overview segmentation
   - multi-bit overview segmentation
   - auto-resolution behavior
@@ -110,12 +115,14 @@ Files:
   - default session creation
   - cursor / bookmark alias resolution
   - signal-group expansion
+  - `list_signals` pattern and type forwarding through the MCP layer
   - session persistence across module reload
   - cross-link time alias handling
   - session-aware `get_signal_overview`
   - auto-resolution plumbing through the MCP layer
   - concurrent reuse of keyed `rtl_trace serve` sessions
   - concurrent reuse of waveform daemons
+  - non-FSDB full-namespace fallback for internal waveform mapping
   - trace / explain / snapshot cross-link flows
   - optional real NVDLA FSDB integration workflow
 

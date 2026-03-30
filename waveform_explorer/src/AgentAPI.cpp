@@ -5,8 +5,9 @@
 #include <cstdint>
 #include <limits>
 #include <map>
-#include <sstream>
+#include <regex>
 #include <set>
+#include <sstream>
 
 AgentAPI::AgentAPI(WaveDatabase& db) : db(db) {}
 
@@ -53,6 +54,121 @@ std::string normalize_radix(const std::string& radix) {
     if (normalized == "bin" || normalized == "binary" || normalized == "2") return "bin";
     if (normalized == "dec" || normalized == "decimal" || normalized == "10") return "dec";
     return "hex";
+}
+
+std::string lowercase_copy(const std::string& value) {
+    std::string lowered;
+    lowered.reserve(value.size());
+    for (char ch : value) {
+        lowered.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+    }
+    return lowered;
+}
+
+std::string glob_to_regex(const std::string& pattern) {
+    std::string regex = "^";
+    regex.reserve(pattern.size() * 2 + 2);
+    for (char ch : pattern) {
+        switch (ch) {
+            case '*':
+                regex += ".*";
+                break;
+            case '?':
+                regex += '.';
+                break;
+            case '.':
+            case '^':
+            case '$':
+            case '|':
+            case '(':
+            case ')':
+            case '[':
+            case ']':
+            case '{':
+            case '}':
+            case '+':
+            case '\\':
+                regex.push_back('\\');
+                regex.push_back(ch);
+                break;
+            default:
+                regex.push_back(ch);
+                break;
+        }
+    }
+    regex += "$";
+    return regex;
+}
+
+bool is_top_module_signal_path(const std::string& path) {
+    const size_t first_dot = path.find('.');
+    if (first_dot == std::string::npos) {
+        return true;
+    }
+    return path.find('.', first_dot + 1) == std::string::npos;
+}
+
+std::string canonical_signal_type(const std::string& raw_type) {
+    const std::string lowered = lowercase_copy(raw_type);
+    if (lowered == "input") return "input";
+    if (lowered == "output") return "output";
+    if (lowered == "inout") return "inout";
+    if (lowered == "reg" || lowered == "register") return "register";
+    if (lowered == "wire" || lowered == "net" || lowered == "tri" || lowered == "tri0" ||
+        lowered == "tri1" || lowered == "wand" || lowered == "wor" ||
+        lowered == "supply0" || lowered == "supply1") {
+        return "net";
+    }
+    return lowered;
+}
+
+bool signal_matches_types(const SignalInfo& info, const std::set<std::string>& allowed_types) {
+    if (allowed_types.empty()) {
+        return true;
+    }
+    return allowed_types.find(canonical_signal_type(info.type)) != allowed_types.end();
+}
+
+json build_signal_type_filter(const std::vector<std::string>& requested_types, std::set<std::string>& allowed_types) {
+    static const std::set<std::string> kSupported = {
+        "input",
+        "output",
+        "inout",
+        "net",
+        "register",
+    };
+
+    for (const auto& raw_type : requested_types) {
+        const std::string canonical = canonical_signal_type(raw_type);
+        if (kSupported.find(canonical) == kSupported.end()) {
+            return {
+                {"status", "error"},
+                {"message", "Unsupported signal type filter: " + raw_type},
+            };
+        }
+        allowed_types.insert(canonical);
+    }
+    return {{"status", "success"}};
+}
+
+json build_path_matcher(const std::string& pattern, std::regex& matcher) {
+    if (pattern.empty() || pattern == "*") {
+        return {{"status", "success"}};
+    }
+
+    try {
+        if (pattern.rfind("regex:", 0) == 0) {
+            matcher = std::regex(pattern.substr(6));
+        } else {
+            matcher = std::regex(glob_to_regex(pattern));
+        }
+    } catch (const std::regex_error& e) {
+        return {
+            {"status", "error"},
+            {"message", std::string("Invalid signal pattern: ") + e.what()},
+        };
+    }
+    return {{"status", "success"}};
 }
 
 std::string normalize_multibit_bits(const std::string& value, uint32_t width) {
@@ -673,6 +789,47 @@ json AgentAPI::get_signal_info(const std::string& signal_path) {
             {"type", info.type},
             {"timescale", db.get_timescale()}
         }}
+    };
+}
+
+json AgentAPI::list_signals(const std::string& pattern, const std::vector<std::string>& types) {
+    std::set<std::string> allowed_types;
+    json type_filter = build_signal_type_filter(types, allowed_types);
+    if (type_filter.value("status", "error") != "success") {
+        return type_filter;
+    }
+
+    std::regex matcher;
+    const bool has_pattern = !pattern.empty() && pattern != "*";
+    json path_filter = build_path_matcher(pattern, matcher);
+    if (path_filter.value("status", "error") != "success") {
+        return path_filter;
+    }
+
+    const bool top_only = pattern.empty();
+    std::vector<std::string> signals;
+    signals.reserve(db.get_all_signals().size());
+    for (const auto& entry : db.get_all_signals()) {
+        const SignalInfo& info = entry.second;
+        if (top_only && !is_top_module_signal_path(info.path)) {
+            continue;
+        }
+        if (has_pattern && !std::regex_match(info.path, matcher)) {
+            continue;
+        }
+        if (!signal_matches_types(info, allowed_types)) {
+            continue;
+        }
+        signals.push_back(info.path);
+    }
+
+    std::sort(signals.begin(), signals.end());
+    return {
+        {"status", "success"},
+        {"data", signals},
+        {"pattern", pattern.empty() ? "" : pattern},
+        {"types", types},
+        {"top_module_only", top_only},
     };
 }
 

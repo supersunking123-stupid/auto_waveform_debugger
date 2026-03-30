@@ -203,6 +203,26 @@ class CrossLinkingTests(unittest.TestCase):
         self.assertIn("timer_tb.timeout", result["data"])
         self.assertIn("timer_tb.clk", result["data"])
 
+    def test_list_signals_forwards_pattern_and_types(self):
+        calls = []
+
+        def fake_wave_agent_query(vcd_path, cmd, args=None, wave_cli_bin=None):
+            calls.append((cmd, dict(args or {})))
+            return {"status": "success", "data": ["top.clk"]}
+
+        with mock.patch.object(mcp_mod, "wave_agent_query", side_effect=fake_wave_agent_query):
+            result = mcp_mod.list_signals(
+                vcd_path=self.overview_waveform_path,
+                pattern="top.u_axi.ar_*",
+                types=["input", "net"],
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(calls, [("list_signals", {
+            "pattern": "top.u_axi.ar_*",
+            "types": ["input", "net"],
+        })])
+
     def test_session_state_persists_across_reload(self):
         created = mcp_mod.create_session(
             waveform_path=self.waveform_path,
@@ -356,6 +376,19 @@ class CrossLinkingTests(unittest.TestCase):
         self.assertEqual(len(created), 1)
         self.assertIs(daemons[0], daemons[1])
         self.assertEqual(len(mcp_mod.wave_daemons), 1)
+
+    def test_non_fsdb_signal_cache_requests_full_namespace(self):
+        calls = []
+
+        def fake_wave_query(vcd_path, cmd, args=None, wave_cli_bin=None):
+            calls.append((cmd, dict(args or {})))
+            return {"status": "success", "data": ["top.clk", "top.done"]}
+
+        with mock.patch.object(mcp_mod, "_wave_query", side_effect=fake_wave_query):
+            signals = mcp_mod._get_wave_signals("/tmp/mock.vcd")
+
+        self.assertEqual(signals, ["top.clk", "top.done"])
+        self.assertEqual(calls, [("list_signals", {"pattern": "*"})])
 
     def test_trace_with_snapshot(self):
         result = mcp_mod.trace_with_snapshot(
