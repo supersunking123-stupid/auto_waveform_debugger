@@ -1,0 +1,33 @@
+# Build outputs
+standalone_trace/build/
+waveform_explorer/build/
+standalone_trace/slang_*.log
+standalone_trace/slang_mem_profile*.log
+
+# VCS simulation artifacts (generated per test case)
+test_cases/**/csrc/
+test_cases/**/simv
+test_cases/**/simv.daidir/
+test_cases/**/vcs.log
+test_cases/**/rtl/
+test_cases/**/*.db
+test_cases/**/*.db.meta
+test_cases/rtl_trace.db.meta
+
+# standalone_trace build artifacts
+standalone_trace/third_party/bak/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Agent session store
+agent_debug_automation/.session_store/
+
+# MCP config (machine-specific)
+.mcp.json
+
+# Misc
+conversation.log
