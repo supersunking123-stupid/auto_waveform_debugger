@@ -1,6 +1,11 @@
 cmake_minimum_required(VERSION 3.14)
 project(wave_agent_cli)
 
+# Default to Release for -O3 -DNDEBUG unless explicitly overridden.
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(ENABLE_FSDB "Enable FSDB support via Verdi FsdbReader SDK" ON)
