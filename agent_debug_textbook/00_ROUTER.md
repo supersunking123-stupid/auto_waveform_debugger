@@ -1,6 +1,15 @@
 # Agent Playbook Router
 
-This document helps you decide **which playbook to follow** based on your current task. Read the task descriptions below, pick the best match, and follow that playbook. If your task spans multiple categories, chain the playbooks in the order listed.
+## Mandatory pre-flight — complete before any tool call
+
+This is not background reading. Work through this checklist first.
+
+- [ ] **1. Confirm the `EDA_for_agent` MCP server is available.** If it is not in your tool list, report this and stop — do not attempt RTL debugging without it.
+- [ ] **2. Check the waveform time precision.** Call `get_signal_info` on any signal in the waveform and record the time unit. All time arguments must be converted to that unit before use (Rule 12).
+- [ ] **3. Identify your task type** using the table below and open the matching playbook.
+- [ ] **4. Follow that playbook as a step-by-step procedure.** Do not skip steps. Do not substitute source-code reading for a tool call.
+
+If at any point two consecutive tool results are empty or nonsensical, stop and apply the "When results are untrustworthy" protocol below before continuing.
 
 ---
 
@@ -58,6 +67,36 @@ Quick reference of which tools belong to which playbook. **Only use the tools li
 - **`TraceMode`** is `"drivers"` or `"loads"`.
 - If `vcd_path` is omitted in a session-aware tool, the active Session's waveform is used.
 - If no session exists yet, a `Default_Session` is created on first session-aware use.
+- **Time values are in units of the waveform's time precision — not nanoseconds.** Before passing any integer time to any tool, call `get_signal_info` on any signal and check the reported timescale. For the common `` `timescale 1ns/1ps `` setup, precision is 1 ps, so 100 ns must be passed as `100000`. Guessing the wrong unit silently queries the wrong time. See Rule 12 in `rtl_debug_guide.md` for the full explanation.
+
+---
+
+## When results are empty or untrustworthy — stop, do not guess
+
+If two or more consecutive tool calls return empty results, zero transitions, or values that contradict each other, **halt the current line of investigation before making another call**. Do not fill the gap with assumptions and continue as if the results were valid — a wrong assumption propagated through subsequent calls creates a false narrative that is harder to undo than the original problem.
+
+Immediate actions:
+1. Re-check the time precision (`get_signal_info`) — the most common cause of empty waveform results is a unit error (Rule 12).
+2. Verify the signal path exists (`list_signals`, `rtl_trace find`).
+3. Confirm the time range has simulation data (`get_signal_overview` with a wide range).
+
+If two recovery attempts fail, stop and report: state what was called, what was returned, and why it is suspicious. See Rule 13 in `rtl_debug_guide.md` for the full stop-trigger table and protocol.
+
+---
+
+## When a tool fails
+
+MCP tool failures are expected from time to time (wrong path, stale DB, signal name mismatch). The correct response is to **report and recover**, not to abandon the MCP layer.
+
+| Symptom | First recovery step |
+|---|---|
+| `DB not found` | Compile the structural DB: `rtl_trace(args=["compile", ...])` |
+| `Signal not found in waveform` | Use `rtl_trace find` to get the DB path; use `list_signals` to check the waveform namespace |
+| `Waveform file not found` | Verify the path and extension (`.vcd`, `.fsdb`, `.fst`) |
+| `Timeout` on `rtl_trace(...)` | Switch to serve mode: `rtl_trace_serve_start/query/stop` |
+| Empty or truncated result | Try `--format json` and/or reduce `--depth` / `--max-nodes` |
+
+**If a tool still fails after one targeted recovery attempt:** report the tool name, arguments, and full error message, then continue with other MCP tools rather than falling back to manual source reading. See Rule 10 in `rtl_debug_guide.md` for the full protocol.
 
 ---
 

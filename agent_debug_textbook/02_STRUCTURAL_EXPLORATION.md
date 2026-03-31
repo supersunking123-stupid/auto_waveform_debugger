@@ -12,8 +12,9 @@
 |---|---|
 | `rtl_trace` (compile) | Build the structural database from RTL source files |
 | `rtl_trace` (find) | Search for signals by name or pattern |
-| `rtl_trace` (hier) | Browse the instance hierarchy |
+| `rtl_trace` (hier) | Browse the instance hierarchy; `--show-source` annotates each node with its RTL definition file and line |
 | `rtl_trace` (trace) | Trace structural drivers or loads of a signal |
+| `rtl_trace` (whereis-instance) | Quick lookup: given one instance path, return its module type and RTL source file/line |
 | `rtl_trace_serve_start` | Start a persistent serve session for multiple queries |
 | `rtl_trace_serve_query` | Send a query to a running serve session |
 | `rtl_trace_serve_stop` | Stop a serve session |
@@ -45,6 +46,14 @@ What do you need to know?
 │
 ├─ "What instances exist under module X?"
 │   └─ rtl_trace(args=["hier", "--db", "rtl_trace.db", "--root", "top.x", "--depth", "2"])
+│
+├─ "What instances exist AND which source files define them?"
+│   └─ rtl_trace(args=["hier", "--db", "rtl_trace.db", "--root", "top.x", "--depth", "2",
+│                       "--show-source", "--format", "json"])
+│
+├─ "Which source file defines instance top.x.u_foo? What module is it?"
+│   └─ rtl_trace(args=["whereis-instance", "--db", "rtl_trace.db",
+│                       "--instance", "top.x.u_foo", "--format", "json"])
 │
 ├─ "Does a signal named 'foo' exist? Where?"
 │   └─ rtl_trace(args=["find", "--db", "rtl_trace.db", "--query", "foo"])
@@ -89,6 +98,47 @@ rtl_trace(args=["trace", "--db", "rtl_trace.db", "--mode", "drivers",
                 "--signal", "top.u0.data_in", "--prefer-port-hop", "--depth", "5"])
 ```
 
+### Sequence E — Jump to the RTL source of a suspicious instance
+
+When a trace or hierarchy browse identifies an instance you want to examine at the source level:
+
+```python
+rtl_trace(args=["whereis-instance", "--db", "rtl_trace.db",
+                "--instance", "top.u_dma.u_fifo", "--format", "json"])
+```
+
+The result includes:
+- `instance` — the full hierarchical path
+- `module` — the module type name
+- `file` — absolute path to the `.sv`/`.v` file where the module is defined
+- `line` — the line number of the module declaration
+
+Read that file to understand the RTL logic directly, without searching the directory tree.
+
+### Sequence F — Collect source files for a targeted local test
+
+When you need to build a filelist for a local simulation (see `EDA_USE.md`), use `hier --show-source` to extract all source files for a subtree in one call, rather than hunting manually:
+
+```python
+# 1. Dump the subtree with source annotations
+rtl_trace(args=["hier", "--db", "rtl_trace.db",
+                "--root", "top.u_dma", "--depth", "10",
+                "--show-source", "--format", "json"])
+```
+
+The JSON result contains a `source_file` field for each node. Collect the unique values — those are the RTL files you need. Then write them to `files.f`:
+
+```
+# files.f (assembled from hier --show-source output)
+/path/to/rtl/dma_top.sv
+/path/to/rtl/dma_engine.sv
+/path/to/rtl/fifo.sv
+/path/to/rtl/arbiter.sv
+tb_top.sv
+```
+
+**Important:** `hier --show-source` returns the definition file for each *module*, not the instance. If multiple instances share the same module (e.g., three `fifo` instances), the file appears once per instance in the output but you only need to include it once in the filelist. Deduplicate before writing `files.f`.
+
 ### Sequence D — Multi-query session (serve mode)
 
 When you need to run many queries against the same database, use serve mode to avoid repeated startup costs:
@@ -96,8 +146,9 @@ When you need to run many queries against the same database, use serve mode to a
 1. `rtl_trace_serve_start(serve_args=["--db", "rtl_trace.db"])` — returns a `session_id`.
 2. `rtl_trace_serve_query(session_id="<sid>", command_line="find --query timeout --limit 5")`
 3. `rtl_trace_serve_query(session_id="<sid>", command_line="trace --mode drivers --signal top.u0.timeout --format json")`
-4. `rtl_trace_serve_query(session_id="<sid>", command_line="hier --root top.u0 --depth 2")`
-5. `rtl_trace_serve_stop(session_id="<sid>")` — always clean up.
+4. `rtl_trace_serve_query(session_id="<sid>", command_line="hier --root top.u0 --depth 2 --show-source")`
+5. `rtl_trace_serve_query(session_id="<sid>", command_line="whereis-instance --instance top.u0.u_fifo --format json")`
+6. `rtl_trace_serve_stop(session_id="<sid>")` — always clean up.
 
 **Rules for serve mode:**
 - Always stop the session when you are done.
@@ -123,3 +174,5 @@ When you need to run many queries against the same database, use serve mode to a
 - `--cone-level N` in trace mode controls how many levels of combinational logic to expand. Use it to control granularity.
 - `find` with `--regex` enables regular expression matching for complex signal name patterns.
 - If `compile` fails, check the error log (`--compile-log compile.log`) before retrying with different flags.
+- **`whereis-instance` vs `hier --show-source`:** use `whereis-instance` for a single known instance (fast point lookup); use `hier --show-source` when you need source files for an entire subtree (filelist generation or design-wide review).
+- `--show-source` output may omit the `source_file` field for instances whose module definition was not resolved during compilation (e.g., black-boxed IP). Handle missing fields gracefully when parsing the JSON.

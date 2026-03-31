@@ -10,7 +10,7 @@
 
 | Tool | Purpose |
 |---|---|
-| `list_signals` | Discover what signals exist in the waveform |
+| `list_signals` | Discover what signals exist in the waveform; filter by hierarchy pattern and/or signal type to avoid context explosion on large designs |
 | `get_signal_info` | Get metadata about a signal (width, type, scope) |
 | `get_snapshot` | Read multiple signal values at one point in time |
 | `get_value_at_time` | Read a single signal's value at one point in time |
@@ -29,7 +29,15 @@
 What do you need to know?
 │
 ├─ "What signals exist?"
-│   └─ list_signals(vcd_path=...)
+│   ├─ Top-level only (safe default)
+│   │   └─ list_signals()                              ← pattern="" returns top module only
+│   ├─ Narrow by hierarchy
+│   │   └─ list_signals(pattern="top.u_fifo.*")        ← glob prefix
+│   │   └─ list_signals(pattern="regex:.*_valid$")     ← regex
+│   ├─ Narrow by signal type
+│   │   └─ list_signals(pattern="top.u_axi.*", types=["input","output"])
+│   └─ Full namespace (⚠ large designs: do NOT use without a pattern)
+│       └─ list_signals(pattern="*")
 │
 ├─ "What is signal X? (width, type)"
 │   └─ get_signal_info(path="top.x")
@@ -61,11 +69,16 @@ What do you need to know?
 
 ### Sequence A — Explore an unfamiliar waveform
 
-1. `list_signals(vcd_path="wave.fsdb")` — see what's available.
-2. Pick signals of interest.
-3. `get_signal_info(path="top.interesting_sig")` — check width/type.
-4. `get_signal_overview(path="top.interesting_sig", start_time=0, end_time=100000, resolution="auto")` — get the big picture.
-5. Zoom into interesting regions with `get_transitions(...)` or `get_snapshot(...)`.
+1. `list_signals()` — see the top-level signals (safe starting point; does not dump the full namespace).
+2. **Check the time precision before using any time argument** — call `get_signal_info` on any signal and read the reported timescale. Every time value you pass to any tool must be in units of the precision (the second number of the `` `timescale `` directive). See Rule 12 in `rtl_debug_guide.md` for the full conversion table.
+   ```python
+   get_signal_info(path="top.clk")   # read the timescale field from the result
+   ```
+3. Drill into the module of interest: `list_signals(pattern="top.u_interesting.*")` — see only that subtree.
+4. Narrow further if still too many results: add `types=["input","output"]` to see only interface signals.
+5. `get_signal_info(path="top.u_interesting.sig")` — check width/type of a specific signal.
+6. `get_signal_overview(path="top.u_interesting.sig", start_time=0, end_time=100000, resolution="auto")` — get the big picture. (Use time values already converted to the correct precision.)
+7. Zoom into interesting regions with `get_transitions(...)` or `get_snapshot(...)`.
 
 ### Sequence B — Check a bus at a specific time
 
@@ -87,8 +100,20 @@ What do you need to know?
 
 ## Tips
 
+- **Always check the waveform time precision with `get_signal_info` before your first time-based query.** Waveform timestamps are in units of the `` `timescale `` precision (the second number). The most common setup is `` `timescale 1ns/1ps ``, which means precision is 1 ps — passing `100` when you mean 100 ns will query time 100 ps instead, 1000× too early. See Rule 12 in `rtl_debug_guide.md`.
 - Use `radix="hex"` for buses, `radix="bin"` for control signals where individual bits matter, `radix="dec"` for counters or arithmetic.
 - `get_snapshot` with a signal group is efficient: create a group via Session Management, then call `get_snapshot(signals=["MyGroup"], signals_are_groups=True)`.
 - `find_condition` accepts compound Boolean expressions — use it instead of chaining multiple `find_edge` calls.
 - `max_limit` in `get_transitions` defaults to 50. Increase it only if you truly need more; large results are harder to reason about.
 - Prefer `get_signal_overview` over `get_transitions` when you need a big-picture view of a long time range.
+
+### `list_signals` — avoiding context explosion
+
+On real chip waveforms (FSDB from gate-level or large RTL sims), the full signal namespace can contain tens of thousands of entries. Dumping it unfiltered will fill your context window and leave no room for analysis.
+
+**Rules:**
+- **Never call `list_signals(pattern="*")` without a narrowing `pattern` on a large or unknown design.** If you don't yet know the size, start with the default (`pattern=""`) and judge the result count before widening.
+- **Use `pattern` to scope to a module subtree** before listing. Example: `list_signals(pattern="top.u_dma.*")` returns only signals under `u_dma`.
+- **Use `types` to filter to interface signals** when you only need to know what a module exposes. Example: `types=["input","output"]` shows only ports, skipping all internal nets and registers.
+- **Combine both** for maximum precision: `list_signals(pattern="top.u_axi.*", types=["output","net"])`.
+- `pattern="regex:<expr>"` accepts a raw regular expression for cases where glob prefix is too coarse. Example: `pattern="regex:.*_valid$"` finds all `*_valid` signals anywhere in the hierarchy.

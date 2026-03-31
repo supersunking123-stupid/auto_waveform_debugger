@@ -94,9 +94,9 @@ This playbook draws from all other playbooks. The tools are organized by the pha
 
 ---
 
-### Phase 3 — Explain causation
+### Phase 3 — Explain causation layer by layer
 
-**Goal:** Confirm *which* suspect actually caused the failure and *how*.
+**Goal:** Build a complete causal chain from symptom to root cause by descending the driver cone one level at a time. **Do not stop as soon as you find a signal that looks wrong. Every wrong signal must be traced further until you reach an actual root cause.**
 
 ```
 3.1  For the top suspect, explain the causal chain:
@@ -108,24 +108,39 @@ This playbook draws from all other playbooks. The tools are organized by the pha
            direction="backward"
        )
 
-3.2  If the cause is a signal deeper in the hierarchy, repeat:
-     → explain_edge_cause(
+3.2  Inspect every RHS driver returned in the result:
+     a. Check the waveform value of each driver at the failure time.
+     b. If a driver value is correct: the fault is in the logic between
+        that driver and the signal above it — record this and stop this branch.
+     c. If a driver value is also wrong: it is now the new signal of interest.
+        Repeat step 3.1 on it, using the time at which it was wrong.
+
+     → explain_signal_at_time(
            db_path="rtl_trace.db",
-           signal=<the identified cause signal>,
-           time=<when it changed>,
-           direction="backward"
+           signal=<wrong_driver>,
+           time=<time_it_was_wrong>
        )
 
-3.3  Continue until you reach a root cause:
-     - A primary input or testbench stimulus
-     - A register whose value was set in a previous cycle
-     - A state machine in an unexpected state
+3.3  Repeat 3.2 on every wrong driver, one layer at a time, until EVERY branch
+     of the cone terminates at one of these stop criteria:
+     - A primary input or testbench stimulus that is provably wrong
+     - A register whose stored value was loaded incorrectly in a prior cycle
+       (go back to that cycle and repeat Phase 3 from there)
+     - A combinational expression where all inputs are correct but the
+       operator, bit-select, or polarity is wrong by design
+     - A CDC crossing with a missing or broken synchronizer
 
-3.4  Bookmark the root cause:
-     → create_bookmark(bookmark_name="root_cause", time=T_root)
+     ⚠ A state machine in an unexpected state is NOT a root cause by itself.
+       Ask: "Why did it enter that state?" and continue tracing.
+
+3.4  Bookmark each key causal point as you confirm it:
+     → create_bookmark(bookmark_name="cause_L1", time=T_cause1, description="...")
+     → create_bookmark(bookmark_name="root_cause", time=T_root, description="...")
 ```
 
-**Output of Phase 3:** You have a causal chain from root cause to symptom, with bookmarks at key points.
+**Common mistake:** Finding that `signal B is 0 when it should be 1` and immediately concluding "the logic driving B is the bug — let me fix it." B's driver may itself be driven by a wrong signal. Check B's drivers before touching any code.
+
+**Output of Phase 3:** A complete causal chain, with every link supported by waveform evidence, ending at a root cause that satisfies one of the stop criteria above.
 
 ---
 
@@ -142,6 +157,12 @@ This playbook draws from all other playbooks. The tools are organized by the pha
      → rtl_trace(args=["trace", "--db", "rtl_trace.db", "--mode", "drivers",
                         "--signal", root_cause_signal, "--format", "json"])
      → rtl_trace(args=["hier", "--db", "rtl_trace.db", "--root", <relevant_module>])
+
+     To read the RTL source of the guilty instance directly:
+     → rtl_trace(args=["whereis-instance", "--db", "rtl_trace.db",
+                        "--instance", <instance_path>, "--format", "json"])
+     The result gives you the exact source file and line — read it to confirm
+     the structural bug (wrong bit-select, missing condition, inverted polarity).
 
 4.3  If you need to check whether the bug occurred elsewhere in the simulation:
      → find_condition(expression=<bug_condition>, start_time=0, direction="forward")

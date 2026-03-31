@@ -15,7 +15,8 @@ Before touching any waveform, understand what you are looking at.
 1. **Read the failure description.** Extract the failing signal, the time of failure, the test name, and any error or assertion message. If the description is vague ("test hangs", "output mismatch"), your first job is to make it concrete.
 2. **Understand the design context.** Use structural exploration (`hier`, `find`) to understand the module hierarchy around the failure point. You do not need to understand the entire chip — just the neighborhood of the symptom.
 3. **Identify the clock domain(s).** Determine which clock drives the failing logic. If multiple clock domains are nearby, note the boundaries immediately — they will matter later.
-4. **Set up your workspace.** Create a session, bookmark the failure time, and create a signal group for the signals mentioned in the failure. This is your anchor; you will always be able to return here.
+4. **Determine the waveform time precision. Do this before passing any time value to any tool.** Call `get_signal_info` on any signal in the waveform and read the timescale it reports. The waveform timestamps are in units of the *precision* — the second number in the `` `timescale `` directive. See Rule 12 for the full explanation and conversion procedure.
+5. **Set up your workspace.** Create a session, bookmark the failure time, and create a signal group for the signals mentioned in the failure. This is your anchor; you will always be able to return here.
 
 **Do not start tracing signals until Phase 0 is complete.** Agents that skip orientation waste time chasing irrelevant signals.
 
@@ -163,7 +164,11 @@ When the waveform contradicts your mental model of the design, **trust the wavef
 
 If you find yourself rationalizing why the waveform "must be wrong," you are probably on the wrong track. Re-examine your assumptions.
 
-### Rule 8 — Limit your trace depth to stay effective
+### Rule 8 — Limit your trace depth to stay effective — but not your investigation depth
+
+Deep cone traces produce overwhelming results. Use constraints to keep individual trace calls actionable. **But do not confuse limiting a single trace call with stopping the investigation early.** Limiting trace depth controls how much structural output you receive per call; it does not mean you stop probing once you find the first unexpected value. After receiving a shallow trace result, you are expected to follow each suspicious driver further until you reach the true root cause.
+
+See also Rule 11 — the two rules work together: Rule 8 keeps individual calls manageable; Rule 11 ensures you keep going layer by layer.
 
 Deep cone traces produce overwhelming results. Use constraints to keep traces actionable:
 
@@ -171,6 +176,8 @@ Deep cone traces produce overwhelming results. Use constraints to keep traces ac
 - Use `stop_at="clk|reset"` to prevent tracing through clock tree and reset logic (these are almost never the root cause in functional bugs).
 - Use `include` and `exclude` regex filters to focus on the relevant module.
 - If `rank_cone_by_time` returns more than ~15 signals, narrow the window or increase the depth constraint before analyzing the results.
+
+**Important:** `depth` limits a single trace call, not the investigation. After you consume a shallow result, you call the tool again on the next suspect. Keep calling until Rule 11's stop criteria are met.
 
 ### Rule 9 — Normalize values when cross-referencing between sources
 
@@ -189,6 +196,147 @@ Waveform signals, simulation logs, VIP messages, and specification documents fre
 1. When you first cross-reference a log entry against a waveform value, explicitly check whether the source uses a different base, offset, or convention. Do this once and record the mapping.
 2. If a value appears to be "off by one" between two sources, suspect a 0-based/1-based convention mismatch before suspecting a real bug.
 3. When using `find_value_intervals` or `find_condition` to search for a value mentioned in a log, apply the normalization first. For example, if the log says `length=8` and you know the VIP is 1-based, search for `awlen == 7` on the waveform, not `awlen == 8`.
+
+### Rule 10 — Report MCP tool failures — never silently fall back to source reading
+
+When an MCP tool call returns an error or an unexpected empty result, **stop and report the failure immediately**. Do not silently switch to reading source files as a substitute. The MCP tools are the primary debugging interface — they exist because raw source reading does not scale to real designs and lacks the temporal evidence that waveform tools provide.
+
+**What to do when a tool fails:**
+
+1. Read the error message carefully. Many failures are fixable in one attempt:
+   - `DB not found` or `compile error` → the structural DB has not been compiled yet; run `rtl_trace compile`.
+   - `Signal not found in waveform` → the path format differs between the structural DB and the waveform; use `rtl_trace find` to locate the signal's exact DB path, and `list_signals` to check the waveform namespace.
+   - `Waveform file not found` → verify the path and extension (`.vcd`, `.fsdb`, `.fst`).
+   - `Timeout` → try `rtl_trace_serve_start/query/stop` instead of the one-shot wrapper, which has a default timeout.
+2. Make at most **one or two targeted recovery attempts**. If the tool still fails, do not continue guessing.
+3. **Report the failure explicitly**: state the tool you called, the exact arguments, and the full error message. This feedback directly improves the toolkit.
+4. Continue the investigation using other available MCP tools — structural-only tools if waveform tools fail, or waveform-only tools if the DB is unavailable. Do not abandon the MCP layer entirely.
+
+**What never to do:**
+- **NEVER open a `.v` or `.sv` source file to trace a signal or understand connectivity.** Source reading is not a fallback for a failed tool call — it is a different activity (code review) that bypasses all simulation evidence. The correct fallback for a failed `explain_signal_at_time` is to report the failure and try `trace_with_snapshot` or `rtl_trace trace`, not to open the file. Source reading is only permitted after MCP tools have identified the guilty instance and you need to read its logic to confirm the bug.
+- Do not suppress or paraphrase error messages — report them verbatim.
+- Do not retry the identical failing call more than twice without changing something.
+
+---
+
+### Rule 11 — Trace the driver cone layer by layer — do not stop at the first wrong signal
+
+Finding a signal with an unexpected value is not the root cause. It is the next signal to investigate. Every driver of that signal must be checked, and if any driver is also wrong, its drivers must be checked in turn. **The investigation continues until you reach a signal whose wrong value can be fully explained by a concrete design flaw, wrong primary input, or a register that was incorrectly loaded in a prior cycle.**
+
+**The correct loop:**
+
+```
+1. Signal X has an unexpected value at time T.
+2. Call explain_signal_at_time (or trace_with_snapshot) on X.
+3. Inspect every RHS term in X's driver cone:
+   a. Check the waveform value of each driver at time T.
+   b. For each driver whose value is also unexpected → it becomes the new X. Go to step 2.
+   c. For each driver whose value is correct → the bug is in the logic connecting
+      that driver to X, not in the driver itself.
+4. Repeat until every branch of the cone terminates at a root cause (see stop criteria).
+```
+
+**Stop criteria — you have reached the root cause when:**
+- A driver is a primary input or testbench stimulus that is provably wrong.
+- A driver is a register whose stored value was loaded incorrectly in a *previous* cycle (go to that cycle and repeat from step 1).
+- A driver is driven by correct inputs but the combinational logic that connects them to the output is wrong by design (wrong operator, wrong bit-select, inverted condition, etc.).
+- A driver is properly connected to a clock-domain crossing but the synchronizer is missing or broken.
+
+**Common mistake to avoid:**
+
+> Signal Y is 0 when it should be 1. Y is assigned `Y = A & B`. A is 1, B is 0.
+> ❌ Wrong: "B is the problem — fix whatever drives B."
+> ✓ Right: "B is 0 unexpectedly. Now trace B's drivers. Is B's value wrong because of its own driver, or because of an earlier register?"
+
+Do not patch Y's driver to work around a wrong B. If B has its own wrong driver, that driver has its own wrong driver, and so on. Only fixing the actual root leaves the design correct everywhere, not just at the symptom site.
+
+**Practical guidance:**
+- Call `explain_signal_at_time` once per cone level, using the previous result to identify which driver to investigate next.
+- Use `trace_with_snapshot` with `clock_path` and `cycle_offsets=[-3,-2,-1,0]` to observe how values evolve across multiple cycles — this often reveals exactly which cycle and which layer the error first appeared.
+- Use `rank_cone_by_time` to prioritize which branch to descend first when a cone has many drivers.
+- A shallow `depth=3` trace on each layer is cleaner than one overwhelming deep trace. Call multiple times rather than widening depth until the output is unreadable.
+
+---
+
+### Rule 12 — Determine the waveform time precision before using any time argument
+
+Waveform timestamps are integers, but their unit depends on the `` `timescale `` directive used during simulation — specifically the **precision** (the second number). If you pass a time value without knowing the precision, you will silently query the wrong time and get results that look plausible but are completely wrong.
+
+**How `` `timescale `` works:**
+
+```
+`timescale <time_unit> / <time_precision>
+```
+
+- `time_unit` — the unit for delay statements in RTL (e.g., `#10` means 10 ns).
+- `time_precision` — the smallest representable time step. **This is the unit of every timestamp in the waveform.**
+
+| `` `timescale `` | Time precision | To express 100 ns, pass… |
+|---|---|---|
+| `1ns/1ns` | 1 ns | `100` |
+| `1ns/1ps` | 1 ps | `100000` |
+| `1ns/100fs` | 100 fs | `1000000` |
+| `1ps/1ps` | 1 ps | `100000` |
+
+**How to determine the precision:**
+
+Call `get_signal_info` on any signal before making your first time-based query:
+
+```python
+get_signal_info(path="top.clk")
+```
+
+Read the `timescale` or `time_unit` field in the result. That field tells you what one waveform timestamp integer represents.
+
+You can also verify by calling `analyze_pattern` on the clock and comparing the reported period against the known clock frequency:
+
+```python
+analyze_pattern(path="top.clk", start_time=0, end_time=10000000)
+# If the reported period is 10000 and you know the clock is 100 MHz (10 ns period),
+# then 10000 units = 10 ns → 1 unit = 1 ps → precision is 1 ps.
+```
+
+**Rules:**
+
+1. **Always call `get_signal_info` on a signal before your first time-based query in any new waveform.** Do this even if you think you know the timescale.
+2. **Convert all time values before passing them.** If a failure report says "error at 150 ns" and precision is 1 ps, pass `150000`, not `150`.
+3. **Do not assume 1 ns precision.** The most common simulation setup is `` `timescale 1ns/1ps ``, which means precision is 1 ps. Assuming 1 ns will put you off by 1000×.
+4. **Record the precision in your first session bookmark description** so you do not need to re-check it later. Example: `create_bookmark(bookmark_name="failure", time=150000, description="150 ns — precision 1ps")`.
+
+---
+
+### Rule 13 — Stop and report when results are untrustworthy; never guess forward
+
+When tool results are empty, contradictory, or cannot be explained, the correct response is to **stop, diagnose the failure, and report**. It is never correct to fill the gap with assumptions and continue as if the results were valid.
+
+**Why this matters:** A single wrong assumption, propagated through five subsequent tool calls, creates a false narrative that is harder to undo than the original problem. The agent appears to be making progress while actually drifting further from the truth. Stopping early costs a few tokens; guessing forward wastes the entire investigation.
+
+#### Stop triggers — halt and diagnose when you observe any of these
+
+| Observation | What it likely means |
+|---|---|
+| Two or more consecutive waveform queries return empty results or zero transitions | Wrong time range — likely a timescale unit error or querying before simulation start |
+| Signal values are all `0`, `x`, or constant across a range where activity is expected | Wrong signal path, wrong time range, or the signal was never driven |
+| Results contradict each other (e.g., a signal is 1 and 0 at the same time from two different calls) | Path mismatch — two calls may be referencing different signals |
+| You have made three or more consecutive tool calls based on an assumption you have not verified | The assumption may be wrong; stop and verify it before continuing |
+| A conclusion requires more than one unverified assumption to hold simultaneously | The chain is speculative; verify each link independently before proceeding |
+
+#### What to do when a stop trigger fires
+
+1. **Stop the current line of investigation immediately.** Do not make another tool call in the same direction.
+2. **Diagnose the source of the bad results.** Common causes:
+   - Wrong time unit (Rule 12) — re-check timescale with `get_signal_info`.
+   - Wrong signal path — use `list_signals` or `rtl_trace find` to verify the path exists.
+   - Time range outside simulation bounds — call `get_signal_overview` with a very wide range to confirm where the simulation actually has data.
+   - Stale or missing DB — the structural DB may not match the waveform.
+3. **Write an explicit status summary** before doing anything else: what you know from verified evidence, what assumptions you made, which of those assumptions may be wrong, and what you need to verify next.
+4. **Report the situation.** If you cannot diagnose the source of the bad results within two recovery attempts, report clearly: the tool called, the arguments, the result, and why it is suspicious. Do not continue debugging on top of unresolved uncertainty.
+
+#### What never to do
+
+- Do not state a conclusion as fact if it is based on an assumption rather than a tool result.
+- Do not use phrases like "this signal is probably X" or "the value is likely Y" as the basis for the next tool call. Verify first, then call.
+- Do not continue after two consecutive empty or nonsensical results without first confirming the time range and signal paths are correct.
 
 ---
 
@@ -243,3 +391,9 @@ If you have exhausted your hypothesis checklist and still cannot find the root c
 6. **Spawn a subagent (Rule 4).** Isolate the suspicious block and test it independently. Sometimes the system-level waveform is too complex to debug efficiently.
 
 7. **Ask for help.** If you have spent significant effort and are not making progress, summarize your findings and present them. A clear summary of what you have checked and eliminated is valuable even without a final answer.
+
+---
+
+**If none of the above is working — stop.**
+
+Continuing to generate tool calls when results are consistently empty or nonsensical is not debugging — it is token consumption with no expected benefit. The threshold is low: if you have attempted two recovery strategies and results are still untrustworthy, **stop and report** rather than trying a third. Apply Rule 13: write a status summary of what is known, what is assumed, and what is blocking you, then present it. An honest "I am blocked and here is why" is more useful than a fabricated causal chain built on unverified assumptions.
