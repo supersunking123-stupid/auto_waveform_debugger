@@ -26,6 +26,14 @@ echo "[Step 2] Running rtl_trace compile..."
     --db tc12.db \
     --top multi_cone_top \
     -f files.f
+# [CHECK] DB file exists and is non-empty
+python3 -c "
+import os
+db='tc12.db'
+assert os.path.exists(db), f'DB file not found: {db}'
+assert os.path.getsize(db) > 0, f'DB file is empty: {db}'
+print('  [CHECK] DB file OK, size:', os.path.getsize(db))
+"
 
 # Step 3: Trace reconvergent point
 echo "[Step 3] Tracing first reconvergence point..."
@@ -33,7 +41,15 @@ echo "[Step 3] Tracing first reconvergence point..."
     --db tc12.db \
     --mode drivers \
     --signal "multi_cone_top.reconverge_0" \
-    --depth 5
+    --depth 5 \
+    --format json > tc12_trace_reconverge.json 2>/dev/null
+python3 -c "
+import json, sys
+data = json.load(open('tc12_trace_reconverge.json'))
+assert 'endpoints' in data, 'Missing endpoints'
+assert len(data['endpoints']) > 0, 'No endpoints found'
+print('  [CHECK] endpoints count:', len(data['endpoints']))
+"
 
 # Step 4: Trace deep cone
 echo "[Step 4] Tracing deep logic cone..."
@@ -57,7 +73,15 @@ echo "[Step 6] Tracing loads from input (high fanout)..."
     --db tc12.db \
     --mode loads \
     --signal "multi_cone_top.in_a" \
-    --depth 5
+    --depth 5 \
+    --format json > tc12_trace_loads.json 2>/dev/null
+python3 -c "
+import json, sys
+data = json.load(open('tc12_trace_loads.json'))
+assert 'endpoints' in data, 'Missing endpoints'
+assert len(data['endpoints']) > 0, 'No endpoints found'
+print('  [CHECK] endpoints count:', len(data['endpoints']))
+"
 
 # Step 7: Trace convergent flag
 echo "[Step 7] Tracing convergent flag logic..."

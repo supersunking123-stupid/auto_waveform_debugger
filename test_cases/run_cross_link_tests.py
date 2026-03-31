@@ -198,7 +198,7 @@ Generated: {timestamp}
 
 """
 
-    for phase in range(1, 12):
+    for phase in range(1, 13):
         phase_results = [r for r in results if r.phase == phase]
         if not phase_results:
             continue

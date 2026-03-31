@@ -1,4 +1,4 @@
-# Cross-Link Test Suite (tc16-tc26)
+# Cross-Link Test Suite (tc16-tc27)
 
 This test suite validates the cross-linking features implemented in `agent_debug_automation` against the NVDLA RTL DB and FSDB waveform.
 
@@ -17,6 +17,7 @@ This test suite validates the cross-linking features implemented in `agent_debug
 | tc24 | 9 | Unmapped Handling | top.mem0_rd_bw_mon.ready_in | 399970000 |
 | tc25 | 10 | Performance | top.mem0_rd_bw_mon.ready_in | 399970000 |
 | tc26 | 11 | Non-Clock Active | varies | varies |
+| tc27 | 12 | History Failure Regression | CQ signals | 784000000-800000000 |
 
 ## Test Assets
 
@@ -56,7 +57,7 @@ python3 test_tc16_backend_sanity.py
 
 ## Critical Constraints
 
-1. **Time Range:** Never use timestamps > `200010000`
+1. **Time Range:** Tests use timestamps up to `800000000` (e.g., tc27 uses 784000000-800000000)
 2. **Known-Good Edge:** `top.mem0_rd_bw_mon.clk @ 399970000`
 3. **Performance Thresholds:**
    - Cold run: < 10s
@@ -103,6 +104,10 @@ Measures cold/hot times and JSON sizes.
 
 ### Phase 11: Non-Clock Active
 Validates cross-link on non-clock control/data signals.
+
+### Phase 12: History Failure Regression
+Regression tests for previously identified failures in the CQ signal history.
+Validates correct handling of signal histories in the 784000000-800000000 time range.
 
 ## Deliverables
 

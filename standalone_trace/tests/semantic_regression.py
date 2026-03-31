@@ -304,6 +304,241 @@ def main():
         ):
             raise AssertionError(f"unexpected whereis source info: {whereis}")
 
+        # ---- Tests 9-20 (new test additions) ----
+
+        # 11) Test 9 — Trace with --cone-level 2
+        cone2 = run_trace_json(
+            rtl_trace, db, "drivers", "semantic_top.u_cons.in_bus",
+            extra=["--cone-level", "2"],
+        )
+        cone2_endpoints = cone2.get("endpoints", [])
+        if len(cone2_endpoints) == 0:
+            raise AssertionError(f"cone-level 2 returned no endpoints: {cone2}")
+        # Verify cone-level 2 returns valid JSON with summary
+        cone2_summary = cone2.get("summary", {})
+        if cone2_summary.get("cone_level") != 2:
+            raise AssertionError(f"cone-level 2 summary doesn't report cone_level=2: {cone2_summary}")
+
+        # 12) Test 10 — Trace with --prefer-port-hop
+        hop = run_trace_json(
+            rtl_trace, db, "drivers", "semantic_top.u_cons.in_bus",
+            extra=["--prefer-port-hop"],
+        )
+        hop_endpoints = hop.get("endpoints", [])
+        if len(hop_endpoints) == 0:
+            raise AssertionError(f"prefer-port-hop returned no endpoints: {hop}")
+
+        # 13) Test 11 — Trace with --include regex filter
+        inc_prod = run_trace_json(
+            rtl_trace, db, "drivers", "semantic_top.u_cons.in_bus",
+            extra=["--include", "u_prod.*"],
+        )
+        for ep in inc_prod.get("endpoints", []):
+            path = ep.get("path", "")
+            if "u_prod" not in path:
+                raise AssertionError(
+                    f"--include 'u_prod.*' should filter out non-matching paths, got: {path}"
+                )
+
+        inc_none = run_trace_json(
+            rtl_trace, db, "drivers", "semantic_top.u_cons.in_bus",
+            extra=["--include", "nonexistent_.*"],
+        )
+        if len(inc_none.get("endpoints", [])) != 0:
+            raise AssertionError(
+                f"--include 'nonexistent_.*' should return zero endpoints: {inc_none}"
+            )
+
+        # 14) Test 12 — Trace with --exclude regex filter
+        exc_cons = run_trace_json(
+            rtl_trace, db, "drivers", "semantic_top.u_cons.in_bus",
+            extra=["--exclude", "u_cons.*"],
+        )
+        for ep in exc_cons.get("endpoints", []):
+            path = ep.get("path", "")
+            if "u_cons" in path:
+                raise AssertionError(
+                    f"--exclude 'u_cons.*' should remove matching paths, got: {path}"
+                )
+
+        # 15) Test 13 — Trace with --stop-at regex
+        stop_at = run_trace_json(
+            rtl_trace, db, "drivers", "semantic_top.data",
+            extra=["--stop-at", "u_prod.*", "--depth", "10"],
+        )
+        stops = stop_at.get("stops", [])
+        # The --stop-at flag is accepted without error; verify stops exist
+        if len(stops) == 0:
+            raise AssertionError(f"expected at least one stop: {stop_at}")
+
+        # 16) Test 14 — hier command basics
+        hier1 = run_json_cmd(
+            [
+                str(rtl_trace),
+                "hier",
+                "--db", str(db),
+                "--root", "semantic_top",
+                "--depth", "1",
+                "--format", "json",
+            ]
+        )
+        if "children" not in hier1 and "nodes" not in hier1 and "tree" not in hier1:
+            raise AssertionError(f"hier output missing children/nodes/tree: {hier1}")
+
+        hier0 = run_cmd(
+            [
+                str(rtl_trace),
+                "hier",
+                "--db", str(db),
+                "--depth", "0",
+            ],
+            expect=0,
+        )
+
+        # 17) Test 15 — find with --regex
+        find_re = run_json_cmd(
+            [
+                str(rtl_trace),
+                "find",
+                "--db", str(db),
+                "--query", "u_prod\\.data",
+                "--regex",
+                "--format", "json",
+            ]
+        )
+        find_re_matches = find_re if isinstance(find_re, list) else find_re.get("matches", find_re.get("results", []))
+        if not any("u_prod.data" in str(m) for m in find_re_matches):
+            raise AssertionError(f"find regex should match u_prod.data: {find_re}")
+
+        find_none = run_cmd(
+            [
+                str(rtl_trace),
+                "find",
+                "--db", str(db),
+                "--query", "zzzzz",
+                "--regex",
+                "--format", "json",
+            ],
+            expect=2,  # exit code 2 means no matches found
+        )
+        # With --format json, check that the matches list is empty
+        # (suggestions may still appear, but matches should be 0)
+        try:
+            find_none_json = json.loads(find_none.stdout)
+            find_none_count = find_none_json.get("count", len(find_none_json) if isinstance(find_none_json, list) else -1)
+            if find_none_count != 0:
+                raise AssertionError(f"find 'zzzzz' should return 0 matches: {find_none.stdout}")
+        except json.JSONDecodeError:
+            # Non-JSON output: just check count: 0 appears
+            if "count: 0" not in find_none.stdout:
+                raise AssertionError(f"find 'zzzzz' should show count 0: {find_none.stdout}")
+
+        # 18) Test 16 — find JSON output format
+        find_json = run_json_cmd(
+            [
+                str(rtl_trace),
+                "find",
+                "--db", str(db),
+                "--query", "data",
+                "--format", "json",
+            ]
+        )
+        find_entries = find_json if isinstance(find_json, list) else find_json.get("matches", find_json.get("results", []))
+        if isinstance(find_entries, list):
+            for entry in find_entries:
+                # Entries may be plain strings (signal paths) or dicts with "path" key
+                if isinstance(entry, str):
+                    continue  # plain string path is valid
+                if isinstance(entry, dict) and "path" not in entry:
+                    raise AssertionError(f"find JSON entry missing 'path' field: {entry}")
+
+        # 19) Test 17 — Invalid signal in trace
+        bad_sig_proc = subprocess.run(
+            [
+                str(rtl_trace),
+                "trace",
+                "--db", str(db),
+                "--mode", "drivers",
+                "--signal", "semantic_top.nonexistent_signal",
+                "--format", "json",
+            ],
+            text=True,
+            capture_output=True,
+        )
+        combined = (bad_sig_proc.stdout + bad_sig_proc.stderr).lower()
+        if bad_sig_proc.returncode == 0:
+            if "error" not in combined and "not found" not in combined and "suggestions" not in combined:
+                raise AssertionError(
+                    f"invalid signal should return error/not found/suggestions: rc={bad_sig_proc.returncode} out={bad_sig_proc.stdout}"
+                )
+
+        # 20) Test 18 — Missing DB file
+        missing_db = subprocess.run(
+            [
+                str(rtl_trace),
+                "trace",
+                "--db", "/tmp/nonexistent_test_db_xyz.db",
+                "--mode", "drivers",
+                "--signal", "top.sig",
+            ],
+            text=True,
+            capture_output=True,
+        )
+        if missing_db.returncode == 0:
+            raise AssertionError(
+                f"missing DB should return non-zero exit code: rc={missing_db.returncode}"
+            )
+
+        # 21) Test 19 — --format text output validation (default format)
+        text_proc = run_cmd(
+            [
+                str(rtl_trace),
+                "trace",
+                "--db", str(db),
+                "--mode", "drivers",
+                "--signal", "semantic_top.u_cons.in_bus",
+            ]
+        )
+        text_out_lower = text_proc.stdout.lower()
+        if "signals:" not in text_out_lower and "endpoint" not in text_out_lower and "driver" not in text_out_lower:
+            raise AssertionError(
+                f"text output should contain signals/endpoint/driver: {text_proc.stdout}"
+            )
+
+        # 22) Test 20 — Incremental compile cache miss
+        inc_miss_db = tmpdir / "semantic_inc_miss.db"
+        tmp_fixture = tmpdir / "semantic_top_modified.sv"
+        shutil.copy(str(fixture), str(tmp_fixture))
+        run_cmd(
+            [
+                str(rtl_trace),
+                "compile",
+                "--db", str(inc_miss_db),
+                "--incremental",
+                "--single-unit",
+                str(tmp_fixture),
+                "--top", "semantic_top",
+            ]
+        )
+        # Append a comment to the source file to force cache miss
+        with open(str(tmp_fixture), "a") as f:
+            f.write("\n// cache miss trigger comment\n")
+        inc_miss2 = run_cmd(
+            [
+                str(rtl_trace),
+                "compile",
+                "--db", str(inc_miss_db),
+                "--incremental",
+                "--single-unit",
+                str(tmp_fixture),
+                "--top", "semantic_top",
+            ]
+        )
+        if "incremental-cache-hit" in inc_miss2.stdout:
+            raise AssertionError(
+                f"modified source should NOT produce incremental-cache-hit: {inc_miss2.stdout}"
+            )
+
         print("semantic_regression: PASS")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

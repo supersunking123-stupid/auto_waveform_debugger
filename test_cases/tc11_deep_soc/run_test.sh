@@ -26,6 +26,14 @@ echo "[Step 2] Running rtl_trace compile..."
     --db tc11.db \
     --top deep_soc_top \
     -f files.f
+# [CHECK] DB file exists and is non-empty
+python3 -c "
+import os
+db='tc11.db'
+assert os.path.exists(db), f'DB file not found: {db}'
+assert os.path.getsize(db) > 0, f'DB file is empty: {db}'
+print('  [CHECK] DB file OK, size:', os.path.getsize(db))
+"
 
 # Step 3: Trace through deep hierarchy (5 levels)
 echo "[Step 3] Tracing through 5-level hierarchy..."
@@ -33,7 +41,15 @@ echo "[Step 3] Tracing through 5-level hierarchy..."
     --db tc11.db \
     --mode drivers \
     --signal "deep_soc_top.gen_subsystems[0].u_subsystem.gen_blocks[0].u_block.u_stage1_reg.u_dff.q" \
-    --depth 10
+    --depth 10 \
+    --format json > tc11_trace_drivers.json 2>/dev/null
+python3 -c "
+import json, sys
+data = json.load(open('tc11_trace_drivers.json'))
+assert 'endpoints' in data, 'Missing endpoints'
+assert len(data['endpoints']) > 0, 'No endpoints found'
+print('  [CHECK] endpoints count:', len(data['endpoints']))
+"
 
 # Step 4: Trace clock tree
 echo "[Step 4] Tracing clock distribution..."
@@ -41,7 +57,15 @@ echo "[Step 4] Tracing clock distribution..."
     --db tc11.db \
     --mode loads \
     --signal "deep_soc_top.clk_raw" \
-    --depth 5
+    --depth 5 \
+    --format json > tc11_trace_loads.json 2>/dev/null
+python3 -c "
+import json, sys
+data = json.load(open('tc11_trace_loads.json'))
+assert 'endpoints' in data, 'Missing endpoints'
+assert len(data['endpoints']) > 0, 'No endpoints found'
+print('  [CHECK] endpoints count:', len(data['endpoints']))
+"
 
 # Step 5: Trace reset tree
 echo "[Step 5] Tracing reset distribution..."

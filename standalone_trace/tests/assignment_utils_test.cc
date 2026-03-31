@@ -35,6 +35,30 @@ int main() {
     return EXIT_FAILURE;
   }
 
+  // Test 3 — Empty assignment text
+  if (!ExpectEq(
+          InferAssignmentLhsPathsFromText("", ""),
+          {},
+          "empty_assignment_text")) {
+    return EXIT_FAILURE;
+  }
+
+  // Test 4 — LHS starting with "top."
+  if (!ExpectEq(
+          InferAssignmentLhsPathsFromText("x", "top.flag <= x"),
+          {"top.flag"},
+          "lhs_starting_with_top_dot")) {
+    return EXIT_FAILURE;
+  }
+
+  // Test 5 — Blocking assignment with ternary and ==
+  if (!ExpectEq(
+          InferAssignmentLhsPathsFromText("top.out", "assign out = (a == b) ? c : d"),
+          {"top.out"},
+          "blocking_with_ternary_and_eq")) {
+    return EXIT_FAILURE;
+  }
+
   std::cout << "assignment_utils_test: PASS\n";
   return EXIT_SUCCESS;
 }

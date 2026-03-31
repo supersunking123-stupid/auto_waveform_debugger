@@ -20,13 +20,29 @@ echo "[Step 1] Running rtl_trace compile (USE_PIPELINE=1)..."
     --top conditional_generate_top \
     -f files.f \
     -D USE_PIPELINE=1
+# [CHECK] DB file exists and is non-empty
+python3 -c "
+import os
+db='tc04_pipe.db'
+assert os.path.exists(db), f'DB file not found: {db}'
+assert os.path.getsize(db) > 0, f'DB file is empty: {db}'
+print('  [CHECK] DB file OK, size:', os.path.getsize(db))
+"
 
 # Trace: drivers through pipeline
 echo "[Step 2] Tracing drivers through pipeline..."
 "$RTL_TRACE" trace \
     --db tc04_pipe.db \
     --mode drivers \
-    --signal "conditional_generate_top.stage_data[2]"
+    --signal "conditional_generate_top.stage_data[2]" \
+    --format json > tc04_trace_drivers.json 2>/dev/null
+python3 -c "
+import json, sys
+data = json.load(open('tc04_trace_drivers.json'))
+assert 'endpoints' in data, 'Missing endpoints'
+assert len(data['endpoints']) > 0, 'No endpoints found'
+print('  [CHECK] endpoints count:', len(data['endpoints']))
+"
 
 # Compile with combinational path
 echo "[Step 3] Running rtl_trace compile (USE_PIPELINE=0)..."
@@ -41,7 +57,15 @@ echo "[Step 4] Tracing combinational path..."
 "$RTL_TRACE" trace \
     --db tc04_comb.db \
     --mode drivers \
-    --signal "conditional_generate_top.result"
+    --signal "conditional_generate_top.result" \
+    --format json > tc04_trace_comb.json 2>/dev/null
+python3 -c "
+import json, sys
+data = json.load(open('tc04_trace_comb.json'))
+assert 'endpoints' in data, 'Missing endpoints'
+assert len(data['endpoints']) > 0, 'No endpoints found'
+print('  [CHECK] endpoints count:', len(data['endpoints']))
+"
 
 # Test case generate with different OP_SELECT
 echo "[Step 5] Running rtl_trace compile (OP_SELECT=2 for AND)..."

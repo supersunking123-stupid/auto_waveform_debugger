@@ -26,13 +26,29 @@ echo "[Step 2] Running rtl_trace compile (should skip system tasks)..."
     --db tc14.db \
     --top system_tasks_top \
     -f files.f
+# [CHECK] DB file exists and is non-empty
+python3 -c "
+import os
+db='tc14.db'
+assert os.path.exists(db), f'DB file not found: {db}'
+assert os.path.getsize(db) > 0, f'DB file is empty: {db}'
+print('  [CHECK] DB file OK, size:', os.path.getsize(db))
+"
 
 # Step 3: Trace data path (should not include system tasks)
 echo "[Step 3] Tracing data path (system tasks should be filtered)..."
 "$RTL_TRACE" trace \
     --db tc14.db \
     --mode drivers \
-    --signal "system_tasks_top.data_out"
+    --signal "system_tasks_top.data_out" \
+    --format json > tc14_trace_drivers.json 2>/dev/null
+python3 -c "
+import json, sys
+data = json.load(open('tc14_trace_drivers.json'))
+assert 'endpoints' in data, 'Missing endpoints'
+assert len(data['endpoints']) > 0, 'No endpoints found'
+print('  [CHECK] endpoints count:', len(data['endpoints']))
+"
 
 # Step 4: Trace valid signal
 echo "[Step 4] Tracing valid signal..."
@@ -65,7 +81,15 @@ echo "[Step 8] Tracing loads from enable..."
 "$RTL_TRACE" trace \
     --db tc14.db \
     --mode loads \
-    --signal "system_tasks_top.enable"
+    --signal "system_tasks_top.enable" \
+    --format json > tc14_trace_loads.json 2>/dev/null
+python3 -c "
+import json, sys
+data = json.load(open('tc14_trace_loads.json'))
+assert 'endpoints' in data, 'Missing endpoints'
+assert len(data['endpoints']) > 0, 'No endpoints found'
+print('  [CHECK] endpoints count:', len(data['endpoints']))
+"
 
 echo "=========================================="
 echo "Test Case 14: PASSED"

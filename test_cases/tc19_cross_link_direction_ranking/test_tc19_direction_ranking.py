@@ -153,11 +153,10 @@ class DirectionAwareRankingTests(unittest.TestCase):
         print(f"  drivers top_summary: {drivers_summary}")
         print(f"  loads top_summary: {loads_summary}")
 
-        # They should not be identical (unless cone is very small)
+        # They should not be identical -- drivers and loads traverse different directions
         if drivers_summary and loads_summary:
-            # At minimum, the summaries should exist
-            self.assertIsNotNone(drivers_summary)
-            self.assertIsNotNone(loads_summary)
+            self.assertNotEqual(drivers_summary, loads_summary,
+                                "drivers and loads top_summary should differ for clk signal")
 
         print(f"  [PASS] Test 4.3: explain_signal_at_time drivers vs loads")
 

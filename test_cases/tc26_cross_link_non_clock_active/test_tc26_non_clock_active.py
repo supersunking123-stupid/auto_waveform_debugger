@@ -85,17 +85,40 @@ class NonClockActiveSignalTests(unittest.TestCase):
         """Test 11.1: Non-clock active signal validation"""
         print("\n[Test 11.1] Non-clock active signal validation")
 
-        # Find active signal and time
-        signal, edge_time = self._find_active_signal_and_time()
+        # First try the hardcoded known-active signal
+        hardcoded_signal = "top.mem0_rd_bw_mon.ready_in"
+        signal = None
+        edge_time = None
+
+        edge_result = mcp_mod.find_edge(
+            vcd_path=self.waveform_path,
+            path=hardcoded_signal,
+            edge_type="anyedge",
+            start_time=self.time,
+            direction="backward",
+        )
+        if edge_result.get("status") == "success":
+            edge_data = edge_result.get("data")
+            if edge_data not in (-1, None):
+                signal = hardcoded_signal
+                edge_time = int(edge_data)
+                print(f"  Hardcoded signal {hardcoded_signal} found active at time {edge_time}")
+
+        # Fall back to dynamic discovery only if hardcoded signal fails
+        if signal is None:
+            signal, edge_time = self._find_active_signal_and_time()
 
         if signal is None or edge_time is None:
-            print("  [WARN] No suitable non-clock active signal found")
+            print("  [WARN] No suitable non-clock active signal found (hardcoded and dynamic)")
             print("  Checked signals:")
-            for s in self.candidates:
+            for s in [hardcoded_signal] + self.candidates:
                 print(f"    - {s}: no edge found near reference time")
             # Still pass but with warning
             print("  [PASS] Test 11.1: Non-clock active signal (WARN - no active signal found)")
             return
+
+        self.assertIsNotNone(signal, "Expected to find a known-active non-clock signal")
+        self.assertIsNotNone(edge_time, "Expected to find an edge time for the active signal")
 
         print(f"  Using signal: {signal} at time {edge_time}")
 

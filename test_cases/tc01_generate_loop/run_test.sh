@@ -28,20 +28,44 @@ echo "[Step 1] Running rtl_trace compile (syntax check + DB generation)..."
     --db tc01.db \
     --top generate_loop_top \
     -f files.f
+# [CHECK] DB file exists and is non-empty
+python3 -c "
+import os
+db='tc01.db'
+assert os.path.exists(db), f'DB file not found: {db}'
+assert os.path.getsize(db) > 0, f'DB file is empty: {db}'
+print('  [CHECK] DB file OK, size:', os.path.getsize(db))
+"
 
 # Step 2: Trace drivers example
 echo "[Step 2] Running rtl_trace trace (drivers mode)..."
 "$RTL_TRACE" trace \
     --db tc01.db \
     --mode drivers \
-    --signal "generate_loop_top.stage_data[0]"
+    --signal "generate_loop_top.stage_data[0]" \
+    --format json > tc01_trace_drivers.json 2>/dev/null
+python3 -c "
+import json, sys
+data = json.load(open('tc01_trace_drivers.json'))
+assert 'endpoints' in data, 'Missing endpoints'
+assert len(data['endpoints']) > 0, 'No endpoints found'
+print('  [CHECK] endpoints count:', len(data['endpoints']))
+"
 
 # Step 3: Trace loads example
 echo "[Step 3] Running rtl_trace trace (loads mode)..."
 "$RTL_TRACE" trace \
     --db tc01.db \
     --mode loads \
-    --signal "generate_loop_top.data_in"
+    --signal "generate_loop_top.data_in" \
+    --format json > tc01_trace_loads.json 2>/dev/null
+python3 -c "
+import json, sys
+data = json.load(open('tc01_trace_loads.json'))
+assert 'endpoints' in data, 'Missing endpoints'
+assert len(data['endpoints']) > 0, 'No endpoints found'
+print('  [CHECK] endpoints count:', len(data['endpoints']))
+"
 
 # Step 4: Trace through generated instance
 echo "[Step 4] Tracing signal through generated instance..."

@@ -26,6 +26,14 @@ echo "[Step 2] Running rtl_trace compile..."
     --db tc13.db \
     --top clock_reset_tree_top \
     -f files.f
+# [CHECK] DB file exists and is non-empty
+python3 -c "
+import os
+db='tc13.db'
+assert os.path.exists(db), f'DB file not found: {db}'
+assert os.path.getsize(db) > 0, f'DB file is empty: {db}'
+print('  [CHECK] DB file OK, size:', os.path.getsize(db))
+"
 
 # Step 3: Trace clock tree (root to leaf)
 echo "[Step 3] Tracing clock tree from primary clock..."
@@ -33,7 +41,15 @@ echo "[Step 3] Tracing clock tree from primary clock..."
     --db tc13.db \
     --mode loads \
     --signal "clock_reset_tree_top.clk_primary" \
-    --depth 10
+    --depth 10 \
+    --format json > tc13_trace_clk_loads.json 2>/dev/null
+python3 -c "
+import json, sys
+data = json.load(open('tc13_trace_clk_loads.json'))
+assert 'endpoints' in data, 'Missing endpoints'
+assert len(data['endpoints']) > 0, 'No endpoints found'
+print('  [CHECK] endpoints count:', len(data['endpoints']))
+"
 
 # Step 4: Trace clock gating hierarchy
 echo "[Step 4] Tracing 3-level clock gating hierarchy..."
@@ -49,7 +65,15 @@ echo "[Step 5] Tracing reset synchronization tree..."
     --db tc13.db \
     --mode loads \
     --signal "clock_reset_tree_top.global_rst_n" \
-    --depth 10
+    --depth 10 \
+    --format json > tc13_trace_rst_loads.json 2>/dev/null
+python3 -c "
+import json, sys
+data = json.load(open('tc13_trace_rst_loads.json'))
+assert 'endpoints' in data, 'Missing endpoints'
+assert len(data['endpoints']) > 0, 'No endpoints found'
+print('  [CHECK] endpoints count:', len(data['endpoints']))
+"
 
 # Step 6: Trace clock mux
 echo "[Step 6] Tracing clock mux..."

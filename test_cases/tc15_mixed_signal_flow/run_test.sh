@@ -26,6 +26,14 @@ echo "[Step 2] Running rtl_trace compile (FEEDBACK_SEL=0)..."
     --db tc15.db \
     --top mixed_signal_flow_top \
     -f files.f
+# [CHECK] DB file exists and is non-empty
+python3 -c "
+import os
+db='tc15.db'
+assert os.path.exists(db), f'DB file not found: {db}'
+assert os.path.getsize(db) > 0, f'DB file is empty: {db}'
+print('  [CHECK] DB file OK, size:', os.path.getsize(db))
+"
 
 # Step 3: Trace through pipeline
 echo "[Step 3] Tracing through 8-stage pipeline..."
@@ -33,7 +41,15 @@ echo "[Step 3] Tracing through 8-stage pipeline..."
     --db tc15.db \
     --mode drivers \
     --signal "mixed_signal_flow_top.pipe_data[4]" \
-    --depth 10
+    --depth 10 \
+    --format json > tc15_trace_pipe.json 2>/dev/null
+python3 -c "
+import json, sys
+data = json.load(open('tc15_trace_pipe.json'))
+assert 'endpoints' in data, 'Missing endpoints'
+assert len(data['endpoints']) > 0, 'No endpoints found'
+print('  [CHECK] endpoints count:', len(data['endpoints']))
+"
 
 # Step 4: Trace feedback path
 echo "[Step 4] Tracing feedback path..."
@@ -55,7 +71,15 @@ echo "[Step 6] Tracing enable chain..."
     --db tc15.db \
     --mode loads \
     --signal "mixed_signal_flow_top.enable" \
-    --depth 5
+    --depth 5 \
+    --format json > tc15_trace_loads.json 2>/dev/null
+python3 -c "
+import json, sys
+data = json.load(open('tc15_trace_loads.json'))
+assert 'endpoints' in data, 'Missing endpoints'
+assert len(data['endpoints']) > 0, 'No endpoints found'
+print('  [CHECK] endpoints count:', len(data['endpoints']))
+"
 
 # Step 7: Trace output with deep cone
 echo "[Step 7] Tracing final output..."

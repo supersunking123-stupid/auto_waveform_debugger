@@ -81,6 +81,13 @@ class MappingRobustnessTests(unittest.TestCase):
         if mapped_top is not None:
             print(f"  TOP variant resolved successfully")
 
+        # Assert TOP.-prefixed version resolves to the same value as the base form
+        if mapped_base is not None and mapped_top is not None:
+            self.assertEqual(
+                mapped_base, mapped_top,
+                f"TOP. normalization should resolve to same value: base={mapped_base}, top={mapped_top}",
+            )
+
         # The normalization helper should handle this
         normalized = mcp_mod._normalize_top_variants(base_signal)
         print(f"  Normalized variants: {normalized}")
@@ -103,21 +110,11 @@ class MappingRobustnessTests(unittest.TestCase):
         print(f"  signal: {bit_select_signal}")
         print(f"  mapped: {mapped}")
         
-        if mapped is not None:
-            print(f"  [PASS] Bit-select signal mapped to: {mapped}")
-            # Verify it's the same signal (exact match in waveform)
-            self.assertEqual(mapped, bit_select_signal,
-                           f"Bit-select signal should map exactly to {bit_select_signal}")
-        else:
-            # If not found, check if it's properly reported as unmapped
-            print(f"  [INFO] Bit-select signal unmapped (checking fallback)")
-            
-            # Try mapping the base bus name (without bit-select)
-            base_signal = "top.nvdla_top.nvdla_core2cvsram_ar_arid"
-            mapped_base = mcp_mod._map_signal_to_waveform(
-                self.waveform_path, base_signal, wave_cli_bin=self.wave_cli_bin
-            )
-            print(f"  base signal {base_signal} mapped to: {mapped_base}")
+        # Assert that mapping returns a non-empty result (either exact or via fallback)
+        self.assertIsNotNone(
+            mapped,
+            f"Bit-select signal {bit_select_signal} should resolve (exact or fallback)",
+        )
 
         print(f"  [PASS] Test 8.3: Bit-select to bus fallback")
 

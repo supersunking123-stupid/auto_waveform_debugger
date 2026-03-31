@@ -57,10 +57,11 @@ class UnmappedSignalHandlingTests(unittest.TestCase):
         )
         self.assertEqual(trace_result.get("status"), "success")
 
-        # Check unmapped_signals exists
+        # Check unmapped_signals exists and is a list
         self.assertIn("unmapped_signals", trace_result,
                      "Missing unmapped_signals in trace_with_snapshot")
         unmapped = trace_result.get("unmapped_signals", [])
+        self.assertIsInstance(unmapped, list, "unmapped_signals should be a list")
         print(f"  trace_with_snapshot unmapped_signals count: {len(unmapped)}")
 
         # Check structure of unmapped entries
@@ -88,7 +89,8 @@ class UnmappedSignalHandlingTests(unittest.TestCase):
         print(f"  Tool returned success with {len(unmapped)} unmapped signals")
 
         if not unmapped:
-            print("  [INFO] No unmapped signals found (cone may map completely)")
+            print("  [WARN] No unmapped signals found -- test is not fully exercising its purpose")
+            print("  [INFO] Consider using a signal known to have unmapped cone entries")
 
         print(f"  [PASS] Test 9.1: Unmapped signal handling")
 

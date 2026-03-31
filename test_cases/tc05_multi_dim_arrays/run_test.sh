@@ -19,6 +19,14 @@ echo "[Step 1] Running rtl_trace compile..."
     --db tc05.db \
     --top multi_dim_arrays_top \
     -f files.f
+# [CHECK] DB file exists and is non-empty
+python3 -c "
+import os
+db='tc05.db'
+assert os.path.exists(db), f'DB file not found: {db}'
+assert os.path.getsize(db) > 0, f'DB file is empty: {db}'
+print('  [CHECK] DB file OK, size:', os.path.getsize(db))
+"
 
 # List signals to find proper paths
 echo "[Step 2] Finding signals with 'storage'..."
@@ -36,7 +44,15 @@ echo "[Step 4] Tracing bit_vector_out drivers..."
 "$RTL_TRACE" trace \
     --db tc05.db \
     --mode drivers \
-    --signal "multi_dim_arrays_top.bit_vector_out"
+    --signal "multi_dim_arrays_top.bit_vector_out" \
+    --format json > tc05_trace_drivers.json 2>/dev/null
+python3 -c "
+import json, sys
+data = json.load(open('tc05_trace_drivers.json'))
+assert 'endpoints' in data, 'Missing endpoints'
+assert len(data['endpoints']) > 0, 'No endpoints found'
+print('  [CHECK] endpoints count:', len(data['endpoints']))
+"
 
 # Trace: individual bit
 echo "[Step 5] Tracing individual bit..."

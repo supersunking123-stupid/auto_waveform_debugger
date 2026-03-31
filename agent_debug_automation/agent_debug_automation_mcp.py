@@ -1547,6 +1547,8 @@ def switch_session(session_name: str, waveform_path: Optional[str] = None):
 @mcp.tool()
 def delete_session(session_name: str, waveform_path: Optional[str] = None):
     """Delete a Session. Default_Session is retained for each waveform."""
+    if session_name == DEFAULT_SESSION_NAME:
+        return {"status": "error", "message": "cannot delete Default_Session"}
     try:
         payload = _resolve_session(waveform_path=waveform_path, session_name=session_name, create_default=False)
         if payload["session_name"] == DEFAULT_SESSION_NAME:

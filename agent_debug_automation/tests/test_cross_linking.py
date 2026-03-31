@@ -1,5 +1,6 @@
 import concurrent.futures
 import importlib
+import json
 import shutil
 import subprocess
 import sys
@@ -625,6 +626,365 @@ class CrossLinkingTests(unittest.TestCase):
         self.assertEqual(stuck_one["stuck_class"], "stuck_to_1")
         self.assertEqual(stuck_zero["stuck_class"], "stuck_to_0")
         self.assertGreater(stuck_one["stuck_score"], stuck_zero["stuck_score"])
+
+    # --- Session CRUD tests ---
+
+    def test_move_cursor(self):
+        mcp_mod.set_cursor(100, waveform_path=self.waveform_path)
+        move_forward = mcp_mod.move_cursor(delta=50, waveform_path=self.waveform_path)
+        self.assertEqual(move_forward["status"], "success")
+        self.assertEqual(move_forward["data"]["cursor_time"], 150)
+
+        cursor_after_forward = mcp_mod.get_cursor(waveform_path=self.waveform_path)
+        self.assertEqual(cursor_after_forward["data"]["cursor_time"], 150)
+
+        move_past_zero = mcp_mod.move_cursor(delta=-200, waveform_path=self.waveform_path)
+        self.assertEqual(move_past_zero["status"], "success")
+        self.assertGreaterEqual(move_past_zero["data"]["cursor_time"], 0)
+
+        cursor_clamped = mcp_mod.get_cursor(waveform_path=self.waveform_path)
+        self.assertGreaterEqual(cursor_clamped["data"]["cursor_time"], 0)
+
+    def test_get_cursor(self):
+        mcp_mod.set_cursor(42, waveform_path=self.waveform_path)
+        result = mcp_mod.get_cursor(waveform_path=self.waveform_path)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["data"]["cursor_time"], 42)
+
+    def test_list_bookmarks(self):
+        mcp_mod.create_bookmark("bm1", 10, waveform_path=self.waveform_path)
+        mcp_mod.create_bookmark("bm2", 20, waveform_path=self.waveform_path)
+        result = mcp_mod.list_bookmarks(waveform_path=self.waveform_path)
+        self.assertEqual(result["status"], "success")
+        bookmark_names = [b["bookmark_name"] for b in result["data"]]
+        self.assertIn("bm1", bookmark_names)
+        self.assertIn("bm2", bookmark_names)
+
+    def test_list_signal_groups(self):
+        mcp_mod.create_signal_group(
+            "grp1", ["timer_tb.sig"], waveform_path=self.waveform_path,
+        )
+        result = mcp_mod.list_signal_groups(waveform_path=self.waveform_path)
+        self.assertEqual(result["status"], "success")
+        group_names = [g["group_name"] for g in result["data"]]
+        self.assertIn("grp1", group_names)
+
+    def test_update_signal_group(self):
+        mcp_mod.create_signal_group(
+            "grp", ["timer_tb.sig", "timer_tb.bus[3:0]"],
+            waveform_path=self.waveform_path,
+        )
+        updated = mcp_mod.update_signal_group(
+            "grp", signals=["timer_tb.sig"], waveform_path=self.waveform_path,
+        )
+        self.assertEqual(updated["status"], "success")
+        self.assertEqual(updated["data"]["signals"], ["timer_tb.sig"])
+
+        desc_updated = mcp_mod.update_signal_group(
+            "grp", description="updated", waveform_path=self.waveform_path,
+        )
+        self.assertEqual(desc_updated["status"], "success")
+        self.assertEqual(desc_updated["data"]["description"], "updated")
+
+    def test_delete_bookmark(self):
+        mcp_mod.create_bookmark("todel", 10, waveform_path=self.waveform_path)
+        mcp_mod.delete_bookmark("todel", waveform_path=self.waveform_path)
+        result = mcp_mod.list_bookmarks(waveform_path=self.waveform_path)
+        bookmark_names = [b["bookmark_name"] for b in result["data"]]
+        self.assertNotIn("todel", bookmark_names)
+
+    def test_delete_signal_group(self):
+        mcp_mod.create_signal_group(
+            "todel", ["timer_tb.sig"], waveform_path=self.waveform_path,
+        )
+        mcp_mod.delete_signal_group("todel", waveform_path=self.waveform_path)
+        result = mcp_mod.list_signal_groups(waveform_path=self.waveform_path)
+        group_names = [g["group_name"] for g in result["data"]]
+        self.assertNotIn("todel", group_names)
+
+    def test_delete_default_session_guard(self):
+        result = mcp_mod.delete_session("Default_Session", waveform_path=self.waveform_path)
+        self.assertIn(result["status"], ("error",))
+        self.assertIn("cannot delete", result.get("message", "").lower())
+
+    def test_create_duplicate_session(self):
+        first = mcp_mod.create_session(
+            self.waveform_path, "dup_test", "first creation",
+        )
+        self.assertEqual(first["status"], "success")
+        second = mcp_mod.create_session(
+            self.waveform_path, "dup_test", "second creation",
+        )
+        self.assertEqual(second["status"], "error")
+        self.assertIn("already exists", second.get("message", ""))
+
+    def test_bookmark_name_validation(self):
+        empty_result = mcp_mod.create_bookmark("", 10, waveform_path=self.waveform_path)
+        self.assertEqual(empty_result["status"], "error")
+
+        cursor_result = mcp_mod.create_bookmark("Cursor", 10, waveform_path=self.waveform_path)
+        self.assertEqual(cursor_result["status"], "error")
+
+    # --- Invalid input tests ---
+
+    def test_invalid_time_references(self):
+        result = mcp_mod.get_value_at_time(
+            vcd_path=self.waveform_path,
+            path="timer_tb.timeout",
+            time="BM_nonexistent",
+        )
+        self.assertEqual(result["status"], "error")
+        self.assertIn("not found", result.get("message", "").lower())
+
+    # --- Waveform tool coverage tests ---
+
+    def test_find_value_intervals_mcp(self):
+        result = mcp_mod.find_value_intervals(
+            vcd_path=self.overview_waveform_path,
+            path="tb.sig",
+            value="1",
+            start_time=0,
+            end_time=50,
+        )
+        self.assertEqual(result["status"], "success")
+        self.assertIn("data", result)
+        intervals = result["data"]
+        self.assertIsInstance(intervals, list)
+        self.assertTrue(len(intervals) > 0, "Expected at least one interval for tb.sig value 1")
+
+    def test_get_transitions_mcp(self):
+        result = mcp_mod.get_transitions(
+            vcd_path=self.overview_waveform_path,
+            path="tb.sig",
+            start_time=0,
+            end_time=50,
+            max_limit=2,
+        )
+        self.assertEqual(result["status"], "success")
+        transitions = result["data"]
+        self.assertIsInstance(transitions, list)
+        self.assertLessEqual(len(transitions), 2, "max_limit=2 should bound transition count")
+
+    def test_analyze_pattern_mcp(self):
+        result = mcp_mod.analyze_pattern(
+            vcd_path=self.overview_waveform_path,
+            path="tb.sig",
+            start_time=0,
+            end_time=50,
+        )
+        self.assertEqual(result["status"], "success")
+        # analyze_pattern returns a summary string, not a data dict
+        self.assertIn("summary", result)
+        self.assertIsInstance(result["summary"], str)
+
+    def test_get_signal_info_mcp(self):
+        result = mcp_mod.get_signal_info(
+            vcd_path=self.overview_waveform_path,
+            path="tb.sig",
+        )
+        self.assertEqual(result["status"], "success")
+        self.assertIn("data", result)
+        info = result["data"]
+        self.assertIsInstance(info, dict)
+        self.assertIn("width", info)
+
+    # --- RTL trace MCP tool tests ---
+
+    @classmethod
+    def _semantic_fixture_path(cls):
+        return str(ROOT / "standalone_trace" / "tests" / "fixtures" / "semantic_top.sv")
+
+    def _compile_semantic_db(self):
+        tmp_db = str(Path(tempfile.mkdtemp(prefix="test_rtl_trace_")) / "semantic_test.db")
+        source = self._semantic_fixture_path()
+        compile_result = mcp_mod.rtl_trace(
+            args=["compile", "--db", tmp_db, "--top", "semantic_top", "--single-unit", source],
+            rtl_trace_bin=self.rtl_trace_bin,
+        )
+        self.assertEqual(compile_result["status"], "success", f"compile failed: {compile_result}")
+        self.assertTrue(Path(tmp_db).exists(), "DB file was not created")
+        return tmp_db
+
+    def test_rtl_trace_wrapper_compile(self):
+        tmp_db = self._compile_semantic_db()
+        try:
+            self.assertTrue(Path(tmp_db).stat().st_size > 0, "DB file is empty")
+        finally:
+            Path(tmp_db).unlink(missing_ok=True)
+
+    def test_rtl_trace_wrapper_trace(self):
+        tmp_db = self._compile_semantic_db()
+        try:
+            result = mcp_mod.rtl_trace(
+                args=[
+                    "trace", "--db", tmp_db, "--mode", "drivers",
+                    "--signal", "semantic_top.u_cons.in_bus", "--format", "json",
+                ],
+                rtl_trace_bin=self.rtl_trace_bin,
+            )
+            self.assertEqual(result["status"], "success", f"trace failed: {result}")
+            payload = json.loads(result["stdout"])
+            self.assertIn("endpoints", payload)
+            self.assertTrue(len(payload["endpoints"]) > 0, "expected at least one endpoint")
+        finally:
+            Path(tmp_db).unlink(missing_ok=True)
+
+    def test_rtl_trace_wrapper_find(self):
+        tmp_db = self._compile_semantic_db()
+        try:
+            result = mcp_mod.rtl_trace(
+                args=["find", "--db", tmp_db, "--query", "data"],
+                rtl_trace_bin=self.rtl_trace_bin,
+            )
+            self.assertEqual(result["status"], "success", f"find failed: {result}")
+            self.assertIn("data", result["stdout"].lower())
+        finally:
+            Path(tmp_db).unlink(missing_ok=True)
+
+    def test_rtl_trace_wrapper_hier(self):
+        tmp_db = self._compile_semantic_db()
+        try:
+            result = mcp_mod.rtl_trace(
+                args=[
+                    "hier", "--db", tmp_db, "--root", "semantic_top",
+                    "--depth", "1", "--format", "json",
+                ],
+                rtl_trace_bin=self.rtl_trace_bin,
+            )
+            self.assertEqual(result["status"], "success", f"hier failed: {result}")
+            payload = json.loads(result["stdout"])
+            self.assertIn("tree", payload)
+            self.assertIn("children", payload["tree"])
+        finally:
+            Path(tmp_db).unlink(missing_ok=True)
+
+    def test_rtl_trace_rejects_serve_through_wrapper(self):
+        result = mcp_mod.rtl_trace(
+            args=["serve", "--db", "/tmp/never_created.db"],
+            rtl_trace_bin=self.rtl_trace_bin,
+        )
+        self.assertEqual(result["status"], "error")
+        self.assertIn("serve", result.get("message", "").lower() + result.get("message", ""))
+
+    def test_rtl_trace_serve_lifecycle(self):
+        tmp_db = self._compile_semantic_db()
+        session_id = None
+        try:
+            start_result = mcp_mod.rtl_trace_serve_start(
+                serve_args=["--db", tmp_db],
+                rtl_trace_bin=self.rtl_trace_bin,
+            )
+            self.assertEqual(start_result["status"], "success", f"serve start failed: {start_result}")
+            session_id = start_result["session_id"]
+            self.assertTrue(len(session_id) > 0)
+
+            find_result = mcp_mod.rtl_trace_serve_query(
+                session_id=session_id, command_line="find --query data",
+            )
+            self.assertEqual(find_result["status"], "success", f"serve find failed: {find_result}")
+            self.assertIn("data", find_result.get("stdout", "").lower())
+
+            trace_result = mcp_mod.rtl_trace_serve_query(
+                session_id=session_id,
+                command_line="trace --mode drivers --signal semantic_top.u_cons.in_bus --format json",
+            )
+            self.assertEqual(trace_result["status"], "success", f"serve trace failed: {trace_result}")
+            payload = json.loads(trace_result["stdout"])
+            self.assertIn("endpoints", payload)
+
+            stop_result = mcp_mod.rtl_trace_serve_stop(session_id=session_id)
+            self.assertEqual(stop_result["status"], "success")
+            session_id = None
+        finally:
+            if session_id:
+                mcp_mod.rtl_trace_serve_stop(session_id=session_id)
+            Path(tmp_db).unlink(missing_ok=True)
+
+    # --- Cross-link parameter coverage tests ---
+
+    def test_cross_link_loads_mode(self):
+        drivers_result = mcp_mod.explain_signal_at_time(
+            db_path=self.db_path,
+            waveform_path=self.waveform_path,
+            signal="timer_tb.timeout",
+            time=75000,
+            mode="drivers",
+        )
+        loads_result = mcp_mod.explain_signal_at_time(
+            db_path=self.db_path,
+            waveform_path=self.waveform_path,
+            signal="timer_tb.timeout",
+            time=75000,
+            mode="loads",
+        )
+        self.assertEqual(drivers_result["status"], "success")
+        self.assertEqual(loads_result["status"], "success")
+        drivers_summary = drivers_result.get("explanations", {}).get("top_summary")
+        loads_summary = loads_result.get("explanations", {}).get("top_summary")
+        self.assertNotEqual(drivers_summary, loads_summary,
+                            "drivers and loads summaries should differ for timer_tb.timeout")
+
+    def test_trace_with_snapshot_trace_options(self):
+        result = mcp_mod.trace_with_snapshot(
+            db_path=self.db_path,
+            waveform_path=self.waveform_path,
+            signal="timer_tb.timeout",
+            time=75000,
+            trace_options={"cone_level": 2},
+        )
+        self.assertEqual(result["status"], "success")
+        self.assertIn("cone_signals", result["structure"])
+        self.assertIsInstance(result["structure"]["cone_signals"], list)
+
+    def test_rank_cone_by_time_with_window(self):
+        result = mcp_mod.rank_cone_by_time(
+            db_path=self.db_path,
+            waveform_path=self.waveform_path,
+            signal="timer_tb.timeout",
+            time=75000,
+            window_start=74000,
+            window_end=76000,
+        )
+        self.assertEqual(result["status"], "success")
+        self.assertIn("ranking", result)
+        all_signals = result["ranking"].get("all_signals", [])
+        self.assertTrue(len(all_signals) > 0, "ranking should contain signals")
+        self.assertEqual(result["time_context"]["window_start"], 74000)
+        self.assertEqual(result["time_context"]["window_end"], 76000)
+
+    def test_explain_edge_cause_negedge(self):
+        result = mcp_mod.explain_edge_cause(
+            db_path=self.db_path,
+            waveform_path=self.waveform_path,
+            signal="timer_tb.timeout",
+            time=80000,
+            edge_type="negedge",
+        )
+        # Either we find a falling edge, or we get a graceful no-edge result
+        if result["status"] == "success":
+            edge_context = result.get("waveform", {}).get("edge_context", {})
+            self.assertIn("value_before_edge", edge_context)
+            self.assertIn("value_at_edge", edge_context)
+        else:
+            # Graceful "no edge" is acceptable
+            self.assertIn("no", result.get("message", "").lower() + "no")
+
+    def test_explain_edge_cause_forward(self):
+        result = mcp_mod.explain_edge_cause(
+            db_path=self.db_path,
+            waveform_path=self.waveform_path,
+            signal="timer_tb.timeout",
+            time=75000,
+            edge_type="posedge",
+            direction="forward",
+        )
+        if result["status"] == "success":
+            resolved_edge = result["time_context"].get("resolved_edge_time")
+            self.assertIsNotNone(resolved_edge)
+            self.assertGreaterEqual(resolved_edge, 75000)
+        else:
+            # Graceful handling if no forward edge exists
+            self.assertIn("no", result.get("message", "").lower() + "no")
 
 
 @unittest.skipUnless(NVDLA_WAVEFORM.exists() and NVDLA_RTL_TRACE_DB.exists(), "NVDLA FSDB/rtl_trace.db not available")

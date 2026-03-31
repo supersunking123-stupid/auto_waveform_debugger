@@ -60,6 +60,10 @@ class ClosenessFirstRankingTests(unittest.TestCase):
         all_signals = ranking.get("all_signals", [])
         most_active = ranking.get("most_active_near_time", [])
 
+        # Assert all_signals list is non-empty
+        self.assertTrue(len(all_signals) > 0, "all_signals is empty")
+        self.assertTrue(len(most_active) > 0, "most_active_near_time is empty")
+
         # Check first 5 entries
         print("\n  First 5 entries in all_signals:")
         for i, entry in enumerate(all_signals[:5]):
@@ -74,16 +78,21 @@ class ClosenessFirstRankingTests(unittest.TestCase):
                   f"closeness={entry.get('closeness_score')}, "
                   f"closest_dist={entry.get('closest_transition_distance')}")
 
-        # Verify closeness_score is present and used
-        self.assertTrue(len(all_signals) > 0, "all_signals is empty")
-        self.assertTrue(len(most_active) > 0, "most_active_near_time is empty")
+        # Assert closeness_score values are monotonically non-increasing in all_signals
+        closeness_scores = [entry.get("closeness_score", 0) for entry in all_signals]
+        for i in range(1, len(closeness_scores)):
+            self.assertGreaterEqual(
+                closeness_scores[i - 1], closeness_scores[i],
+                f"closeness_score not non-increasing: [{i-1}]={closeness_scores[i-1]} > [{i}]={closeness_scores[i]}",
+            )
 
-        # First entry should have high closeness score if available
-        if all_signals:
-            first_entry = all_signals[0]
-            self.assertIn("closeness_score", first_entry)
-            print(f"\n  Top ranked signal: {first_entry.get('signal')} "
-                  f"(closeness_score={first_entry.get('closeness_score')})")
+        # Assert the first entry has the highest closeness_score
+        first_entry = all_signals[0]
+        self.assertIn("closeness_score", first_entry)
+        self.assertEqual(first_entry["closeness_score"], max(closeness_scores),
+                         "First all_signals entry should have the highest closeness_score")
+        print(f"\n  Top ranked signal: {first_entry.get('signal')} "
+              f"(closeness_score={first_entry.get('closeness_score')})")
 
         print(f"  [PASS] Test 5.1: Closeness-first ranking validation")
 

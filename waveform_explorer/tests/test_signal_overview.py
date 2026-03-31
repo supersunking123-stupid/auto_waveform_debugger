@@ -222,6 +222,59 @@ class SignalOverviewCliTests(unittest.TestCase):
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["data"], 25)
 
+    def test_find_condition_forward_direction(self):
+        result = self._query("find_condition", {
+            "expression": "tb.sig == 0",
+            "direction": "forward",
+            "start_time": 25,
+        })
+        self.assertEqual(result["status"], "success")
+        found_time = result["data"]
+        self.assertIsInstance(found_time, int)
+        # At t=25, sig=1; searching forward for sig==0 should find t=30
+        self.assertGreaterEqual(found_time, 25)
+
+    def test_get_signal_overview_with_bin_radix(self):
+        result = self._query("get_signal_overview", {
+            "path": "tb.bus[3:0]",
+            "start_time": 0,
+            "end_time": 80,
+            "resolution": 10,
+            "radix": "bin",
+        })
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["radix"], "bin")
+        # At least one segment should have a binary-formatted value (starts with 'b')
+        has_bin_value = False
+        for seg in result["segments"]:
+            if "value" in seg and seg["value"].startswith("b"):
+                has_bin_value = True
+                # Binary value after 'b' prefix should contain only 0/1
+                bits = seg["value"][1:]
+                for ch in bits:
+                    self.assertIn(ch, "01xz")
+        self.assertTrue(has_bin_value, "Expected at least one segment with binary-formatted value")
+
+    def test_get_signal_overview_with_dec_radix(self):
+        result = self._query("get_signal_overview", {
+            "path": "tb.bus[3:0]",
+            "start_time": 0,
+            "end_time": 80,
+            "resolution": 10,
+            "radix": "dec",
+        })
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["radix"], "dec")
+        # At least one segment should have a decimal-formatted value (starts with 'd')
+        has_dec_value = False
+        for seg in result["segments"]:
+            if "value" in seg and seg["value"].startswith("d"):
+                has_dec_value = True
+                # Decimal value after 'd' prefix should be numeric
+                digits = seg["value"][1:]
+                self.assertTrue(digits.isdigit(), f"Expected decimal digits, got: {digits}")
+        self.assertTrue(has_dec_value, "Expected at least one segment with decimal-formatted value")
+
     def test_malformed_vcd_timestamp_returns_error_instead_of_crashing(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             bad_vcd = Path(temp_dir) / "bad.vcd"
