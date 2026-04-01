@@ -14,6 +14,11 @@ set(VERDI_HOME "/home/qsun/synopsys_apps/verdi/V-2023.12-SP2" CACHE PATH "Path t
 include_directories(third_party)
 include_directories(third_party/fst)
 include_directories(src)
+include_directories(src/vcd)
+include_directories(src/fst)
+include_directories(src/fsdb)
+include_directories(src/cadence)
+include_directories(src/siemens)
 
 # Enable ZLIB (often required by FST)
 find_package(ZLIB)
@@ -31,9 +36,20 @@ set(FST_SOURCES
 # Set compile flags for FST C files to avoid warnings or issues with C++ linkage
 set_source_files_properties(${FST_SOURCES} PROPERTIES LANGUAGE C)
 
-file(GLOB SOURCES "src/*.cpp")
+set(SOURCES
+    src/AgentAPI.cpp
+    src/main.cpp
+    src/WaveDatabase.cpp
+    src/FormatRegistry.cpp
+)
 
-add_executable(wave_agent_cli ${SOURCES} ${FST_SOURCES})
+set(FORMAT_ADAPTER_SOURCES
+    src/vcd/VcdAdapter.cpp
+    src/fst/FstAdapter.cpp
+    src/fsdb/FsdbAdapter.cpp
+)
+
+add_executable(wave_agent_cli ${SOURCES} ${FORMAT_ADAPTER_SOURCES} ${FST_SOURCES})
 
 if(ZLIB_FOUND)
     target_link_libraries(wave_agent_cli ZLIB::ZLIB)

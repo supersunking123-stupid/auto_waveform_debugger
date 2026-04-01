@@ -22,6 +22,7 @@ If at any point two consecutive tool results are empty or nonsensical, stop and 
 | **Signal Investigation** | Explain *why* a signal has a particular value at a particular time | `03_SIGNAL_INVESTIGATION.md` |
 | **Root-Cause Analysis** | Find the source of a bug by combining structural and waveform analysis | `04_ROOT_CAUSE_ANALYSIS.md` |
 | **Session Management** | Set up, organize, or switch debugging workspaces (cursors, bookmarks, signal groups) | `05_SESSION_MANAGEMENT.md` |
+| **Supervised Debug** | Debug with a two-agent setup (Debugger + Supervisor) when single-agent attempts have failed or the model is prone to carelessness/hallucination | `06_SUPERVISED_DEBUG.md` |
 
 ## Step 2 — Routing rules
 
@@ -35,6 +36,7 @@ Follow these rules to pick the right playbook:
 6. **"Why did signal X change at time T?"** → Signal Investigation
 7. **"What caused this bug / failure / assertion?"** → Root-Cause Analysis
 8. **"Set a bookmark / create a signal group / switch session"** → Session Management
+9. **"Debug failed with single agent" / "Agent keeps making mistakes" / "Use supervised mode"** → Supervised Debug
 
 ## Step 3 — Chaining playbooks
 
@@ -42,6 +44,7 @@ Some tasks require chaining. Common chains:
 
 - **Triage a failure** → Session Management (set up workspace) → Waveform Browsing (observe symptoms) → Signal Investigation (explain the anomaly)
 - **Full root-cause debug** → Session Management → Root-Cause Analysis (which internally chains Structural Exploration + Waveform Browsing)
+- **Supervised root-cause debug** → Supervised Debug (wraps Root-Cause Analysis with a Supervisor agent reviewing each phase)
 - **Design review / connectivity audit** → Structural Exploration → Waveform Browsing (verify structural understanding against simulation)
 
 ## Step 4 — Tool inventory by playbook
@@ -55,6 +58,7 @@ Quick reference of which tools belong to which playbook. **Only use the tools li
 | Signal Investigation | `explain_signal_at_time`, `explain_edge_cause`, `trace_with_snapshot`, `rank_cone_by_time` |
 | Root-Cause Analysis | All Signal Investigation tools + Waveform Browsing tools + Structural Exploration tools (used in a prescribed sequence) |
 | Session Management | `create_session`, `list_sessions`, `get_session`, `switch_session`, `delete_session`, `set_cursor`, `move_cursor`, `get_cursor`, `create_bookmark`, `delete_bookmark`, `list_bookmarks`, `create_signal_group`, `update_signal_group`, `delete_signal_group`, `list_signal_groups` |
+| Supervised Debug | All tools from Root-Cause Analysis, used by the Debugger agent; Supervisor uses no MCP tools (review only) |
 
 ---
 

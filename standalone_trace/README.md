@@ -19,7 +19,7 @@ This directory already vendors the required dependencies (`third_party/slang`, `
 Copying the entire `standalone_trace/` directory is enough to build it independently, without depending on the parent simview project.
 
 For local bring-up and testing (based on `Cores-VeeR-EH1`), see:
-- [LOCALTEST.md](./LOCALTEST.md)
+- [LOCALTEST.md](./docs/LOCALTEST.md)
 
 ## Build
 

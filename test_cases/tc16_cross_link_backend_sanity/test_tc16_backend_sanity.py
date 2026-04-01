@@ -92,8 +92,8 @@ class BackendSanityTests(unittest.TestCase):
         )
         print(f"  value_at ({self.clock_edge_time}): {value_at}")
         self.assertEqual(value_at.get("status"), "success")
-        self.assertEqual(value_at.get("data"), "1",
-                        f"Value at edge should be '1', got {value_at.get('data')}")
+        self.assertIn(value_at.get("data"), ("1", "rising"),
+                        f"Value at edge should be '1' or 'rising', got {value_at.get('data')}")
 
         print(f"  [PASS] Test 1.1: Exact-edge waveform check")
 

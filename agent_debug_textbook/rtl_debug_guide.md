@@ -340,6 +340,31 @@ When tool results are empty, contradictory, or cannot be explained, the correct 
 
 ---
 
+### Rule 14 — Respect the golden boundary: never question VIPs, assertions, or protocol checkers
+
+Certain components are **golden** — they define what correct behavior is. When they fire or flag an error, the DUT is wrong, not the golden component. Questioning the golden boundary is almost always a waste of debug cycles and leads the investigation astray.
+
+**Golden components:**
+
+| Component | Why it is trusted |
+|---|---|
+| **Verification IP (VIPs)** | Protocol monitors from commercial or mature VIP libraries are validated across thousands of designs. If a VIP flags a violation, the DUT violated the protocol. |
+| **Assertions** | Written by the verification team to define correct behavior. An assertion firing means the DUT violated its specification. |
+| **Protocol checkers** | Embedded or external checkers (e.g., AXI protocol checker) enforce bus protocol rules. They are the reference, not the suspect. |
+| **Scoreboards and reference models** | Define the expected input/output relationship. Mismatches mean the DUT diverged. |
+| **Testbench stimulus** | Defines the test intent. "Wrong stimulus" means a different test, not a DUT bug (unless the user explicitly says the testbench may be wrong). |
+
+**How to apply:**
+
+1. **Never hypothesize that a golden component is buggy** unless the user explicitly says "the assertion may be wrong" or "check the VIP configuration."
+2. **Trace inward from the golden boundary.** If a VIP fires, the DUT signal feeding the VIP has the wrong value. Trace that signal backward using Playbook 03/04 — do not investigate the VIP's checker logic.
+3. **An assertion's condition is the starting point for backward tracing**, not a suspect to be debugged. Extract the signals from the assertion expression and begin Phase 1 (observe the symptom) on those signals.
+4. **If you find yourself explaining why the assertion "shouldn't have fired"**, you are on the wrong track. The assertion did fire. The question is why the DUT reached the state that triggered it.
+
+**Exception:** The user may say "the testbench has a known issue" or "this assertion has false positives." In that case, proceed with caution but still check the DUT first — the exception is rare, and defaulting to trust-the-golden-component is correct more than 95% of the time.
+
+---
+
 ## Part 3 — Common Bug Patterns
 
 When forming hypotheses (Rule 2), check whether the symptom matches any of these common patterns. This can accelerate your investigation.
@@ -386,7 +411,7 @@ If you have exhausted your hypothesis checklist and still cannot find the root c
 
 4. **Compare with a passing test.** If you have a waveform from a passing test, compare the signal values at the same logical point (same transaction number, same state machine state, not necessarily the same absolute time). The difference often reveals the bug.
 
-5. **Question the testbench.** The testbench itself may be incorrect — wrong expected values, wrong timing constraints, or wrong stimulus. Do not blindly trust the checker.
+5. **Question the testbench (with caution — see Rule 14).** The testbench itself may be incorrect — wrong expected values, wrong timing constraints, or wrong stimulus. However, Rule 14 applies: VIPs, assertions, and protocol checkers are golden by default. Only question them after you have exhausted all DUT-side explanations, or if the user explicitly says the testbench may be wrong.
 
 6. **Spawn a subagent (Rule 4).** Isolate the suspicious block and test it independently. Sometimes the system-level waveform is too complex to debug efficiently.
 
