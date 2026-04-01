@@ -1,4 +1,3 @@
 #pragma once
-// Compiler.h — Compile subcommand interface
-#include "db/GraphDb.h"
-// RunCompile is declared in GraphDb.h
+// Compiler.h — Compile subcommand interface.
+// RunCompile is declared in db/GraphDb.h (public API).

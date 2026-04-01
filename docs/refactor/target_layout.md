@@ -20,18 +20,20 @@ auto_waveform_debugger/
     main.cc                              # thin arg parse + subcommand dispatch (52 lines)
     AssignmentUtils.cc                   # assignment text inference utilities
     db/
-      GraphDb.h                          # public API declarations
-      GraphDb_all.cc                     # full implementation (4242 lines, Phase 2 extraction pending)
+      GraphDb.h                          # public API declarations (6 Run* functions)
+      GraphDbTypes.h                     # all type/struct/enum definitions (no slang AST deps)
+      GraphDbInternals.h                 # shared internal function declarations (no slang AST deps)
+      GraphDb.cc                         # shared infrastructure + compile-time indexing (~2450 lines)
     compile/
-      Compiler.h / Compiler.cc           # stub — populated in Phase 2
+      Compiler.h / Compiler.cc           # RunCompile + MFCU helpers (~460 lines)
     query/
-      TraceQuery.h / TraceQuery.cc       # stub — populated in Phase 2
-      HierQuery.h / HierQuery.cc         # stub — populated in Phase 2
-      FindQuery.h / FindQuery.cc         # stub — populated in Phase 2
-      WhereIsQuery.h / WhereIsQuery.cc   # stub — populated in Phase 2
+      TraceQuery.h / TraceQuery.cc       # RunTrace + trace-specific functions (~425 lines)
+      HierQuery.h / HierQuery.cc         # RunHier + hier-specific functions
+      FindQuery.h / FindQuery.cc         # RunFind + find-specific functions
+      WhereIsQuery.h / WhereIsQuery.cc   # RunWhereInstance + whereis-specific functions
     serve/
-      ServeLoop.h / ServeLoop.cc         # stub — populated in Phase 2
-    CMakeLists.txt                       # compiles main.cc + AssignmentUtils.cc + db/GraphDb_all.cc
+      ServeLoop.h / ServeLoop.cc         # RunServe + SplitCommandLine
+    CMakeLists.txt                       # compiles all 8 TUs
     third_party/                         # slang, fmt
     docs/
       Tech_Note.md                       # C++ internals: graph DB format, compile-time indexing
@@ -114,10 +116,10 @@ auto_waveform_debugger/
 
 | Component | Before | After |
 |---|---|---|
-| standalone_trace | 1 monolith `main.cc` (4,277 lines) | thin `main.cc` (52 lines) + directory structure with stubs; impl in `db/GraphDb_all.cc` (Phase 2 extraction pending) |
+| standalone_trace | 1 monolith `main.cc` (4,277 lines) | thin `main.cc` (52 lines) + 7 module TUs: db/GraphDb.cc, compile/Compiler.cc, query/*.cc, serve/ServeLoop.cc |
 | waveform_explorer | 5 source files, format code mixed | FormatAdapter interface + FormatRegistry + per-format adapter folders (vcd/fst/fsdb/cadence/siemens) |
 | agent_debug_automation | 1 monolith `agent_debug_automation_mcp.py` (2,347 lines) | 7 module files + backward-compat re-export shim with mock forwarding |
 
 ## Remaining Work
 
-- **Phase 2 standalone_trace**: Extract functions from `db/GraphDb_all.cc` into the stub files (compile/Compiler.cc, query/*.cc, serve/ServeLoop.cc, db/GraphDb.cc). Requires comprehensive header with all type declarations.
+None — all phases complete.
