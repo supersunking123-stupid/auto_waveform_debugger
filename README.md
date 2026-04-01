@@ -35,12 +35,20 @@ Three components, each independently buildable:
 standalone_trace/
   main.cc                  # thin arg parse + subcommand dispatch
   AssignmentUtils.cc       # assignment text inference utilities
+  compile/
+    Compiler.cc/.h         # slang elaboration -> graph DB compile flow
   db/
-    GraphDb.h              # public API declarations
-    GraphDb_all.cc         # implementation (monolith, Phase 2 extraction pending)
-  compile/                 # stub — slang elaboration -> graph DB (Phase 2)
-  query/                   # stubs — trace/hier/find/whereis queries (Phase 2)
-  serve/                   # stub — interactive serve loop (Phase 2)
+    EntryPoints.h          # shared public entry points
+    GraphDb.cc             # DB read/write and shared graph logic
+    GraphDbInternals.h     # internal helpers and session flags
+    GraphDbTypes.h         # shared structs and type definitions
+  query/
+    TraceQuery.cc/.h       # trace subcommand implementation
+    HierQuery.cc/.h        # hierarchy query implementation
+    FindQuery.cc/.h        # signal search implementation
+    WhereIsQuery.cc/.h     # instance-location query implementation
+  serve/
+    ServeLoop.cc/.h        # interactive serve loop
   third_party/             # slang, fmt
   tests/                   # semantic_regression.py (CTest)
 ```
@@ -96,6 +104,7 @@ uv pip install fastmcp   # or: pip install fastmcp
 ## Run MCP Service
 
 ```bash
+.venv/bin/python3 agent_debug_automation/agent_debug_automation_mcp.py
 .venv/bin/python3 -m agent_debug_automation.agent_debug_automation_mcp
 ```
 

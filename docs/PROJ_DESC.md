@@ -43,14 +43,15 @@ uv pip install fastmcp
 ## Run MCP Service
 
 ```bash
-python -m agent_debug_automation.agent_debug_automation_mcp
+.venv/bin/python3 agent_debug_automation/agent_debug_automation_mcp.py
+.venv/bin/python3 -m agent_debug_automation.agent_debug_automation_mcp
 ```
 
 ## Tests
 
 ```bash
-python3 -m unittest waveform_explorer.tests.test_signal_overview
-python3 -m unittest agent_debug_automation.tests.test_cross_linking
+.venv/bin/python3 -m unittest waveform_explorer.tests.test_signal_overview
+.venv/bin/python3 -m unittest agent_debug_automation.tests.test_cross_linking
 cd standalone_trace && ctest --test-dir build --output-on-failure
 ```
 
@@ -74,7 +75,7 @@ cd standalone_trace && ctest --test-dir build --output-on-failure
 
 | File | Purpose |
 |---|---|
-| `agent_debug_automation_mcp.py` | Single-file MCP server: session persistence, backend process management, signal mapping, cross-link tools, ranking |
+| `agent_debug_automation_mcp.py` | Thin compatibility wrapper that re-exports the split MCP implementation and supports both direct-script and `-m` startup |
 | `tests/test_cross_linking.py` | Cross-link regression (timer_tb VCD + optional NVDLA FSDB) |
 
 ### `waveform_explorer/`
@@ -91,7 +92,14 @@ cd standalone_trace && ctest --test-dir build --output-on-failure
 
 | File | Purpose |
 |---|---|
-| `main.cc` | Monolithic source: compile (slang elaboration + graph DB build), trace/find/hier/serve queries |
+| `main.cc` | Thin subcommand dispatcher for compile, trace, find, hier, whereis-instance, and serve |
+| `compile/Compiler.cc` | Compile pipeline from slang elaboration to graph DB emission |
+| `db/GraphDb.cc` | Shared graph DB load/save logic and common query helpers |
+| `query/TraceQuery.cc` | Trace query implementation |
+| `query/HierQuery.cc` | Hierarchy query implementation |
+| `query/FindQuery.cc` | Signal search implementation |
+| `query/WhereIsQuery.cc` | Instance-location query implementation |
+| `serve/ServeLoop.cc` | Interactive serve-mode command loop |
 | `tests/semantic_regression.py` | CTest-driven semantic regression |
 | `tests/fixtures/` | Small RTL test fixtures |
 
