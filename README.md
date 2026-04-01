@@ -96,7 +96,7 @@ uv pip install fastmcp   # or: pip install fastmcp
 ## Run MCP Service
 
 ```bash
-.venv/bin/python3 agent_debug_automation/agent_debug_automation_mcp.py
+.venv/bin/python3 -m agent_debug_automation.agent_debug_automation_mcp
 ```
 
 ## Tests

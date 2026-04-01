@@ -32,8 +32,8 @@ uv pip install fastmcp
 ## Run MCP service
 
 ```bash
-cd /home/qsun/AI_PROJ/auto_waveform_debugger/agent_debug_automation
-python agent_debug_automation_mcp.py
+cd /home/qsun/AI_PROJ/auto_waveform_debugger
+python -m agent_debug_automation.agent_debug_automation_mcp
 ```
 
 ## MCP client config
@@ -44,7 +44,8 @@ python agent_debug_automation_mcp.py
     "agent_debug_automation": {
       "command": "/home/qsun/AI_PROJ/auto_waveform_debugger/.venv/bin/python",
       "args": [
-        "/home/qsun/AI_PROJ/auto_waveform_debugger/agent_debug_automation/agent_debug_automation_mcp.py"
+        "-m",
+        "agent_debug_automation.agent_debug_automation_mcp"
       ]
     }
   }
