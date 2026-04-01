@@ -40,18 +40,31 @@ This playbook draws from all other playbooks. The tools are organized by the pha
      If given an assertion failure or error message, extract the signal name and time.
      If given a vague description, use find_condition or find_value_intervals to locate it.
 
-1.2  Bookmark the failure point:
+1.2  Create the error-scenario anchor session — this is your home base for the
+     entire debug. Every investigation branch starts here and must ultimately
+     explain the signals captured in this snapshot.
+     → create_session(waveform_path=<path>, session_name="error_scenario")
      → set_cursor(time=T_fail)
-     → create_bookmark(bookmark_name="failure", time=T_fail)
+     → create_bookmark(bookmark_name="error_point", time=T_fail,
+                        description="<failure desc + time precision note>")
 
-1.3  Take a snapshot of the failing signal and its neighbors:
+1.3  Take a snapshot of the failing signal and ALL signals mentioned in the
+     error message:
      → get_snapshot(signals=[failing_signal, related_signals...], time="Cursor")
+     → create_signal_group(group_name="error_interface",
+                            signals=[...the signals just snapshotted...])
 
 1.4  Check recent activity around the failure:
      → get_transitions(path=failing_signal, start_time=T_fail-window, end_time=T_fail)
      → find_edge(path=failing_signal, edge_type="anyedge", start_time=T_fail, direction="backward")
 
-1.5  Record your observations before moving on.
+1.5  Understand how the waveform correlates with the error message BEFORE
+     moving on. For each signal in the error message, explain how its waveform
+     value at T_fail produced the specific error text. If you cannot explain the
+     correlation, you are not ready for Phase 2.
+
+1.6  Record your observations. The error-scenario snapshot is the contract:
+     your final root cause must explain every value in it.
 ```
 
 **Output of Phase 1:** You know *what* is wrong and *when* it went wrong. You have a bookmark at the failure time.
@@ -140,7 +153,16 @@ This playbook draws from all other playbooks. The tools are organized by the pha
 
 **Common mistake:** Finding that `signal B is 0 when it should be 1` and immediately concluding "the logic driving B is the bug — let me fix it." B's driver may itself be driven by a wrong signal. Check B's drivers before touching any code.
 
-**Output of Phase 3:** A complete causal chain, with every link supported by waveform evidence, ending at a root cause that satisfies one of the stop criteria above.
+**When data sequences are long (>20 transitions):** Do not try to reason over raw JSON output mentally. Write a short Python script to process the data — iterate transitions, compare expected vs. actual, flag anomalies. See `06_SUPERVISED_DEBUG.md` for the script structure and review protocol. This prevents miscounting, value confusion, and missed patterns.
+
+**Backtracking to the error-scenario anchor:** If a branch terminates at a correct signal (dead end), return to the error-scenario session and pick a different signal from the `error_interface` group to trace:
+```
+switch_session(session_name="error_scenario")
+get_snapshot(signals=["error_interface"], signals_are_groups=True, time="BM_error_point")
+# Pick the next untried signal from the group and restart from Phase 2
+```
+
+**Output of Phase 3:** A complete causal chain, with every link supported by waveform evidence, ending at a root cause that satisfies one of the stop criteria above. The root cause must explain every signal value in the error-scenario snapshot created in Phase 1.
 
 ---
 
@@ -220,3 +242,5 @@ Phase 4:
 - **The debug loop is iterative.** Phase 3 often reveals a deeper cause that sends you back to Phase 2 with a new target signal. This is normal.
 - **Stop when you reach a primary input or testbench stimulus.** That is the boundary of RTL responsibility.
 - **Window sizing:** When using `rank_cone_by_time`, start with a window of 5–10 clock cycles before the failure. Too wide a window dilutes the ranking; too narrow might miss the cause.
+- **Golden boundary (Rule 14):** VIPs, assertions, and protocol checkers are golden — never question their correctness. If an assertion fires, the DUT is wrong. Trace the DUT signals that triggered the assertion, not the assertion logic itself.
+- **Error-scenario anchor:** Your final conclusion must explain every value in the Phase 1 error-scenario snapshot. If it doesn't, the investigation is incomplete.

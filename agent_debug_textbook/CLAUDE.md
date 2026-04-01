@@ -49,3 +49,13 @@ Phase 4: Verify and document (bookmarks, signal groups, causal chain)
 ```
 
 This workflow is fully prescribed in `agent_debug_textbook/04_ROOT_CAUSE_ANALYSIS.md`. Use it as a checklist.
+
+## When to use supervised mode
+
+If a single-agent debug attempt has failed — the agent drifted from playbooks, made careless tool calls, or reached conclusions based on unverified assumptions — retry with the two-agent **Supervised Debug** architecture described in `agent_debug_textbook/06_SUPERVISED_DEBUG.md`.
+
+Key elements:
+- A **Supervisor** agent reviews every tool call and conclusion before the Debugger advances to the next phase.
+- An **error-scenario anchor session** serves as the starting point and backtracking target for every investigation branch.
+- **Python scripts** replace manual inspection of long waveform data sequences (>20 transitions).
+- **Golden boundary rule** (Rule 14): never question VIPs, assertions, or protocol checkers — trace the DUT signals that feed them instead.
