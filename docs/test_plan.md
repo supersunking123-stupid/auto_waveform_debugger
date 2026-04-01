@@ -1,5 +1,7 @@
 # Test Enhancement Plan
 
+> **Status: COMPLETED** — All test enhancements in this plan were implemented in commit `d23eb75` ("Enhance test coverage across all three components and fix product bugs"). Post-refactor baseline: 83/83 tests pass.
+
 ## Overview
 
 This plan addresses all blind spots identified in the test coverage audit across three components. Each section targets a specific component with concrete test additions.

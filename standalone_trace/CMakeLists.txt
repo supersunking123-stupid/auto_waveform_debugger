@@ -24,7 +24,12 @@ set(SLANG_USE_CPPTRACE OFF CACHE BOOL "")
 
 add_subdirectory(third_party/slang)
 
-add_executable(rtl_trace main.cc AssignmentUtils.cc)
+add_executable(rtl_trace
+  main.cc
+  AssignmentUtils.cc
+  db/GraphDb_all.cc
+)
+target_include_directories(rtl_trace PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(rtl_trace PRIVATE slang::slang)
 
 add_executable(assignment_utils_test tests/assignment_utils_test.cc AssignmentUtils.cc)

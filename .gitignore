@@ -13,6 +13,7 @@ test_cases/**/rtl/
 test_cases/**/*.db
 test_cases/**/*.db.meta
 test_cases/rtl_trace.db.meta
+test_cases/**/*.json
 
 # standalone_trace build artifacts
 standalone_trace/third_party/bak/
@@ -29,5 +30,18 @@ agent_debug_automation/.session_store/
 # MCP config (machine-specific)
 .mcp.json
 
+# AI tool artifacts
+.qwen/
+
+# Lab / course materials
+UVM_knowledge/
+
+# Environment
+.env
+
+# Editor
+*.swp
+
 # Misc
 conversation.log
+.claude/scheduled_tasks.lock

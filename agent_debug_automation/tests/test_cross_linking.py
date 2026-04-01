@@ -105,7 +105,7 @@ class CrossLinkingTests(unittest.TestCase):
         Path(cls.overview_waveform_path).write_text(OVERVIEW_FIXTURE_VCD, encoding="ascii")
         cls.rtl_trace_bin = str(ROOT / "standalone_trace" / "build" / "rtl_trace")
         cls.wave_cli_bin = str(ROOT / "waveform_explorer" / "build" / "wave_agent_cli")
-        fixture_dir = ROOT / "standalone_trace" / "test_case0"
+        fixture_dir = Path(__file__).parent / "fixtures"
         subprocess.run(
             [
                 cls.rtl_trace_bin,
