@@ -1,6 +1,6 @@
 // ServeLoop.cc — Interactive serve mode implementation.
 #include "serve/ServeLoop.h"
-#include "db/GraphDb.h"
+#include "db/EntryPoints.h"
 #include "db/GraphDbTypes.h"
 #include "db/GraphDbInternals.h"
 #include "query/TraceQuery.h"

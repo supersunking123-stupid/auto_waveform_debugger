@@ -1,5 +1,5 @@
 #pragma once
-// GraphDb.h — Public API for standalone_trace modules.
+// EntryPoints.h — Public API for standalone_trace modules.
 
 namespace rtl_trace {
 

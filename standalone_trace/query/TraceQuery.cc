@@ -1,6 +1,6 @@
 // TraceQuery.cc — Trace query subcommand implementation.
 #include "query/TraceQuery.h"
-#include "db/GraphDb.h"
+#include "db/EntryPoints.h"
 #include "db/GraphDbTypes.h"
 #include "db/GraphDbInternals.h"
 

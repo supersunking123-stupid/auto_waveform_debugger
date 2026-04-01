@@ -1,4 +1,4 @@
-#include "db/GraphDb.h"
+#include "db/EntryPoints.h"
 #include <iostream>
 #include <string>
 

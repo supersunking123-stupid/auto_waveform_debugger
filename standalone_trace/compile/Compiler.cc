@@ -1,5 +1,5 @@
 #include "compile/Compiler.h"
-#include "db/GraphDb.h"
+#include "db/EntryPoints.h"
 #include "db/GraphDbTypes.h"
 #include "db/GraphDbInternals.h"
 #include "AssignmentUtils.h"

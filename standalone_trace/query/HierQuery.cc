@@ -1,6 +1,6 @@
 // HierQuery.cc — Hierarchy query subcommand implementation.
 #include "query/HierQuery.h"
-#include "db/GraphDb.h"
+#include "db/EntryPoints.h"
 #include "db/GraphDbTypes.h"
 #include "db/GraphDbInternals.h"
 

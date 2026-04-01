@@ -2,7 +2,7 @@
 // Contains: compile-time trace building, graph DB I/O, session management,
 // string/path/bit utilities, CLI helpers, help printers, and query output functions.
 
-#include "db/GraphDb.h"
+#include "db/EntryPoints.h"
 #include "db/GraphDbTypes.h"
 #include "db/GraphDbInternals.h"
 #include "AssignmentUtils.h"

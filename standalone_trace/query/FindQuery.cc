@@ -1,6 +1,6 @@
 // FindQuery.cc — Find query subcommand implementation.
 #include "query/FindQuery.h"
-#include "db/GraphDb.h"
+#include "db/EntryPoints.h"
 #include "db/GraphDbTypes.h"
 #include "db/GraphDbInternals.h"
 
