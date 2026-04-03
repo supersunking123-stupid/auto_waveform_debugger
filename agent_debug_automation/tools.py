@@ -475,6 +475,93 @@ def get_transitions(
 
 
 @mcp.tool()
+def count_transitions(
+    vcd_path: Optional[str] = None,
+    path: str = "",
+    start_time: TimeReference = 0,
+    end_time: TimeReference = 0,
+    edge_type: EdgeType | EdgeTypeAlias = "anyedge",
+    session_name: Optional[str] = None,
+):
+    """Count edges or toggles for one signal in a session-aware time window."""
+    try:
+        edge_type = _normalize_edge_type(edge_type)
+        resolved_start, resolved_end, start_info, end_info, session = _resolve_time_range_reference(
+            start_time,
+            end_time,
+            waveform_path=vcd_path,
+            session_name=session_name,
+        )
+        import agent_debug_automation.agent_debug_automation_mcp as _wrapper
+        result = _wrapper.wave_agent_query(
+            session["waveform_path"],
+            "count_transitions",
+            {
+                "path": path,
+                "start_time": resolved_start,
+                "end_time": resolved_end,
+                "edge_type": edge_type,
+            },
+        )
+        result["resolved_time_range"] = {"start": start_info, "end": end_info}
+        return _with_session_metadata(result, session)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool()
+def dump_waveform_data(
+    vcd_path: Optional[str] = None,
+    signals: Optional[List[str]] = None,
+    start_time: TimeReference = 0,
+    end_time: TimeReference = 0,
+    output_path: str = "",
+    mode: str = "transitions",
+    sample_period: Optional[int] = None,
+    radix: str = "hex",
+    overwrite: bool = False,
+    signals_are_groups: bool = False,
+    session_name: Optional[str] = None,
+):
+    """Dump waveform data to a local JSONL file for offline processing."""
+    try:
+        expanded_signals, signal_info, signal_session = _expand_signal_groups(
+            signals or [],
+            signals_are_groups=signals_are_groups,
+            waveform_path=vcd_path,
+            session_name=session_name,
+        )
+        resolved_start, resolved_end, start_info, end_info, time_session = _resolve_time_range_reference(
+            start_time,
+            end_time,
+            waveform_path=signal_session["waveform_path"] if signal_session else vcd_path,
+            session_name=signal_session["session_name"] if signal_session else session_name,
+        )
+        session = time_session if signal_session is None else signal_session
+        import agent_debug_automation.agent_debug_automation_mcp as _wrapper
+        payload = {
+            "signals": expanded_signals,
+            "start_time": resolved_start,
+            "end_time": resolved_end,
+            "output_path": output_path,
+            "mode": mode,
+            "radix": radix,
+            "overwrite": overwrite,
+        }
+        if sample_period is not None:
+            payload["sample_period"] = sample_period
+        result = _wrapper.wave_agent_query(
+            session["waveform_path"],
+            "dump_waveform_data",
+            payload,
+        )
+        result["resolved_time_range"] = {"start": start_info, "end": end_info}
+        return _with_session_metadata(result, session, None, signal_info)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool()
 def get_signal_overview(
     vcd_path: Optional[str] = None,
     path: str = "",

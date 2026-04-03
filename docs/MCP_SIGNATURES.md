@@ -205,6 +205,8 @@ find_edge(vcd_path: Optional[str] = None, path: str = "", edge_type: EdgeType | 
 find_value_intervals(vcd_path: Optional[str] = None, path: str = "", value: str = "", start_time: TimeReference = 0, end_time: TimeReference = 0, radix: str = "hex", session_name: Optional[str] = None)
 find_condition(vcd_path: Optional[str] = None, expression: str = "", start_time: TimeReference = 0, direction: Direction = "forward", session_name: Optional[str] = None)
 get_transitions(vcd_path: Optional[str] = None, path: str = "", start_time: TimeReference = 0, end_time: TimeReference = 0, max_limit: int = 50, session_name: Optional[str] = None)
+count_transitions(vcd_path: Optional[str] = None, path: str = "", start_time: TimeReference = 0, end_time: TimeReference = 0, edge_type: EdgeType | EdgeTypeAlias = "anyedge", session_name: Optional[str] = None)
+dump_waveform_data(vcd_path: Optional[str] = None, signals: Optional[List[str]] = None, start_time: TimeReference = 0, end_time: TimeReference = 0, output_path: str = "", mode: str = "transitions", sample_period: Optional[int] = None, radix: str = "hex", overwrite: bool = False, signals_are_groups: bool = False, session_name: Optional[str] = None)
 get_signal_overview(vcd_path: Optional[str] = None, path: str = "", start_time: TimeReference = 0, end_time: TimeReference = 0, resolution: ResolutionReference = "auto", radix: str = "hex", session_name: Optional[str] = None)
 analyze_pattern(vcd_path: Optional[str] = None, path: str = "", start_time: TimeReference = 0, end_time: TimeReference = 0, session_name: Optional[str] = None)
 ```

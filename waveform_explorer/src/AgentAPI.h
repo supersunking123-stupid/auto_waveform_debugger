@@ -36,6 +36,20 @@ public:
 
     // 4. Compressed Transitions
     json get_transitions(const std::string& signal_path, uint64_t start_time, uint64_t end_time, int max_limit = 50);
+    json count_transitions(
+        const std::string& signal_path,
+        uint64_t start_time,
+        uint64_t end_time,
+        const std::string& edge_type = "anyedge");
+    json dump_waveform_data(
+        const std::vector<std::string>& signal_paths,
+        uint64_t start_time,
+        uint64_t end_time,
+        const std::string& output_path,
+        const std::string& mode = "transitions",
+        const json& sample_period = nullptr,
+        const std::string& radix = "hex",
+        bool overwrite = false);
     json get_signal_overview(
         const std::string& signal_path,
         uint64_t start_time,

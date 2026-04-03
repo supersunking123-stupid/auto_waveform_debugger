@@ -2,6 +2,7 @@
 
 import json
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -279,6 +280,108 @@ class WaveformCommandTests(unittest.TestCase):
         self.assertEqual(result["status"], "success")
         transitions = result["data"]
         self.assertLessEqual(len(transitions), 2)
+
+    def test_count_transitions_posedge(self):
+        result = self._query("count_transitions", {
+            "path": "timer_tb.clk",
+            "start_time": 0,
+            "end_time": 30000,
+            "edge_type": "posedge",
+        })
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["data"]["count"], 3)
+        self.assertEqual(result["data"]["effective_mode"], "posedge")
+
+    def test_count_transitions_negedge(self):
+        result = self._query("count_transitions", {
+            "path": "timer_tb.clk",
+            "start_time": 0,
+            "end_time": 30000,
+            "edge_type": "negedge",
+        })
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["data"]["count"], 3)
+
+    def test_count_transitions_multibit_counts_toggles(self):
+        result = self._query("count_transitions", {
+            "path": "timer_tb.load_value",
+            "start_time": 70000,
+            "end_time": 135000,
+            "edge_type": "posedge",
+        })
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["data"]["count"], 5)
+        self.assertEqual(result["data"]["effective_mode"], "toggle")
+
+    def test_dump_waveform_data_transitions_jsonl(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "transitions.jsonl"
+            result = self._query("dump_waveform_data", {
+                "signals": ["timer_tb.clk", "timer_tb.rst_n"],
+                "start_time": 0,
+                "end_time": 60000,
+                "output_path": str(output_path),
+                "mode": "transitions",
+            })
+            self.assertEqual(result["status"], "success")
+            self.assertEqual(result["format"], "jsonl")
+            self.assertEqual(result["records_written"], 15)
+
+            rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(rows), 15)
+            self.assertEqual(rows[0], {
+                "t": 0,
+                "signal": "timer_tb.clk",
+                "event": "anyedge",
+                "value_before": "x",
+                "value_after": "0",
+                "glitch": False,
+            })
+            self.assertEqual(rows[2], {
+                "t": 5000,
+                "signal": "timer_tb.clk",
+                "event": "posedge",
+                "value_before": "0",
+                "value_after": "1",
+                "glitch": False,
+            })
+            same_time_rows = [row for row in rows if row["t"] == 50000]
+            self.assertEqual([row["signal"] for row in same_time_rows], ["timer_tb.clk", "timer_tb.rst_n"])
+
+    def test_dump_waveform_data_samples_jsonl(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "samples.jsonl"
+            result = self._query("dump_waveform_data", {
+                "signals": ["timer_tb.clk", "timer_tb.load_value"],
+                "start_time": 0,
+                "end_time": 50000,
+                "output_path": str(output_path),
+                "mode": "samples",
+                "sample_period": 25000,
+                "radix": "hex",
+            })
+            self.assertEqual(result["status"], "success")
+            self.assertEqual(result["records_written"], 3)
+
+            rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual([row["t"] for row in rows], [0, 25000, 50000])
+            self.assertEqual(rows[0]["values"]["timer_tb.clk"], "0")
+            self.assertEqual(rows[1]["values"]["timer_tb.clk"], "rising")
+            self.assertEqual(rows[2]["values"]["timer_tb.load_value"], "h00")
+
+    def test_dump_waveform_data_overwrite_guard(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "existing.jsonl"
+            output_path.write_text("old\n", encoding="utf-8")
+            result = self._query("dump_waveform_data", {
+                "signals": ["timer_tb.clk"],
+                "start_time": 0,
+                "end_time": 10000,
+                "output_path": str(output_path),
+                "mode": "transitions",
+            })
+            self.assertEqual(result["status"], "error")
+            self.assertIn("overwrite=true", result["message"])
 
     # ------------------------------------------------------------------
     # analyze_pattern

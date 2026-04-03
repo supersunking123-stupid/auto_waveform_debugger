@@ -150,6 +150,48 @@ def get_transitions(vcd_path: str, path: str, start_time: int, end_time: int, ma
         return {"status": "error", "message": str(e)}
 
 @mcp.tool()
+def count_transitions(vcd_path: str, path: str, start_time: int, end_time: int, edge_type: str = "anyedge"):
+    """Count edges or toggles for one signal in one explicit integer time window."""
+    try:
+        return get_daemon(vcd_path).query("count_transitions", {
+            "path": path,
+            "start_time": start_time,
+            "end_time": end_time,
+            "edge_type": edge_type,
+        })
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@mcp.tool()
+def dump_waveform_data(
+    vcd_path: str,
+    signals: List[str],
+    start_time: int,
+    end_time: int,
+    output_path: str,
+    mode: str = "transitions",
+    sample_period: Optional[int] = None,
+    radix: str = "hex",
+    overwrite: bool = False,
+):
+    """Dump waveform data to a local JSONL file without returning the full dataset over MCP."""
+    try:
+        args = {
+            "signals": signals,
+            "start_time": start_time,
+            "end_time": end_time,
+            "output_path": output_path,
+            "mode": mode,
+            "radix": radix,
+            "overwrite": overwrite,
+        }
+        if sample_period is not None:
+            args["sample_period"] = sample_period
+        return get_daemon(vcd_path).query("dump_waveform_data", args)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@mcp.tool()
 def get_signal_overview(
     vcd_path: str,
     path: str,

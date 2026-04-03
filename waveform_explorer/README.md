@@ -100,6 +100,19 @@ Get a compressed history of signal flips within a time window.
 - **Query:** `{"cmd": "get_transitions", "args": {"path": "TOP.clk", "start_time": 0, "end_time": 20000, "max_limit": 10}}`
 - **Response:** Includes timestamps and values, with `glitch: true` if multiple changes occur at the same timestamp.
 
+#### 3a. `count_transitions`
+Count edges or toggles within a time window.
+- **Query:** `{"cmd": "count_transitions", "args": {"path": "TOP.clk", "start_time": 0, "end_time": 20000, "edge_type": "posedge"}}`
+- **Scalar behavior:** `posedge`, `negedge`, and `anyedge` are supported.
+- **Multi-bit behavior:** counts toggles regardless of the requested edge filter.
+
+#### 3c. `dump_waveform_data`
+Write large waveform windows directly to a local JSONL file.
+- **Query:** `{"cmd": "dump_waveform_data", "args": {"signals": ["TOP.clk", "TOP.count"], "start_time": 0, "end_time": 20000, "output_path": "/tmp/wave.jsonl", "mode": "transitions"}}`
+- **Modes:** `transitions` or `samples`
+- **Sample mode:** requires `sample_period`
+- **Safety:** existing files are preserved unless `overwrite` is set to `true`
+
 #### 3b. `get_signal_overview`
 Get a resolution-aware overview of one signal over a time window.
 - **Query:** `{"cmd": "get_signal_overview", "args": {"path": "TOP.bus[7:0]", "start_time": 0, "end_time": 20000, "resolution": "auto", "radix": "hex"}}`

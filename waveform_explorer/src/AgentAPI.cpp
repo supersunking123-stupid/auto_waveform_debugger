@@ -3,8 +3,11 @@
 #include <cctype>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <map>
+#include <optional>
 #include <regex>
 #include <set>
 #include <sstream>
@@ -740,6 +743,109 @@ uint64_t choose_auto_resolution(
     return low;
 }
 
+struct ClassifiedTransition {
+    bool changed = false;
+    bool matches_requested_edge = false;
+    std::string event;
+    std::string value_before;
+    std::string value_after;
+};
+
+std::optional<std::string> parse_sample_period_arg(const json& sample_period) {
+    if (sample_period.is_null()) {
+        return std::nullopt;
+    }
+
+    if (sample_period.is_number_integer() || sample_period.is_number_unsigned()) {
+        const auto value = sample_period.get<int64_t>();
+        if (value <= 0) {
+            return "sample_period must be > 0";
+        }
+        return std::nullopt;
+    }
+
+    if (sample_period.is_string()) {
+        try {
+            const auto value = std::stoll(sample_period.get<std::string>());
+            if (value <= 0) {
+                return "sample_period must be > 0";
+            }
+            return std::nullopt;
+        } catch (...) {
+            return "sample_period must be an integer";
+        }
+    }
+
+    return "sample_period must be an integer";
+}
+
+uint64_t extract_sample_period_arg(const json& sample_period) {
+    if (sample_period.is_number_integer() || sample_period.is_number_unsigned()) {
+        return sample_period.get<uint64_t>();
+    }
+    return static_cast<uint64_t>(std::stoull(sample_period.get<std::string>()));
+}
+
+ClassifiedTransition classify_transition_event(
+    const SignalInfo& info,
+    const std::string& raw_before,
+    const std::string& raw_after,
+    const std::string& requested_edge_type) {
+    ClassifiedTransition result;
+    result.value_before = info.width <= 1 ? simplify_scalar_value(raw_before) : raw_before;
+    result.value_after = info.width <= 1 ? simplify_scalar_value(raw_after) : raw_after;
+
+    if (info.width <= 1) {
+        if (result.value_before == result.value_after) {
+            return result;
+        }
+        result.changed = true;
+        if (result.value_before == "0" && result.value_after == "1") {
+            result.event = "posedge";
+        } else if (result.value_before == "1" && result.value_after == "0") {
+            result.event = "negedge";
+        } else {
+            result.event = "anyedge";
+        }
+        result.matches_requested_edge =
+            requested_edge_type == "anyedge" ||
+            requested_edge_type == result.event ||
+            (requested_edge_type == "anyedge" && result.changed);
+        return result;
+    }
+
+    if (raw_before == raw_after) {
+        return result;
+    }
+    result.changed = true;
+    result.event = "toggle";
+    result.matches_requested_edge = true;
+    return result;
+}
+
+std::string effective_count_mode(const SignalInfo& info, const std::string& requested_edge_type) {
+    if (info.width <= 1) {
+        return requested_edge_type;
+    }
+    return "toggle";
+}
+
+struct DumpTransitionRecord {
+    uint64_t timestamp = 0;
+    std::string signal;
+    std::string event;
+    std::string value_before;
+    std::string value_after;
+    bool glitch = false;
+};
+
+bool dump_transition_record_less(const DumpTransitionRecord& lhs, const DumpTransitionRecord& rhs) {
+    if (lhs.timestamp != rhs.timestamp) {
+        return lhs.timestamp < rhs.timestamp;
+    }
+    return lhs.signal < rhs.signal;
+}
+
 json format_signal_value_at_time(WaveDatabase& db, const std::string& signal_path, uint64_t time, const std::string& radix) {
     if (!db.has_signal(signal_path)) {
         return "x";
@@ -1058,6 +1164,7 @@ json AgentAPI::find_condition(const std::string& expression, uint64_t start_time
 
 json AgentAPI::get_transitions(const std::string& signal_path, uint64_t start_time, uint64_t end_time, int max_limit) {
     if (!db.has_signal(signal_path)) return {{"status", "error"}, {"message", "Signal not found"}};
+    if (start_time > end_time) return {{"status", "error"}, {"message", "start_time must be <= end_time"}};
 
     const auto& trans = db.get_transitions(signal_path);
     json history = json::array();
@@ -1082,6 +1189,232 @@ json AgentAPI::get_transitions(const std::string& signal_path, uint64_t start_ti
         {"status", "success"},
         {"data", history},
         {"truncated", it != trans.end() && it->timestamp <= end_time}
+    };
+}
+
+json AgentAPI::count_transitions(
+    const std::string& signal_path,
+    uint64_t start_time,
+    uint64_t end_time,
+    const std::string& edge_type) {
+    if (!db.has_signal(signal_path)) {
+        return {{"status", "error"}, {"message", "Signal not found"}};
+    }
+    if (start_time > end_time) {
+        return {{"status", "error"}, {"message", "start_time must be <= end_time"}};
+    }
+
+    const auto& info = db.get_signal_info(signal_path);
+    if (info.width <= 1 &&
+        edge_type != "posedge" &&
+        edge_type != "negedge" &&
+        edge_type != "anyedge") {
+        return {{"status", "error"}, {"message", "edge_type must be posedge, negedge, or anyedge"}};
+    }
+
+    const auto& trans = db.get_transitions(signal_path);
+    int64_t count = 0;
+    auto it = std::lower_bound(
+        trans.begin(),
+        trans.end(),
+        start_time,
+        [](const Transition& tr, uint64_t t) {
+            return tr.timestamp < t;
+        });
+
+    while (it != trans.end() && it->timestamp <= end_time) {
+        const uint64_t before_time = it->timestamp == 0 ? 0 : (it->timestamp - 1);
+        const std::string before = it->timestamp == 0 ? "U" : db.get_value_at_time(signal_path, before_time);
+        const ClassifiedTransition event = classify_transition_event(info, before, it->value, edge_type);
+        if (event.changed && event.matches_requested_edge) {
+            ++count;
+        }
+        ++it;
+    }
+
+    return {
+        {"status", "success"},
+        {"data", {
+            {"count", count},
+            {"signal", info.path},
+            {"width", info.width},
+            {"requested_edge_type", edge_type},
+            {"effective_mode", effective_count_mode(info, edge_type)},
+            {"start_time", start_time},
+            {"end_time", end_time},
+        }},
+    };
+}
+
+json AgentAPI::dump_waveform_data(
+    const std::vector<std::string>& signal_paths,
+    uint64_t start_time,
+    uint64_t end_time,
+    const std::string& output_path,
+    const std::string& mode,
+    const json& sample_period,
+    const std::string& radix,
+    bool overwrite) {
+    if (signal_paths.empty()) {
+        return {{"status", "error"}, {"message", "signals must not be empty"}};
+    }
+    if (start_time > end_time) {
+        return {{"status", "error"}, {"message", "start_time must be <= end_time"}};
+    }
+    if (output_path.empty()) {
+        return {{"status", "error"}, {"message", "output_path must not be empty"}};
+    }
+    if (mode != "transitions" && mode != "samples") {
+        return {{"status", "error"}, {"message", "mode must be transitions or samples"}};
+    }
+
+    if (mode == "samples") {
+        if (const auto sample_period_error = parse_sample_period_arg(sample_period)) {
+            return {{"status", "error"}, {"message", *sample_period_error}};
+        }
+    } else if (!sample_period.is_null()) {
+        if (const auto sample_period_error = parse_sample_period_arg(sample_period)) {
+            return {{"status", "error"}, {"message", *sample_period_error}};
+        }
+    }
+
+    std::vector<std::string> resolved_signals;
+    resolved_signals.reserve(signal_paths.size());
+    for (const auto& path : signal_paths) {
+        if (!db.has_signal(path)) {
+            return {{"status", "error"}, {"message", "Signal not found: " + path}};
+        }
+        resolved_signals.push_back(db.get_signal_info(path).path);
+    }
+
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path requested_path(output_path);
+    const fs::path absolute_output = fs::absolute(requested_path, ec);
+    if (ec) {
+        return {{"status", "error"}, {"message", "failed to resolve output_path"}};
+    }
+    const fs::path parent_dir = absolute_output.parent_path();
+    if (!parent_dir.empty() && !fs::exists(parent_dir)) {
+        return {{"status", "error"}, {"message", "output directory does not exist"}};
+    }
+    if (fs::exists(absolute_output) && !overwrite) {
+        return {{"status", "error"}, {"message", "output_path already exists; pass overwrite=true to replace it"}};
+    }
+
+    const fs::path temp_path = absolute_output.string() + ".tmp";
+    std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) {
+        return {{"status", "error"}, {"message", "failed to open temp output file"}};
+    }
+
+    uint64_t records_written = 0;
+    uint64_t bytes_written = 0;
+    const std::string normalized_radix = normalize_radix(radix);
+
+    auto write_line = [&](const json& record) {
+        const std::string line = record.dump();
+        out << line << '\n';
+        bytes_written += static_cast<uint64_t>(line.size() + 1);
+        ++records_written;
+    };
+
+    std::string write_error;
+    if (mode == "transitions") {
+        std::vector<DumpTransitionRecord> records;
+        for (const auto& path : resolved_signals) {
+            const auto& info = db.get_signal_info(path);
+            const auto& transitions = db.get_transitions(path);
+            auto it = std::lower_bound(
+                transitions.begin(),
+                transitions.end(),
+                start_time,
+                [](const Transition& tr, uint64_t t) {
+                    return tr.timestamp < t;
+                });
+            while (it != transitions.end() && it->timestamp <= end_time) {
+                const uint64_t before_time = it->timestamp == 0 ? 0 : (it->timestamp - 1);
+                const std::string before = it->timestamp == 0 ? "U" : db.get_value_at_time(path, before_time);
+                const ClassifiedTransition event = classify_transition_event(info, before, it->value, "anyedge");
+                if (event.changed) {
+                    records.push_back({
+                        it->timestamp,
+                        info.path,
+                        event.event,
+                        event.value_before,
+                        event.value_after,
+                        it->is_glitch,
+                    });
+                }
+                ++it;
+            }
+        }
+
+        std::sort(records.begin(), records.end(), dump_transition_record_less);
+        for (const auto& record : records) {
+            write_line({
+                {"t", record.timestamp},
+                {"signal", record.signal},
+                {"event", record.event},
+                {"value_before", record.value_before},
+                {"value_after", record.value_after},
+                {"glitch", record.glitch},
+            });
+        }
+    } else {
+        const uint64_t step = extract_sample_period_arg(sample_period);
+        for (uint64_t time = start_time; time <= end_time;) {
+            json values = json::object();
+            for (const auto& path : resolved_signals) {
+                values[path] = format_signal_value_at_time(db, path, time, normalized_radix);
+            }
+            write_line({
+                {"t", time},
+                {"values", values},
+            });
+            if (time > std::numeric_limits<uint64_t>::max() - step) {
+                break;
+            }
+            time += step;
+        }
+    }
+
+    out.close();
+    if (!out) {
+        write_error = "failed while writing output file";
+    }
+
+    if (write_error.empty()) {
+        if (overwrite && fs::exists(absolute_output)) {
+            fs::remove(absolute_output, ec);
+            if (ec) {
+                write_error = "failed to replace existing output file";
+            }
+        }
+    }
+    if (write_error.empty()) {
+        fs::rename(temp_path, absolute_output, ec);
+        if (ec) {
+            write_error = "failed to finalize output file";
+        }
+    }
+    if (!write_error.empty()) {
+        fs::remove(temp_path, ec);
+        return {{"status", "error"}, {"message", write_error}};
+    }
+
+    return {
+        {"status", "success"},
+        {"output_path", absolute_output.string()},
+        {"format", "jsonl"},
+        {"mode", mode},
+        {"records_written", records_written},
+        {"bytes_written", bytes_written},
+        {"signals", resolved_signals},
+        {"start_time", start_time},
+        {"end_time", end_time},
+        {"radix", mode == "samples" ? json(normalized_radix) : json(nullptr)},
+        {"sample_period", mode == "samples" ? json(extract_sample_period_arg(sample_period)) : json(nullptr)},
     };
 }
 

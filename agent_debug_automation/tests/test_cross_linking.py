@@ -321,6 +321,99 @@ class CrossLinkingTests(unittest.TestCase):
         self.assertGreaterEqual(result["resolution"], 3)
         self.assertLessEqual(len(result["segments"]), 20)
 
+    def test_count_transitions_resolves_session_time_aliases(self):
+        mcp_mod.create_session(
+            waveform_path=self.waveform_path,
+            session_name="count_view",
+            description="counter aliases",
+        )
+        mcp_mod.switch_session("count_view", waveform_path=self.waveform_path)
+        mcp_mod.set_cursor(0, waveform_path=self.waveform_path, session_name="count_view")
+        mcp_mod.create_bookmark(
+            "count_end",
+            30000,
+            waveform_path=self.waveform_path,
+            session_name="count_view",
+            description="count range end",
+        )
+
+        result = mcp_mod.count_transitions(
+            vcd_path=self.waveform_path,
+            path="timer_tb.clk",
+            start_time="Cursor",
+            end_time="BM_count_end",
+            edge_type="rise",
+            session_name="count_view",
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["data"]["count"], 3)
+        self.assertEqual(result["data"]["effective_mode"], "posedge")
+        self.assertEqual(result["resolved_time_range"]["start"]["resolved_time"], 0)
+        self.assertEqual(result["resolved_time_range"]["end"]["resolved_time"], 30000)
+
+    def test_dump_waveform_data_expands_signal_groups(self):
+        mcp_mod.create_signal_group(
+            "timeout_group",
+            ["timer_tb.timeout", "timer_tb.clk", "timer_tb.timeout"],
+            waveform_path=self.waveform_path,
+            description="dump bundle",
+        )
+        output_path = Path(self.temp_dir.name) / "dump_group.jsonl"
+
+        result = mcp_mod.dump_waveform_data(
+            vcd_path=self.waveform_path,
+            signals=["timeout_group"],
+            start_time=70000,
+            end_time=80000,
+            output_path=str(output_path),
+            mode="samples",
+            sample_period=5000,
+            signals_are_groups=True,
+        )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(
+            result["resolved_signals"]["expanded_signals"],
+            ["timer_tb.timeout", "timer_tb.clk"],
+        )
+        self.assertEqual(result["records_written"], 3)
+        rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([row["t"] for row in rows], [70000, 75000, 80000])
+        self.assertIn("timer_tb.timeout", rows[1]["values"])
+
+    def test_dump_waveform_data_forwards_arguments(self):
+        calls = []
+
+        def fake_wave_agent_query(vcd_path, cmd, args=None, wave_cli_bin=None):
+            calls.append((cmd, dict(args or {})))
+            return {"status": "success", "output_path": "/tmp/out.jsonl"}
+
+        with mock.patch.object(mcp_mod, "wave_agent_query", side_effect=fake_wave_agent_query):
+            result = mcp_mod.dump_waveform_data(
+                vcd_path="/tmp/mock.fsdb",
+                signals=["top.a", "top.b"],
+                start_time=10,
+                end_time=30,
+                output_path="/tmp/out.jsonl",
+                mode="samples",
+                sample_period=5,
+                radix="bin",
+                overwrite=True,
+            )
+
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(calls, [("dump_waveform_data", {
+            "signals": ["top.a", "top.b"],
+            "start_time": 10,
+            "end_time": 30,
+            "output_path": "/tmp/out.jsonl",
+            "mode": "samples",
+            "radix": "bin",
+            "overwrite": True,
+            "sample_period": 5,
+        })])
+
     def test_concurrent_rtl_session_lookup_reuses_single_session(self):
         created = []
 

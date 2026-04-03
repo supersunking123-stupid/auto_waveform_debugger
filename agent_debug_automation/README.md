@@ -106,6 +106,8 @@ These keep the original `rtl_trace` command model unchanged.
 - `find_value_intervals(vcd_path=None, path, value, start_time, end_time, radix="hex", session_name=None)`
 - `find_condition(vcd_path=None, expression, start_time, direction="forward", session_name=None)`
 - `get_transitions(vcd_path=None, path, start_time, end_time, max_limit=50, session_name=None)`
+- `count_transitions(vcd_path=None, path, start_time, end_time, edge_type="anyedge", session_name=None)`
+- `dump_waveform_data(vcd_path=None, signals, start_time, end_time, output_path, mode="transitions", sample_period=None, radix="hex", overwrite=False, signals_are_groups=False, session_name=None)`
 - `get_signal_overview(vcd_path=None, path, start_time, end_time, resolution="auto", radix="hex", session_name=None)`
 - `analyze_pattern(vcd_path=None, path, start_time, end_time, session_name=None)`
 
@@ -113,6 +115,8 @@ Waveform semantics stay aligned with `wave_agent_cli`. In particular, backward e
 For multi-bit value queries, `radix` may be `hex`, `bin`, or `dec`; the default is `hex`.
 `get_signal_overview` provides a zoomed-out, resolution-aware summary of one signal and also accepts `resolution="auto"` for an overview capped to a manageable number of segments.
 `list_signals` now defaults to top-module-only output. Pass `pattern="*"` for the full namespace, a narrower wildcard such as `top.nvdla_top.nvdla_core2cvsram_ar_*`, and optionally `types=["input","output","net"]` to filter by signal category.
+`count_transitions` counts scalar edges or multi-bit toggles over a time window.
+`dump_waveform_data` writes large transition streams or fixed-step samples directly to a local JSONL file so the full dataset does not have to travel through MCP.
 
 ### Session tools
 

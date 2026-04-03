@@ -46,6 +46,22 @@ json dispatch_query(AgentAPI& api, WaveDatabase& db, const json& q) {
     } else if (cmd == "get_transitions") {
         response = api.get_transitions(args.value("path", ""), args.value("start_time", 0ULL),
                                        args.value("end_time", 0ULL), args.value("max_limit", 50));
+    } else if (cmd == "count_transitions") {
+        response = api.count_transitions(
+            args.value("path", ""),
+            args.value("start_time", 0ULL),
+            args.value("end_time", 0ULL),
+            args.value("edge_type", "anyedge"));
+    } else if (cmd == "dump_waveform_data") {
+        response = api.dump_waveform_data(
+            args.value("signals", std::vector<std::string>()),
+            args.value("start_time", 0ULL),
+            args.value("end_time", 0ULL),
+            args.value("output_path", ""),
+            args.value("mode", "transitions"),
+            args.contains("sample_period") ? args["sample_period"] : json(nullptr),
+            args.value("radix", "hex"),
+            args.value("overwrite", false));
     } else if (cmd == "get_signal_overview") {
         response = api.get_signal_overview(
             args.value("path", ""),
