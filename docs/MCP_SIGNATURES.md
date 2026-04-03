@@ -1,6 +1,6 @@
 # MCP Signatures
 
-This file lists the MCP tool signatures exposed by the local servers in this repo as of March 28, 2026.
+This file lists the MCP tool signatures exposed by the local servers in this repo as of April 3, 2026.
 
 ## Main Agent MCP
 
@@ -12,7 +12,7 @@ The main agent MCP exposes a session-aware waveform view model:
 
 - `Session`
   - A saved waveform view bound to one waveform file.
-  - Stores the current `Cursor`, named `Bookmarks`, and named `Signal Groups`.
+  - Stores the current `Cursor`, named `Bookmarks`, named `Signal Groups`, and named `Created Signals`.
 - `Cursor`
   - The current focus time in a Session.
   - May be referenced as `time="Cursor"`.
@@ -22,6 +22,12 @@ The main agent MCP exposes a session-aware waveform view model:
 - `Signal Group`
   - A named saved signal list in a Session.
   - May be expanded by `get_snapshot(..., signals_are_groups=True)`.
+- `Created Signal`
+  - A named virtual signal defined by a Verilog-like expression over real signals or other created signals.
+  - Stored in the session as `created_signals[signal_name] = {expression, ast, dependencies, description}`.
+  - Transparently supported by `get_transitions`, `get_value_at_time`, `find_edge`, and other session-aware waveform tools.
+  - Supports chained dependencies (e.g., `v2 = v1 | c` where `v1` is also a created signal).
+  - Maximum dependency depth: 16 levels. Circular dependencies are rejected at creation time.
 
 Default behavior:
 - Each waveform gets a `Default_Session` on first session-aware use.
@@ -248,6 +254,74 @@ delete_signal_group(group_name: str, waveform_path: Optional[str] = None, sessio
 list_signal_groups(waveform_path: Optional[str] = None, session_name: Optional[str] = None)
 ```
 
+### Virtual signal expression tools
+
+Create, update, delete, and list virtual signals defined by Verilog-like expressions. Virtual signals are computed on demand from real waveform signals (or other virtual signals) and behave like real signals in all session-aware waveform tools.
+
+```python
+create_signal_expression(
+    signal_name: str,
+    expression: str,
+    description: str = "",
+    waveform_path: Optional[str] = None,
+    session_name: Optional[str] = None,
+)
+update_signal_expression(
+    signal_name: str,
+    expression: Optional[str] = None,
+    description: Optional[str] = None,
+    waveform_path: Optional[str] = None,
+    session_name: Optional[str] = None,
+)
+delete_signal_expression(
+    signal_name: str,
+    waveform_path: Optional[str] = None,
+    session_name: Optional[str] = None,
+)
+list_signal_expressions(
+    waveform_path: Optional[str] = None,
+    session_name: Optional[str] = None,
+)
+```
+
+#### Supported operators
+
+| Category | Operators | Notes |
+|----------|-----------|-------|
+| Unary bitwise | `~` `!` | `!` treats non-zero as true |
+| Unary reduction | `&` `\|` `^` `~&` `~\|` `~^` `^~` | Standard Verilog reduction operators |
+| Bitwise binary | `&` `\|` `^` | Standard Verilog |
+| Custom binary | `~&` `~\|` `~^` | **Custom extension**: `a ~& b` = `~(a & b)` |
+| Logical | `&&` `\|\|` | Vector truthiness: non-zero = true |
+| Equality | `==` `!=` `===` `!==` | `===`/`!==` are 4-state identity (x === x is true) |
+| Relational | `<` `>` `<=` `>=` | Returns 1-bit |
+| Shift | `<<` `>>` `<<<` `>>>` | `>>>` uses signedness of left operand |
+| Arithmetic | `+` `-` `*` `/` `%` `**` | Division by zero returns x |
+| Ternary | `? :` | X-merge per IEEE 1364 when condition is x/z |
+| Assignment in ternary | `=` | **Custom extension**: `cond ? a = b : c` treated as `cond ? b : c` |
+| Literals | `0` `1` `4'b1010` `32'hFF` `8'd255` `'x` `'z` | Sized/unsized Verilog constants |
+
+Signal paths follow standard hierarchy: `top.module.signal`. The `$` character is supported in identifiers for synthesized nets.
+
+#### Interaction with existing tools
+
+Virtual signals are transparently supported by these session-aware waveform tools:
+
+- `get_transitions(path="virtual_signal_name", ...)` — returns computed transitions
+- `get_value_at_time(path="virtual_signal_name", ...)` — evaluates expression at a single time point
+- `find_edge(path="virtual_signal_name", ...)` — searches for edges in computed transitions
+- `get_snapshot(signals=[..., "virtual_signal_name"], ...)` — mixed real/virtual snapshots
+- `find_value_intervals`, `count_transitions`, `get_signal_overview`, `analyze_pattern` — all virtual-aware
+
+Structural trace tools (`trace_with_snapshot`, `explain_signal_at_time`, `rank_cone_by_time`, `explain_edge_cause`) return an error if a virtual signal name is passed — they require a real signal path and a structural DB.
+
+#### Performance notes
+
+- Evaluation is **event-driven**: the virtual signal is only evaluated at times when an operand signal changes.
+- Computed transitions are **cached** in memory (per session). Subsequent queries for the same virtual signal reuse the cache.
+- Cache is automatically invalidated when the expression or a dependency is updated or deleted.
+- For chained virtual signals (e.g., `v2 = v1 | c` where `v1` is also virtual), dependencies are resolved via topological sort.
+
 ### Cross-linked structural and waveform analysis tools
 
 ```python
@@ -359,4 +433,14 @@ find_value_intervals(vcd_path="wave.fsdb", path="top.rid", value="d8", start_tim
 find_edge(vcd_path="wave.fsdb", path="top.clk", edge_type="rising", start_time=100, direction="backward")
 get_signal_overview(vcd_path="wave.fsdb", path="top.bus[7:0]", start_time=0, end_time=100000, resolution="auto", radix="hex")
 trace_with_snapshot(db_path="rtl_trace.db", waveform_path="wave.fsdb", signal="top.foo", time="Cursor")
+
+# Virtual signal expressions
+create_signal_expression(signal_name="aw_sent", expression="awvalid & awready", description="AW channel handshake")
+get_transitions(path="aw_sent", start_time=0, end_time=100000)
+get_value_at_time(path="aw_sent", time="Cursor")
+create_signal_expression(signal_name="bus_sum", expression="bus_a + bus_b")
+find_edge(path="aw_sent", edge_type="posedge", start_time=0, direction="forward")
+create_signal_expression(signal_name="chained", expression="aw_sent | ar_sent")  # depends on another virtual signal
+list_signal_expressions()
+delete_signal_expression(signal_name="bus_sum")
 ```

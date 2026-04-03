@@ -82,6 +82,7 @@ def _default_session_payload(
         "cursor_time": 0,
         "bookmarks": {},
         "signal_groups": {},
+        "created_signals": {},
         "created_at": now,
         "updated_at": now,
     }
@@ -95,6 +96,7 @@ def _normalize_session_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     normalized["cursor_time"] = int(normalized.get("cursor_time", 0))
     normalized["bookmarks"] = dict(normalized.get("bookmarks", {}))
     normalized["signal_groups"] = dict(normalized.get("signal_groups", {}))
+    normalized["created_signals"] = dict(normalized.get("created_signals", {}))
     normalized["created_at"] = str(normalized.get("created_at", _utc_now_iso()))
     normalized["updated_at"] = str(normalized.get("updated_at", normalized["created_at"]))
     return normalized
@@ -239,6 +241,7 @@ def _session_summary(payload: Dict[str, Any]) -> Dict[str, Any]:
         "cursor_time": payload["cursor_time"],
         "bookmark_names": sorted(payload["bookmarks"].keys()),
         "signal_group_names": sorted(payload["signal_groups"].keys()),
+        "created_signal_names": sorted(payload.get("created_signals", {}).keys()),
         "created_at": payload["created_at"],
         "updated_at": payload["updated_at"],
     }

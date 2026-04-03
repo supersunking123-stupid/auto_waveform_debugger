@@ -85,7 +85,10 @@ agent_debug_automation/
   mapping.py                     # signal path normalization, FSDB prefix lookup
   ranking.py                     # heuristic scoring functions
   models.py                      # constants, type aliases, data models
-  tests/                         # test_cross_linking.py (49 tests)
+  expression_parser.py           # Verilog expression tokenizer + recursive descent parser
+  expression_evaluator.py        # 4-state logic evaluator (0/1/x/z, event-driven)
+  virtual_signals.py             # virtual signal service (create/update/delete, caching)
+  tests/                         # test_cross_linking.py, test_expression_*, test_virtual_signals
 ```
 
 ## Build

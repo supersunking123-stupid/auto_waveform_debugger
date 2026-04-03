@@ -49,6 +49,7 @@ from .ranking import (
     _rank_signal_summaries,
     _window_bounds,
 )
+from .virtual_signals import vs_service
 from .sessions import (
     _default_session_payload,
     _expand_signal_groups,
@@ -338,6 +339,10 @@ def get_value_at_time(
     """
     try:
         resolved_time, time_info, session = _resolve_time_reference(time, waveform_path=vcd_path, session_name=session_name)
+        if vs_service.is_virtual(path, session):
+            val = vs_service.eval_at_time(path, session, resolved_time)
+            result = {"status": "success", "data": val, "path": path, "time": resolved_time}
+            return _with_session_metadata(result, session, time_info)
         import agent_debug_automation.agent_debug_automation_mcp as _wrapper
         result = _wrapper.wave_agent_query(
             session["waveform_path"],
@@ -362,6 +367,30 @@ def find_edge(
     try:
         edge_type = _normalize_edge_type(edge_type)
         resolved_time, time_info, session = _resolve_time_reference(start_time, waveform_path=vcd_path, session_name=session_name)
+        if vs_service.is_virtual(path, session):
+            transitions = list(vs_service.iter_transitions(path, session, 0, resolved_time + 1000000))
+            prev = None
+            last_match = None
+            for tr in transitions:
+                val = tr["v"]
+                is_edge = False
+                if edge_type == "posedge" and prev is not None and prev == "0" and val == "1":
+                    is_edge = True
+                elif edge_type == "negedge" and prev is not None and prev == "1" and val == "0":
+                    is_edge = True
+                elif edge_type == "anyedge" and prev is not None and prev != val:
+                    is_edge = True
+                if is_edge:
+                    if direction == "forward" and tr["t"] >= resolved_time:
+                        result = {"status": "success", "data": {"time": tr["t"], "value": val}}
+                        return _with_session_metadata(result, session, time_info)
+                    elif direction == "backward" and tr["t"] <= resolved_time:
+                        last_match = tr
+                prev = val
+            if direction == "backward" and last_match is not None:
+                result = {"status": "success", "data": {"time": last_match["t"], "value": last_match["v"]}}
+                return _with_session_metadata(result, session, time_info)
+            return _with_session_metadata({"status": "success", "data": None, "message": "no edge found"}, session, time_info)
         import agent_debug_automation.agent_debug_automation_mcp as _wrapper
         result = _wrapper.wave_agent_query(
             session["waveform_path"],
@@ -457,6 +486,14 @@ def get_transitions(
             waveform_path=vcd_path,
             session_name=session_name,
         )
+        if vs_service.is_virtual(path, session):
+            transitions = list(vs_service.iter_transitions(
+                path, session, resolved_start, resolved_end,
+            ))
+            truncated = len(transitions) > max_limit
+            result = {"status": "success", "data": transitions[:max_limit], "truncated": truncated}
+            result["resolved_time_range"] = {"start": start_info, "end": end_info}
+            return _with_session_metadata(result, session)
         import agent_debug_automation.agent_debug_automation_mcp as _wrapper
         result = _wrapper.wave_agent_query(
             session["waveform_path"],
@@ -891,6 +928,90 @@ def list_signal_groups(waveform_path: Optional[str] = None, session_name: Option
             for name, item in sorted(session["signal_groups"].items())
         ]
         return _with_session_metadata({"status": "success", "data": groups}, session)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Virtual signal expression tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def create_signal_expression(
+    signal_name: str,
+    expression: str,
+    description: str = "",
+    waveform_path: Optional[str] = None,
+    session_name: Optional[str] = None,
+):
+    """Create a virtual signal from a Verilog-like expression.
+
+    The virtual signal can be used with all session-aware waveform tools
+    (get_transitions, get_value_at_time, get_snapshot, find_edge, etc.).
+
+    Supported operators (standard Verilog):
+      Unary: ~ ! & | ^ ~& ~| ~^ ^~ (reduction when unary prefix)
+      Binary: & | ^ ~& ~| ~^ && || == != < > <= >= << >> <<< >>> + - * / % **
+      Ternary: ? :
+      Custom extensions: binary ~& ~| ~^ (e.g., a ~& b = ~(a & b)),
+                         = inside ternary (a ? b = c : d treated as a ? c : d)
+
+    Example:
+      create_signal_expression("aw_sent", "awvalid & awready")
+      create_signal_expression("bus_sum", "bus_a + bus_b")
+    """
+    try:
+        session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+        session = vs_service.create(session, signal_name, expression, description)
+        info = vs_service.get_info(signal_name, session)
+        return _with_session_metadata({"status": "success", "data": info}, session)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool()
+def update_signal_expression(
+    signal_name: str,
+    expression: Optional[str] = None,
+    description: Optional[str] = None,
+    waveform_path: Optional[str] = None,
+    session_name: Optional[str] = None,
+):
+    """Update the expression or description of an existing virtual signal."""
+    try:
+        session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+        session = vs_service.update(session, signal_name, expression=expression, description=description)
+        info = vs_service.get_info(signal_name, session)
+        return _with_session_metadata({"status": "success", "data": info}, session)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool()
+def delete_signal_expression(
+    signal_name: str,
+    waveform_path: Optional[str] = None,
+    session_name: Optional[str] = None,
+):
+    """Delete a virtual signal from the session."""
+    try:
+        session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+        session = vs_service.delete(session, signal_name)
+        return _with_session_metadata({"status": "success", "data": {"deleted": signal_name}}, session)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool()
+def list_signal_expressions(
+    waveform_path: Optional[str] = None,
+    session_name: Optional[str] = None,
+):
+    """List all virtual signals defined in the session."""
+    try:
+        session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+        virtuals = vs_service.list(session)
+        return _with_session_metadata({"status": "success", "data": virtuals}, session)
     except Exception as e:
         return {"status": "error", "message": str(e)}
 

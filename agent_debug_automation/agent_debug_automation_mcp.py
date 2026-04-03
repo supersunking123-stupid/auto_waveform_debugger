@@ -25,6 +25,9 @@ if __package__ in (None, ""):
     from agent_debug_automation import clients  # noqa: F401
     from agent_debug_automation import sessions  # noqa: F401
     from agent_debug_automation import ranking  # noqa: F401
+    from agent_debug_automation import expression_parser  # noqa: F401
+    from agent_debug_automation import expression_evaluator  # noqa: F401
+    from agent_debug_automation import virtual_signals  # noqa: F401
     from agent_debug_automation import server  # noqa: F401
     from agent_debug_automation import tools  # noqa: F401
 else:
@@ -34,6 +37,9 @@ else:
     from . import clients  # noqa: F401
     from . import sessions  # noqa: F401
     from . import ranking  # noqa: F401
+    from . import expression_parser  # noqa: F401
+    from . import expression_evaluator  # noqa: F401
+    from . import virtual_signals  # noqa: F401
     from . import server  # noqa: F401
     from . import tools  # noqa: F401
 
@@ -156,6 +162,26 @@ if __package__ in (None, ""):
     # --- server ---
     from agent_debug_automation.server import mcp  # noqa: F401
 
+    # --- expression parser ---
+    from agent_debug_automation.expression_parser import (  # noqa: F401
+        parse_expression,
+        collect_signal_refs,
+        ParseError,
+    )
+
+    # --- expression evaluator ---
+    from agent_debug_automation.expression_evaluator import (  # noqa: F401
+        LogicValue,
+        evaluate_expression,
+        iter_virtual_transitions,
+    )
+
+    # --- virtual signals ---
+    from agent_debug_automation.virtual_signals import (  # noqa: F401
+        vs_service,
+        clear_virtual_cache,
+    )
+
     # --- tools ---
     from agent_debug_automation.tools import (  # noqa: F401
         _build_common_context,
@@ -191,6 +217,10 @@ if __package__ in (None, ""):
         update_signal_group,
         delete_signal_group,
         list_signal_groups,
+        create_signal_expression,
+        update_signal_expression,
+        delete_signal_expression,
+        list_signal_expressions,
         trace_with_snapshot,
         explain_signal_at_time,
         rank_cone_by_time,
@@ -310,6 +340,26 @@ else:
     # --- server ---
     from .server import mcp  # noqa: F401
 
+    # --- expression parser ---
+    from .expression_parser import (  # noqa: F401
+        parse_expression,
+        collect_signal_refs,
+        ParseError,
+    )
+
+    # --- expression evaluator ---
+    from .expression_evaluator import (  # noqa: F401
+        LogicValue,
+        evaluate_expression,
+        iter_virtual_transitions,
+    )
+
+    # --- virtual signals ---
+    from .virtual_signals import (  # noqa: F401
+        vs_service,
+        clear_virtual_cache,
+    )
+
     # --- tools ---
     from .tools import (  # noqa: F401
         _build_common_context,
@@ -345,6 +395,10 @@ else:
         update_signal_group,
         delete_signal_group,
         list_signal_groups,
+        create_signal_expression,
+        update_signal_expression,
+        delete_signal_expression,
+        list_signal_expressions,
         trace_with_snapshot,
         explain_signal_at_time,
         rank_cone_by_time,
@@ -362,7 +416,7 @@ else:
 
 _fwd_targets: dict = {}
 _pkg_name = _PKG_NAME
-for _sub_name in ("models", "mapping", "clients", "sessions", "ranking", "tools"):
+for _sub_name in ("models", "mapping", "clients", "sessions", "ranking", "expression_parser", "expression_evaluator", "virtual_signals", "tools"):
     _sub = sys.modules.get(f"{_pkg_name}.{_sub_name}")
     if _sub is None:
         continue

@@ -20,6 +20,7 @@ DEFAULT_RANK_WINDOW_AFTER = 1000
 DEFAULT_EXPLAIN_WINDOW_AFTER = 0
 DEFAULT_TRANSITION_LIMIT = 256
 DEFAULT_BACKEND_READ_TIMEOUT_SEC = 300
+MAX_VIRTUAL_SIGNAL_DEPTH = 16
 
 # ---------------------------------------------------------------------------
 # Session store paths
