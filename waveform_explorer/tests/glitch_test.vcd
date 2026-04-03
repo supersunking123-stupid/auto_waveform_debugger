@@ -1,0 +1,39 @@
+$version Test VCD with glitches for duplicate timestamp tests $end
+$timescale 1ps $end
+$scope module TOP $end
+ $scope module test $end
+  $var wire 1 ! clk_single $end
+  $var wire 4 " multibit [3:0] $end
+ $upscope $end
+$upscope $end
+$enddefinitions $end
+
+#0
+0!
+b0000 "
+
+#100
+1!
+b0101 "
+
+#200
+1!
+0!
+1!
+b1010 "
+
+#300
+0!
+b0011 "
+
+#400
+1!
+b1100 "
+
+#500
+1!
+0!
+b1001 "
+
+$dumpall
+$end

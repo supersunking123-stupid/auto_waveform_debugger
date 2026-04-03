@@ -206,6 +206,12 @@ find_value_intervals(vcd_path: Optional[str] = None, path: str = "", value: str 
 find_condition(vcd_path: Optional[str] = None, expression: str = "", start_time: TimeReference = 0, direction: Direction = "forward", session_name: Optional[str] = None)
 get_transitions(vcd_path: Optional[str] = None, path: str = "", start_time: TimeReference = 0, end_time: TimeReference = 0, max_limit: int = 50, session_name: Optional[str] = None)
 count_transitions(vcd_path: Optional[str] = None, path: str = "", start_time: TimeReference = 0, end_time: TimeReference = 0, edge_type: EdgeType | EdgeTypeAlias = "anyedge", session_name: Optional[str] = None)
+  Counts edges or toggles for one signal in a time window.
+  For multi-bit signals, `edge_type` must be `"anyedge"` and the tool counts value toggles.
+  For single-bit signals, `edge_type` can be `"posedge"`, `"negedge"`, or `"anyedge"`.
+
+  **Glitch handling:** When multiple transitions occur at the same timestamp (glitches), each transition is evaluated against the immediately preceding transition record in the sequence. For example, if a signal has transitions `0→1` and `1→0` both at timestamp 100, both are counted as edges. This means glitch bursts are fully enumerated—each individual transition record contributes to the count based on its actual value change.
+
 dump_waveform_data(vcd_path: Optional[str] = None, signals: Optional[List[str]] = None, start_time: TimeReference = 0, end_time: TimeReference = 0, output_path: str = "", mode: str = "transitions", sample_period: Optional[int] = None, radix: str = "hex", overwrite: bool = False, signals_are_groups: bool = False, session_name: Optional[str] = None)
 get_signal_overview(vcd_path: Optional[str] = None, path: str = "", start_time: TimeReference = 0, end_time: TimeReference = 0, resolution: ResolutionReference = "auto", radix: str = "hex", session_name: Optional[str] = None)
 analyze_pattern(vcd_path: Optional[str] = None, path: str = "", start_time: TimeReference = 0, end_time: TimeReference = 0, session_name: Optional[str] = None)

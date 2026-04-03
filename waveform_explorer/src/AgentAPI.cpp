@@ -1222,13 +1222,19 @@ json AgentAPI::count_transitions(
             return tr.timestamp < t;
         });
 
+    std::string running_value = "U";
+    if (it != trans.begin()) {
+        auto prev = it;
+        --prev;
+        running_value = prev->value;
+    }
+
     while (it != trans.end() && it->timestamp <= end_time) {
-        const uint64_t before_time = it->timestamp == 0 ? 0 : (it->timestamp - 1);
-        const std::string before = it->timestamp == 0 ? "U" : db.get_value_at_time(signal_path, before_time);
-        const ClassifiedTransition event = classify_transition_event(info, before, it->value, edge_type);
+        const ClassifiedTransition event = classify_transition_event(info, running_value, it->value, edge_type);
         if (event.changed && event.matches_requested_edge) {
             ++count;
         }
+        running_value = it->value;
         ++it;
     }
 
@@ -1332,10 +1338,16 @@ json AgentAPI::dump_waveform_data(
                 [](const Transition& tr, uint64_t t) {
                     return tr.timestamp < t;
                 });
+
+            std::string running_value = "U";
+            if (it != transitions.begin()) {
+                auto prev = it;
+                --prev;
+                running_value = prev->value;
+            }
+
             while (it != transitions.end() && it->timestamp <= end_time) {
-                const uint64_t before_time = it->timestamp == 0 ? 0 : (it->timestamp - 1);
-                const std::string before = it->timestamp == 0 ? "U" : db.get_value_at_time(path, before_time);
-                const ClassifiedTransition event = classify_transition_event(info, before, it->value, "anyedge");
+                const ClassifiedTransition event = classify_transition_event(info, running_value, it->value, "anyedge");
                 if (event.changed) {
                     records.push_back({
                         it->timestamp,
@@ -1346,6 +1358,7 @@ json AgentAPI::dump_waveform_data(
                         it->is_glitch,
                     });
                 }
+                running_value = it->value;
                 ++it;
             }
         }

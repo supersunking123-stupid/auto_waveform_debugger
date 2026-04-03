@@ -423,5 +423,142 @@ class WaveformCommandTests(unittest.TestCase):
         self.assertIsInstance(result["summary"], str)
 
 
+@unittest.skipUnless(CLI.exists(), "wave_agent_cli not built")
+class GlitchTransitionTests(unittest.TestCase):
+    """Tests for duplicate timestamp (glitch) edge counting behavior.
+
+    These tests verify that when multiple transitions occur at the same
+    timestamp (glitches), each transition is evaluated against the immediately
+    preceding transition record in the sequence. This means glitch bursts are
+    fully enumerated—each individual transition record contributes to the count
+    based on its actual value change.
+    """
+
+    GLITCH_VCD = ROOT / "waveform_explorer" / "tests" / "glitch_test.vcd"
+
+    def _query(self, cmd, args):
+        """Send a single JSON command and return the parsed response."""
+        query = {"cmd": cmd, "args": args}
+        completed = subprocess.run(
+            [str(CLI), str(self.GLITCH_VCD), json.dumps(query)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return json.loads(completed.stdout.strip())
+
+    def test_count_transitions_single_bit_glitch_at_t200(self):
+        """At t=200: 1→1→0→1 (glitch, posedge, posedge) counts 1 posedge.
+
+        The signal transitions are:
+        - t=0: U→0 (initial, not counted as posedge)
+        - t=100: 0→1 (posedge, counted)
+        - t=200: 1→1 (no change, not counted)
+        - t=200: 1→0 (negedge, not counted for posedge)
+        - t=200: 0→1 (posedge, counted)
+
+        Total posedges: 2 (at t=100 and second transition at t=200)
+        """
+        result = self._query("count_transitions", {
+            "path": "test.clk_single",
+            "start_time": 0,
+            "end_time": 300,
+            "edge_type": "posedge",
+        })
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["data"]["count"], 2)
+
+    def test_count_transitions_single_bit_anyedge_glitch_at_t200(self):
+        """At t=200: 1→1→0→1 counts 2 anyedges (1→0 and 0→1).
+
+        The signal transitions are:
+        - t=0: U→0 (anyedge, counted)
+        - t=100: 0→1 (anyedge, counted)
+        - t=200: 1→1 (no change, not counted)
+        - t=200: 1→0 (anyedge, counted)
+        - t=200: 0→1 (anyedge, counted)
+
+        Total anyedges: 5
+        """
+        result = self._query("count_transitions", {
+            "path": "test.clk_single",
+            "start_time": 0,
+            "end_time": 300,
+            "edge_type": "anyedge",
+        })
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["data"]["count"], 5)
+
+    def test_count_transitions_single_bit_glitch_at_t500(self):
+        """At t=500: 1→1→0 (glitch then negedge) counts 0 posedges.
+
+        The signal transitions are:
+        - t=400: 0→1 (posedge, counted)
+        - t=500: 1→1 (no change, not counted)
+        - t=500: 1→0 (negedge, not counted for posedge)
+
+        Total posedges: 3 (at t=100, second transition at t=200, and t=400)
+        """
+        result = self._query("count_transitions", {
+            "path": "test.clk_single",
+            "start_time": 0,
+            "end_time": 600,
+            "edge_type": "posedge",
+        })
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["data"]["count"], 3)
+
+    def test_count_transitions_range_excludes_glitch_before_start(self):
+        """When start_time is within a glitch burst, transitions before start are excluded.
+
+        At t=200: 1→1→0→1, with start_time=200 we should only count transitions
+        at or after t=200. The running_value is initialized from the last transition
+        before start_time (t=100, value=1).
+        """
+        result = self._query("count_transitions", {
+            "path": "test.clk_single",
+            "start_time": 200,
+            "end_time": 300,
+            "edge_type": "posedge",
+        })
+        self.assertEqual(result["status"], "success")
+        # At t=200: 1→1 (no change), 1→0 (negedge), 0→1 (posedge)
+        # Only 1 posedge counted
+        self.assertEqual(result["data"]["count"], 1)
+
+    def test_dump_waveform_data_glitch_transitions(self):
+        """Dump transitions mode should emit only glitch transitions with actual value changes.
+
+        Note that dump_waveform_data filters out no-change transitions, so
+        glitch transitions like 1→1 are not emitted even though they are
+        marked as glitches in the waveform.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "glitch.jsonl"
+            result = self._query("dump_waveform_data", {
+                "signals": ["test.clk_single"],
+                "start_time": 0,
+                "end_time": 600,
+                "output_path": str(output_path),
+                "mode": "transitions",
+            })
+            self.assertEqual(result["status"], "success")
+
+            rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines()]
+            glitch_rows = [row for row in rows if row["glitch"]]
+            # At t=200: 1→1 (no change, not dumped), 1→0 (negedge, dumped), 0→1 (posedge, dumped)
+            # At t=500: 1→1 (no change, not dumped), 1→0 (negedge, dumped)
+            # Total 3 glitch transitions dumped (the no-change ones are filtered)
+            self.assertEqual(len(glitch_rows), 3)
+            # Check that glitch rows have the correct timestamps and events
+            glitch_timestamps = [row["t"] for row in glitch_rows]
+            self.assertEqual(glitch_timestamps.count(200), 2)
+            self.assertEqual(glitch_timestamps.count(500), 1)
+            # Verify the events at t=200
+            t200_glitches = [row for row in glitch_rows if row["t"] == 200]
+            events_at_200 = [row["event"] for row in t200_glitches]
+            self.assertEqual(sorted(events_at_200), ["negedge", "posedge"])
+
+
 if __name__ == "__main__":
     unittest.main()
