@@ -30,11 +30,13 @@ from .mapping import (
     _resolve_bin,
 )
 from .models import (
+    BoundaryPolicy,
     DEFAULT_EXPLAIN_WINDOW_AFTER,
     DEFAULT_RANK_WINDOW_AFTER,
     DEFAULT_RANK_WINDOW_BEFORE,
     DEFAULT_RTL_TRACE_BIN,
     DEFAULT_SESSION_NAME,
+    DEFAULT_VIRTUAL_LEAF_MAX_LIMIT,
     Direction,
     EdgeType,
     EdgeTypeAlias,
@@ -572,6 +574,12 @@ def _virtual_logic_values_at_time(path: str, session: Dict[str, Any], time: int)
     return current, previous
 
 
+def _virtual_previous_raw_value(path: str, session: Dict[str, Any], time: int) -> Optional[str]:
+    if time <= 0:
+        return None
+    return vs_service.eval_logic_at_time(path, session, time - 1).to_string()
+
+
 def _format_virtual_logic_value(current: LogicValue, previous: Optional[LogicValue], radix: str) -> str:
     current_raw = current.to_string()
     previous_raw = "U" if previous is None else previous.to_string()
@@ -600,6 +608,467 @@ def _virtual_edge_matches(previous_value: str, current_value: str, edge_type: st
     if edge_type == "negedge":
         return previous_value == "1" and current_value == "0"
     return previous_value != current_value
+
+
+def _classify_count_transition(width: int, previous_value: str, current_value: str, edge_type: str) -> tuple[bool, bool]:
+    if width <= 1:
+        previous_scalar = _simplify_scalar_value(previous_value)
+        current_scalar = _simplify_scalar_value(current_value)
+        if previous_scalar == current_scalar:
+            return False, False
+        if edge_type == "anyedge":
+            return True, True
+        if edge_type == "posedge":
+            return True, previous_scalar == "0" and current_scalar == "1"
+        return True, previous_scalar == "1" and current_scalar == "0"
+
+    changed = previous_value != current_value
+    return changed, changed
+
+
+def _normalize_boundary_policy(boundary_policy: BoundaryPolicy | str) -> str:
+    normalized = str(boundary_policy).strip().lower()
+    if normalized in {"include", "inclusive"}:
+        return "inclusive"
+    if normalized in {"exclude", "exclusive"}:
+        return "exclusive"
+    raise ValueError("boundary_policy must be 'inclusive' or 'exclusive'")
+
+
+def _normalize_virtual_leaf_max_limit(virtual_leaf_max_limit: int) -> int:
+    try:
+        limit = int(virtual_leaf_max_limit)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("virtual_leaf_max_limit must be an integer > 0") from exc
+    if limit <= 0:
+        raise ValueError("virtual_leaf_max_limit must be > 0")
+    return limit
+
+
+def _real_signal_matches_edge_at_time(
+    path: str,
+    session: Dict[str, Any],
+    time: int,
+    width: int,
+    edge_type: str,
+) -> bool:
+    previous_value = "U"
+    if time > 0:
+        previous_result = _wave_query(
+            session["waveform_path"],
+            "get_raw_value_at_time",
+            {"path": path, "time": time - 1},
+        )
+        if previous_result.get("status") != "success":
+            return False
+        previous_value = str(previous_result.get("data", "U"))
+
+    current_result = _wave_query(
+        session["waveform_path"],
+        "get_raw_value_at_time",
+        {"path": path, "time": time},
+    )
+    if current_result.get("status") != "success":
+        return False
+    _, matches_requested_edge = _classify_count_transition(
+        width,
+        previous_value,
+        str(current_result.get("data", "U")),
+        edge_type,
+    )
+    return matches_requested_edge
+
+
+def _virtual_matching_edge_times(
+    path: str,
+    session: Dict[str, Any],
+    start_time: int,
+    end_time: int,
+    width: int,
+    edge_type: str,
+    transitions: Optional[List[Dict[str, Any]]] = None,
+    include_start_boundary: bool = True,
+    virtual_leaf_max_limit: int = DEFAULT_VIRTUAL_LEAF_MAX_LIMIT,
+) -> List[int]:
+    if transitions is None:
+        transitions = list(vs_service.iter_transitions(
+            path,
+            session,
+            start_time,
+            end_time,
+            leaf_max_limit=virtual_leaf_max_limit,
+        ))
+
+    prev_value = "U" if start_time == 0 else _virtual_previous_raw_value(path, session, start_time)
+    matches: List[int] = []
+    for tr in transitions:
+        current_time = int(tr["t"])
+        current_value = tr["v"]
+        if prev_value is not None:
+            _, matches_requested_edge = _classify_count_transition(
+                width,
+                prev_value,
+                current_value,
+                edge_type,
+            )
+            if matches_requested_edge and (include_start_boundary or current_time != start_time):
+                matches.append(current_time)
+        prev_value = current_value
+    return matches
+
+
+def _virtual_window_transitions(
+    path: str,
+    session: Dict[str, Any],
+    start_time: int,
+    end_time: int,
+    virtual_leaf_max_limit: int = DEFAULT_VIRTUAL_LEAF_MAX_LIMIT,
+) -> tuple[str, List[Dict[str, Any]]]:
+    """Return the value at *start_time* plus real transition records in-window."""
+    computed = list(vs_service.iter_transitions(
+        path,
+        session,
+        start_time,
+        end_time,
+        leaf_max_limit=virtual_leaf_max_limit,
+    ))
+    if computed:
+        start_value = computed[0]["v"]
+    else:
+        start_value = vs_service.eval_logic_at_time(path, session, start_time).to_string()
+
+    transitions: List[Dict[str, Any]] = []
+    previous_value = _virtual_previous_raw_value(path, session, start_time)
+    if start_time == 0 or (previous_value is not None and previous_value != start_value):
+        transitions.append({"t": start_time, "v": start_value})
+    transitions.extend(computed[1:])
+    return start_value, transitions
+
+
+def _virtual_signal_width(path: str, session: Dict[str, Any], time_hint: int = 0) -> int:
+    width = vs_service._resolve_signal_width(path, session)
+    if width is not None:
+        return int(width)
+    return vs_service.eval_logic_at_time(path, session, time_hint).width
+
+
+def _virtual_effective_count_mode(width: int, requested_edge_type: str) -> str:
+    if width <= 1:
+        return requested_edge_type
+    return "toggle"
+
+
+def _virtual_leaf_signal_paths(path: str, session: Dict[str, Any]) -> List[str]:
+    created = session.get("created_signals", {})
+    leaves: List[str] = []
+    seen_virtual: set = set()
+    seen_leaf: set = set()
+
+    def _visit(name: str) -> None:
+        info = created.get(name)
+        if info is None:
+            if name not in seen_leaf:
+                seen_leaf.add(name)
+                leaves.append(name)
+            return
+        if name in seen_virtual:
+            return
+        seen_virtual.add(name)
+        for dep in info.get("dependencies", []):
+            _visit(dep)
+
+    _visit(path)
+    return leaves
+
+
+def _virtual_timescale(path: str, session: Dict[str, Any]) -> str:
+    for signal_path in _virtual_leaf_signal_paths(path, session):
+        info = _wave_query(
+            session["waveform_path"],
+            "get_signal_info",
+            {"path": signal_path},
+        )
+        if info.get("status") == "success":
+            timescale = info.get("data", {}).get("timescale")
+            if timescale:
+                return str(timescale)
+    return ""
+
+
+def _append_virtual_overview_segment(
+    segments: List[Dict[str, Any]],
+    start: int,
+    end: int,
+    state: str,
+    value: str = "",
+    transitions: int = 0,
+    unique_values: int = 0,
+) -> None:
+    if start > end:
+        return
+
+    segment = {
+        "start": start,
+        "end": end,
+        "state": state,
+    }
+    if value:
+        segment["value"] = value
+    if transitions > 0:
+        segment["transitions"] = transitions
+    if unique_values > 0:
+        segment["unique_values"] = unique_values
+    segments.append(segment)
+
+
+def _append_virtual_stable_overview_segment(
+    segments: List[Dict[str, Any]],
+    width: int,
+    start: int,
+    end: int,
+    raw_value: str,
+    radix: str,
+) -> None:
+    if width <= 1:
+        _append_virtual_overview_segment(
+            segments,
+            start,
+            end,
+            _simplify_scalar_value(raw_value),
+        )
+        return
+
+    _append_virtual_overview_segment(
+        segments,
+        start,
+        end,
+        "stable",
+        _format_multibit_value(raw_value, width, radix),
+    )
+
+
+def _parse_virtual_overview_resolution(resolution: ResolutionReference) -> tuple[ResolutionReference, int | str]:
+    if isinstance(resolution, int) and not isinstance(resolution, bool):
+        if resolution <= 0:
+            raise ValueError("resolution must be > 0")
+        return resolution, resolution
+
+    if isinstance(resolution, str):
+        lowered = resolution.lower()
+        if lowered == "auto":
+            return "auto", "auto"
+        try:
+            parsed = int(resolution)
+        except ValueError as exc:
+            raise ValueError("resolution must be an integer or 'auto'") from exc
+        if parsed <= 0:
+            raise ValueError("resolution must be > 0")
+        return resolution, parsed
+
+    raise ValueError("resolution must be an integer or 'auto'")
+
+
+def _choose_virtual_auto_resolution(
+    window_transitions: List[Dict[str, Any]],
+    start_time: int,
+    end_time: int,
+) -> int:
+    target_segments = 20
+
+    if not window_transitions:
+        return 1
+
+    def _estimated_segment_count(resolution: int) -> int:
+        count = 0
+        cursor = start_time
+        i = 0
+        while i < len(window_transitions):
+            current = window_transitions[i]
+            current_t = int(current["t"])
+            if (
+                i + 1 < len(window_transitions)
+                and int(window_transitions[i + 1]["t"]) >= current_t
+                and int(window_transitions[i + 1]["t"]) - current_t < resolution
+            ):
+                j = i + 1
+                while (
+                    j + 1 < len(window_transitions)
+                    and int(window_transitions[j + 1]["t"]) >= int(window_transitions[j]["t"])
+                    and int(window_transitions[j + 1]["t"]) - int(window_transitions[j]["t"]) < resolution
+                ):
+                    j += 1
+
+                if cursor < current_t:
+                    count += 1
+                count += 1
+
+                cursor = int(window_transitions[j]["t"])
+                flipping_end = cursor
+                if cursor > current_t:
+                    flipping_end = cursor - 1
+                if flipping_end == cursor:
+                    cursor += 1
+                i = j + 1
+                continue
+
+            if cursor < current_t:
+                count += 1
+            cursor = current_t
+            i += 1
+
+        if cursor <= end_time:
+            count += 1
+        return count
+
+    span = max(1, end_time - start_time + 1)
+    low = 1
+    high = span
+    if _estimated_segment_count(low) <= target_segments:
+        return low
+
+    while low < high:
+        mid = low + (high - low) // 2
+        if _estimated_segment_count(mid) <= target_segments:
+            high = mid
+        else:
+            low = mid + 1
+    return low
+
+
+def _build_virtual_overview_segments(
+    width: int,
+    window_transitions: List[Dict[str, Any]],
+    start_time: int,
+    end_time: int,
+    resolution: int,
+    start_value: str,
+    radix: str,
+) -> List[Dict[str, Any]]:
+    segments: List[Dict[str, Any]] = []
+    cursor = start_time
+    current_value = start_value
+
+    i = 0
+    while i < len(window_transitions):
+        current = window_transitions[i]
+        current_t = int(current["t"])
+
+        if (
+            i + 1 < len(window_transitions)
+            and int(window_transitions[i + 1]["t"]) >= current_t
+            and int(window_transitions[i + 1]["t"]) - current_t < resolution
+        ):
+            j = i + 1
+            while (
+                j + 1 < len(window_transitions)
+                and int(window_transitions[j + 1]["t"]) >= int(window_transitions[j]["t"])
+                and int(window_transitions[j + 1]["t"]) - int(window_transitions[j]["t"]) < resolution
+            ):
+                j += 1
+
+            if cursor < current_t:
+                _append_virtual_stable_overview_segment(
+                    segments,
+                    width,
+                    cursor,
+                    current_t - 1,
+                    current_value,
+                    radix,
+                )
+
+            unique_values_seen = {current_value}
+            for idx in range(i, j + 1):
+                unique_values_seen.add(str(window_transitions[idx]["v"]))
+
+            flipping_end = int(window_transitions[j]["t"])
+            if flipping_end > current_t:
+                flipping_end -= 1
+            if flipping_end < current_t:
+                flipping_end = current_t
+
+            if width <= 1:
+                _append_virtual_overview_segment(
+                    segments,
+                    current_t,
+                    flipping_end,
+                    "flipping",
+                    transitions=j - i + 1,
+                )
+            else:
+                _append_virtual_overview_segment(
+                    segments,
+                    current_t,
+                    flipping_end,
+                    "flipping",
+                    transitions=j - i + 1,
+                    unique_values=len(unique_values_seen),
+                )
+
+            current_value = str(window_transitions[j]["v"])
+            cursor = int(window_transitions[j]["t"])
+            if flipping_end == cursor:
+                cursor += 1
+            i = j + 1
+            continue
+
+        if cursor < current_t:
+            _append_virtual_stable_overview_segment(
+                segments,
+                width,
+                cursor,
+                current_t - 1,
+                current_value,
+                radix,
+            )
+        current_value = str(current["v"])
+        cursor = current_t
+        i += 1
+
+    if cursor <= end_time:
+        _append_virtual_stable_overview_segment(
+            segments,
+            width,
+            cursor,
+            end_time,
+            current_value,
+            radix,
+        )
+
+    return segments
+
+
+def _virtual_analyze_pattern_summary(
+    path: str,
+    session: Dict[str, Any],
+    start_time: int,
+    end_time: int,
+    virtual_leaf_max_limit: int = DEFAULT_VIRTUAL_LEAF_MAX_LIMIT,
+) -> str:
+    _, transitions = _virtual_window_transitions(
+        path,
+        session,
+        start_time,
+        end_time,
+        virtual_leaf_max_limit=virtual_leaf_max_limit,
+    )
+    num_transitions = len(transitions)
+    if num_transitions == 0:
+        return "Static signal, no transitions in this window."
+
+    if num_transitions > 4:
+        intervals = [
+            int(transitions[idx]["t"]) - int(transitions[idx - 1]["t"])
+            for idx in range(1, len(transitions))
+        ]
+        avg = sum(intervals) / len(intervals)
+        consistent = all(abs(interval - avg) <= avg * 0.05 for interval in intervals)
+        if consistent:
+            return (
+                "Clock-like signal with average period "
+                f"{(avg * 2):g} units (half-period {avg:g})."
+            )
+
+    return f"Dynamic signal with {num_transitions} transitions."
 
 
 @mcp.tool()
@@ -642,28 +1111,43 @@ def find_edge(
     start_time: TimeReference = 0,
     direction: Direction = "forward",
     session_name: Optional[str] = None,
+    virtual_leaf_max_limit: int = DEFAULT_VIRTUAL_LEAF_MAX_LIMIT,
 ):
     """Search for the next or previous signal edge from a time reference."""
     try:
         edge_type = _normalize_edge_type(edge_type)
+        virtual_leaf_max_limit = _normalize_virtual_leaf_max_limit(virtual_leaf_max_limit)
         resolved_time, time_info, session = _resolve_time_reference(start_time, waveform_path=vcd_path, session_name=session_name)
         if vs_service.is_virtual(path, session):
             CHUNK_SIZE = 1000000
             if direction == "forward":
                 max_time = vs_service.max_leaf_transition_time(path, session)
-                if max_time <= resolved_time:
+                search_start = resolved_time + 1
+                if max_time < search_start:
                     result = {"status": "success", "data": -1}
                     return _with_session_metadata(result, session, time_info)
 
-                curr_start = resolved_time
+                curr_start = search_start
                 while curr_start <= max_time:
                     curr_end = min(max_time, curr_start + CHUNK_SIZE - 1)
-                    transitions = list(vs_service.iter_transitions(path, session, curr_start, curr_end))
-                    prev = None
+                    fetch_start = max(0, curr_start - 1)
+                    transitions = list(vs_service.iter_transitions(
+                        path,
+                        session,
+                        fetch_start,
+                        curr_end,
+                        leaf_max_limit=virtual_leaf_max_limit,
+                    ))
+                    prev = "U" if fetch_start == 0 else None
                     for tr in transitions:
+                        current_time = int(tr["t"])
                         val = tr["v"]
-                        if prev is not None and _virtual_edge_matches(prev, val, edge_type) and tr["t"] > resolved_time:
-                            result = {"status": "success", "data": tr["t"]}
+                        if (
+                            prev is not None
+                            and current_time >= curr_start
+                            and _virtual_edge_matches(prev, val, edge_type)
+                        ):
+                            result = {"status": "success", "data": current_time}
                             return _with_session_metadata(result, session, time_info)
                         prev = val
                     if curr_end >= max_time:
@@ -673,13 +1157,25 @@ def find_edge(
                 curr_end = resolved_time
                 while True:
                     curr_start = max(0, curr_end - CHUNK_SIZE + 1)
-                    transitions = list(vs_service.iter_transitions(path, session, curr_start, curr_end))
-                    prev = None
+                    fetch_start = max(0, curr_start - 1)
+                    transitions = list(vs_service.iter_transitions(
+                        path,
+                        session,
+                        fetch_start,
+                        curr_end,
+                        leaf_max_limit=virtual_leaf_max_limit,
+                    ))
+                    prev = "U" if fetch_start == 0 else None
                     last_match = None
                     for tr in transitions:
+                        current_time = int(tr["t"])
                         val = tr["v"]
-                        if prev is not None and _virtual_edge_matches(prev, val, edge_type) and curr_start <= tr["t"] <= resolved_time:
-                            last_match = tr["t"]
+                        if (
+                            prev is not None
+                            and curr_start <= current_time <= resolved_time
+                            and _virtual_edge_matches(prev, val, edge_type)
+                        ):
+                            last_match = current_time
                         prev = val
 
                     if last_match is not None:
@@ -718,9 +1214,11 @@ def find_value_intervals(
     end_time: TimeReference = 0,
     radix: str = "hex",
     session_name: Optional[str] = None,
+    virtual_leaf_max_limit: int = DEFAULT_VIRTUAL_LEAF_MAX_LIMIT,
 ):
     """Find all matching value intervals in a session-aware time range."""
     try:
+        virtual_leaf_max_limit = _normalize_virtual_leaf_max_limit(virtual_leaf_max_limit)
         resolved_start, resolved_end, start_info, end_info, session = _resolve_time_range_reference(
             start_time,
             end_time,
@@ -735,7 +1233,11 @@ def find_value_intervals(
                 return {"status": "error", "message": "failed to parse query value"}
 
             transitions = list(vs_service.iter_transitions(
-                path, session, resolved_start, resolved_end,
+                path,
+                session,
+                resolved_start,
+                resolved_end,
+                leaf_max_limit=virtual_leaf_max_limit,
             ))
             intervals = []
             current_raw = transitions[0]["v"] if transitions else current_logic.to_string()
@@ -811,9 +1313,11 @@ def get_transitions(
     end_time: TimeReference = 0,
     max_limit: int = 50,
     session_name: Optional[str] = None,
+    virtual_leaf_max_limit: int = DEFAULT_VIRTUAL_LEAF_MAX_LIMIT,
 ):
     """Get a compressed transition history in a session-aware time window."""
     try:
+        virtual_leaf_max_limit = _normalize_virtual_leaf_max_limit(virtual_leaf_max_limit)
         resolved_start, resolved_end, start_info, end_info, session = _resolve_time_range_reference(
             start_time,
             end_time,
@@ -822,7 +1326,11 @@ def get_transitions(
         )
         if vs_service.is_virtual(path, session):
             transitions = list(vs_service.iter_transitions(
-                path, session, resolved_start, resolved_end,
+                path,
+                session,
+                resolved_start,
+                resolved_end,
+                leaf_max_limit=virtual_leaf_max_limit,
             ))
             truncated = len(transitions) > max_limit
             result = {"status": "success", "data": transitions[:max_limit], "truncated": truncated}
@@ -853,10 +1361,14 @@ def count_transitions(
     end_time: TimeReference = 0,
     edge_type: EdgeType | EdgeTypeAlias = "anyedge",
     session_name: Optional[str] = None,
+    boundary_policy: BoundaryPolicy = "inclusive",
+    virtual_leaf_max_limit: int = DEFAULT_VIRTUAL_LEAF_MAX_LIMIT,
 ):
     """Count edges or toggles for one signal in a session-aware time window."""
     try:
         edge_type = _normalize_edge_type(edge_type)
+        boundary_policy = _normalize_boundary_policy(boundary_policy)
+        virtual_leaf_max_limit = _normalize_virtual_leaf_max_limit(virtual_leaf_max_limit)
         resolved_start, resolved_end, start_info, end_info, session = _resolve_time_range_reference(
             start_time,
             end_time,
@@ -864,27 +1376,37 @@ def count_transitions(
             session_name=session_name,
         )
         if vs_service.is_virtual(path, session):
-            # Count transitions in the virtual signal's computed timeline.
+            width = _virtual_signal_width(path, session, resolved_start)
             transitions = list(vs_service.iter_transitions(
-                path, session, resolved_start, resolved_end,
+                path,
+                session,
+                resolved_start,
+                resolved_end,
+                leaf_max_limit=virtual_leaf_max_limit,
             ))
-            count = 0
-            prev_v: Optional[str] = None
-            for tr in transitions:
-                v = tr["v"]
-                if prev_v is not None and v != prev_v:
-                    if edge_type == "anyedge":
-                        count += 1
-                    elif edge_type == "posedge" and prev_v == "0" and v == "1":
-                        count += 1
-                    elif edge_type == "negedge" and prev_v == "1" and v == "0":
-                        count += 1
-                prev_v = v
+            count = len(_virtual_matching_edge_times(
+                path,
+                session,
+                resolved_start,
+                resolved_end,
+                width,
+                edge_type,
+                transitions,
+                include_start_boundary=boundary_policy == "inclusive",
+                virtual_leaf_max_limit=virtual_leaf_max_limit,
+            ))
             result = {
                 "status": "success",
-                "data": {"count": count, "signal": path,
-                         "requested_edge_type": edge_type,
-                         "start_time": resolved_start, "end_time": resolved_end},
+                "data": {
+                    "count": count,
+                    "signal": path,
+                    "width": width,
+                    "requested_edge_type": edge_type,
+                    "effective_mode": _virtual_effective_count_mode(width, edge_type),
+                    "start_time": resolved_start,
+                    "end_time": resolved_end,
+                    "boundary_policy": boundary_policy,
+                },
             }
             result["resolved_time_range"] = {"start": start_info, "end": end_info}
             return _with_session_metadata(result, session)
@@ -899,6 +1421,17 @@ def count_transitions(
                 "edge_type": edge_type,
             },
         )
+        if result.get("status") == "success":
+            data = result.get("data", {})
+            if boundary_policy == "exclusive" and _real_signal_matches_edge_at_time(
+                path,
+                session,
+                resolved_start,
+                int(data.get("width", 1)),
+                edge_type,
+            ):
+                data["count"] = max(0, int(data.get("count", 0)) - 1)
+            data["boundary_policy"] = boundary_policy
         result["resolved_time_range"] = {"start": start_info, "end": end_info}
         return _with_session_metadata(result, session)
     except Exception as e:
@@ -966,6 +1499,7 @@ def get_signal_overview(
     resolution: ResolutionReference = "auto",
     radix: str = "hex",
     session_name: Optional[str] = None,
+    virtual_leaf_max_limit: int = DEFAULT_VIRTUAL_LEAF_MAX_LIMIT,
 ):
     """Summarize one signal over a time window using a resolution-aware overview.
 
@@ -975,6 +1509,7 @@ def get_signal_overview(
     - resolution may be an integer or "auto"
     """
     try:
+        virtual_leaf_max_limit = _normalize_virtual_leaf_max_limit(virtual_leaf_max_limit)
         resolved_start, resolved_end, start_info, end_info, session = _resolve_time_range_reference(
             start_time,
             end_time,
@@ -982,28 +1517,38 @@ def get_signal_overview(
             session_name=session_name,
         )
         if vs_service.is_virtual(path, session):
-            # Evaluate using iter_transitions to get full timeline
-            transitions = list(vs_service.iter_transitions(path, session, resolved_start, resolved_end))
-            num_transitions = max(0, len(transitions) - 1)
-            # Create a simple preview of the last few transitions
-            preview = []
-            for t in transitions[-5:]:
-                preview.append({
-                    "t": t["t"],
-                    "v": _format_virtual_value_at_time(path, session, t["t"], radix),
-                })
-                
+            requested_resolution, parsed_resolution = _parse_virtual_overview_resolution(resolution)
+            width = _virtual_signal_width(path, session, resolved_start)
+            start_value, transitions = _virtual_window_transitions(
+                path,
+                session,
+                resolved_start,
+                resolved_end,
+                virtual_leaf_max_limit=virtual_leaf_max_limit,
+            )
+            resolved_resolution = (
+                _choose_virtual_auto_resolution(transitions, resolved_start, resolved_end)
+                if parsed_resolution == "auto"
+                else parsed_resolution
+            )
+            segments = _build_virtual_overview_segments(
+                width,
+                transitions,
+                resolved_start,
+                resolved_end,
+                resolved_resolution,
+                start_value,
+                radix,
+            )
             result = {
                 "status": "success",
-                "data": {
-                    "signal": path,
-                    "type": "virtual",
-                    "width": "unknown",
-                    "transitions_in_window": num_transitions,
-                    "start_time": resolved_start,
-                    "end_time": resolved_end,
-                    "preview": preview,
-                }
+                "requested_resolution": requested_resolution,
+                "resolution": resolved_resolution,
+                "timescale": _virtual_timescale(path, session),
+                "signal": path,
+                "width": width,
+                "radix": None if width <= 1 else _normalize_radix(radix),
+                "segments": segments,
             }
             result["resolved_time_range"] = {"start": start_info, "end": end_info}
             return _with_session_metadata(result, session)
@@ -1033,9 +1578,11 @@ def analyze_pattern(
     start_time: TimeReference = 0,
     end_time: TimeReference = 0,
     session_name: Optional[str] = None,
+    virtual_leaf_max_limit: int = DEFAULT_VIRTUAL_LEAF_MAX_LIMIT,
 ):
     """Analyze a signal's behavior (e.g., identify clocks, static signals)."""
     try:
+        virtual_leaf_max_limit = _normalize_virtual_leaf_max_limit(virtual_leaf_max_limit)
         resolved_start, resolved_end, start_info, end_info, session = _resolve_time_range_reference(
             start_time,
             end_time,
@@ -1043,25 +1590,16 @@ def analyze_pattern(
             session_name=session_name,
         )
         if vs_service.is_virtual(path, session):
-            transitions = list(vs_service.iter_transitions(path, session, resolved_start, resolved_end))
-            num_transitions = max(0, len(transitions) - 1)
-            
-            # Simple pattern analysis for virtual signals
-            result_data = {
-                "signal": path,
-                "is_static": num_transitions == 0,
-                "transitions": num_transitions,
-                "time_range": {"start": resolved_start, "end": resolved_end}
+            result = {
+                "status": "success",
+                "summary": _virtual_analyze_pattern_summary(
+                    path,
+                    session,
+                    resolved_start,
+                    resolved_end,
+                    virtual_leaf_max_limit=virtual_leaf_max_limit,
+                ),
             }
-            if num_transitions > 1:
-                intervals = [transitions[i]["t"] - transitions[i-1]["t"] for i in range(1, len(transitions))]
-                min_int = min(intervals)
-                max_int = max(intervals)
-                result_data["min_interval"] = min_int
-                result_data["max_interval"] = max_int
-                result_data["is_periodic"] = min_int == max_int
-            
-            result = {"status": "success", "data": result_data}
             result["resolved_time_range"] = {"start": start_info, "end": end_info}
             return _with_session_metadata(result, session)
 
@@ -1337,6 +1875,107 @@ def list_signal_groups(waveform_path: Optional[str] = None, session_name: Option
             for name, item in sorted(session["signal_groups"].items())
         ]
         return _with_session_metadata({"status": "success", "data": groups}, session)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Virtual bus construction tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def create_bus_concat(
+    signal_name: str,
+    source_signals: List[str],
+    description: str = "",
+    waveform_path: Optional[str] = None,
+    session_name: Optional[str] = None,
+):
+    """Create a new bus by concatenating real or created signals."""
+    try:
+        session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+        session = vs_service.create_concat(
+            session,
+            signal_name=signal_name,
+            source_signals=source_signals,
+            description=description,
+        )
+        info = vs_service.get_info(signal_name, session)
+        return _with_session_metadata({"status": "success", "data": info}, session)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool()
+def create_bus_slices(
+    signal_name_prefix: str,
+    source_signal: str,
+    slice_width: int,
+    description: str = "",
+    waveform_path: Optional[str] = None,
+    session_name: Optional[str] = None,
+):
+    """Expand one bus into equal-width sub-buses in MSB-first order."""
+    try:
+        session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+        session, infos = vs_service.create_slices(
+            session,
+            signal_name_prefix=signal_name_prefix,
+            source_signal=source_signal,
+            slice_width=slice_width,
+            description=description,
+        )
+        return _with_session_metadata({"status": "success", "data": infos}, session)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool()
+def create_reversed_bus(
+    signal_name: str,
+    source_signal: str,
+    description: str = "",
+    waveform_path: Optional[str] = None,
+    session_name: Optional[str] = None,
+):
+    """Create a new bus by reversing the bit order of an existing bus."""
+    try:
+        session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+        session = vs_service.create_reverse(
+            session,
+            signal_name=signal_name,
+            source_signal=source_signal,
+            description=description,
+        )
+        info = vs_service.get_info(signal_name, session)
+        return _with_session_metadata({"status": "success", "data": info}, session)
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool()
+def create_bus_slice(
+    signal_name: str,
+    source_signal: str,
+    msb: int,
+    lsb: int,
+    description: str = "",
+    waveform_path: Optional[str] = None,
+    session_name: Optional[str] = None,
+):
+    """Create a new bus from an inclusive range of an existing bus."""
+    try:
+        session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+        session = vs_service.create_slice(
+            session,
+            signal_name=signal_name,
+            source_signal=source_signal,
+            msb=msb,
+            lsb=lsb,
+            description=description,
+        )
+        info = vs_service.get_info(signal_name, session)
+        return _with_session_metadata({"status": "success", "data": info}, session)
     except Exception as e:
         return {"status": "error", "message": str(e)}
 

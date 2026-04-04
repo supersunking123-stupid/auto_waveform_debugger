@@ -17,6 +17,7 @@ NVDLA_RTL_TRACE_DB = Path("/home/qsun/DVT/nvdla/hw/verif/sim_vip/rtl_trace.db")
 sys.path.insert(0, str(ROOT))
 
 from agent_debug_automation import agent_debug_automation_mcp as mcp_mod
+from agent_debug_automation.virtual_signals import clear_virtual_cache
 
 
 OVERVIEW_FIXTURE_VCD = """$date
@@ -146,6 +147,42 @@ $end
 """
 
 
+BOUNDARY_EDGE_FIXTURE_VCD = """$date
+  boundary edge fixture
+$end
+$timescale 1ns $end
+$scope module TOP $end
+$var wire 1 ! a $end
+$upscope $end
+$enddefinitions $end
+#0
+0!
+#1000000
+1!
+#2000000
+$end
+"""
+
+
+LATE_BOUNDARY_EDGE_FIXTURE_VCD = """$date
+  late boundary edge fixture
+$end
+$timescale 1ns $end
+$scope module TOP $end
+$var wire 1 ! a $end
+$upscope $end
+$enddefinitions $end
+#0
+1!
+#1000000
+0!
+#2000000
+1!
+#2000001
+$end
+"""
+
+
 class CrossLinkingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -158,6 +195,10 @@ class CrossLinkingTests(unittest.TestCase):
         Path(cls.virtual_waveform_path).write_text(VIRTUAL_FIXTURE_VCD, encoding="ascii")
         cls.sparse_waveform_path = str(Path(cls.temp_dir.name) / "sparse_edge_fixture.vcd")
         Path(cls.sparse_waveform_path).write_text(SPARSE_EDGE_FIXTURE_VCD, encoding="ascii")
+        cls.boundary_waveform_path = str(Path(cls.temp_dir.name) / "boundary_edge_fixture.vcd")
+        Path(cls.boundary_waveform_path).write_text(BOUNDARY_EDGE_FIXTURE_VCD, encoding="ascii")
+        cls.late_boundary_waveform_path = str(Path(cls.temp_dir.name) / "late_boundary_edge_fixture.vcd")
+        Path(cls.late_boundary_waveform_path).write_text(LATE_BOUNDARY_EDGE_FIXTURE_VCD, encoding="ascii")
         cls.rtl_trace_bin = str(ROOT / "standalone_trace" / "build" / "rtl_trace")
         cls.wave_cli_bin = str(ROOT / "waveform_explorer" / "build" / "wave_agent_cli")
         fixture_dir = Path(__file__).parent / "fixtures"
@@ -1011,6 +1052,84 @@ class CrossLinkingTests(unittest.TestCase):
         self.assertEqual(virtual["status"], "success")
         self.assertEqual(virtual["data"]["bus_passthru"], real["data"]["bus"])
 
+    def test_virtual_bus_tools_create_and_query(self):
+        concat = mcp_mod.create_bus_concat(
+            "ab",
+            ["a", "b"],
+            waveform_path=self.virtual_waveform_path,
+        )
+        self.assertEqual(concat["status"], "success")
+        self.assertEqual(concat["data"]["kind"], "bus_op")
+        self.assertEqual(concat["data"]["width"], 2)
+        self.assertEqual(concat["data"]["operation"]["type"], "concat")
+
+        reverse = mcp_mod.create_reversed_bus(
+            "bus_rev",
+            "bus",
+            waveform_path=self.virtual_waveform_path,
+        )
+        self.assertEqual(reverse["status"], "success")
+        self.assertEqual(reverse["data"]["operation"]["type"], "reverse")
+
+        bus_slice = mcp_mod.create_bus_slice(
+            "bus_upper",
+            "bus",
+            3,
+            2,
+            waveform_path=self.virtual_waveform_path,
+        )
+        self.assertEqual(bus_slice["status"], "success")
+        self.assertEqual(bus_slice["data"]["width"], 2)
+        self.assertEqual(bus_slice["data"]["operation"]["msb"], 3)
+        self.assertEqual(bus_slice["data"]["operation"]["lsb"], 2)
+
+        slices = mcp_mod.create_bus_slices(
+            "parts",
+            "bus",
+            2,
+            waveform_path=self.virtual_waveform_path,
+        )
+        self.assertEqual(slices["status"], "success")
+        self.assertEqual(
+            [item["signal_name"] for item in slices["data"]],
+            ["parts_3_2", "parts_1_0"],
+        )
+
+        snapshot = mcp_mod.get_snapshot(
+            vcd_path=self.virtual_waveform_path,
+            signals=["ab", "bus_rev", "bus_upper", "parts_3_2", "parts_1_0"],
+            time=21,
+            radix="bin",
+        )
+        self.assertEqual(snapshot["status"], "success")
+        self.assertEqual(snapshot["data"]["ab"], "b11")
+        self.assertEqual(snapshot["data"]["bus_rev"], "b0101")
+        self.assertEqual(snapshot["data"]["bus_upper"], "b10")
+        self.assertEqual(snapshot["data"]["parts_3_2"], "b10")
+        self.assertEqual(snapshot["data"]["parts_1_0"], "b10")
+
+        listed = mcp_mod.list_signal_expressions(waveform_path=self.virtual_waveform_path)
+        self.assertEqual(listed["status"], "success")
+        listed_by_name = {item["signal_name"]: item for item in listed["data"]}
+        self.assertEqual(listed_by_name["ab"]["kind"], "bus_op")
+        self.assertEqual(listed_by_name["bus_rev"]["operation"]["type"], "reverse")
+
+    def test_update_signal_expression_rejects_bus_created_signal(self):
+        create = mcp_mod.create_reversed_bus(
+            "bus_rev_update",
+            "bus",
+            waveform_path=self.virtual_waveform_path,
+        )
+        self.assertEqual(create["status"], "success")
+
+        update = mcp_mod.update_signal_expression(
+            "bus_rev_update",
+            expression="bus",
+            waveform_path=self.virtual_waveform_path,
+        )
+        self.assertEqual(update["status"], "error")
+        self.assertIn("delete and recreate", update.get("message", "").lower())
+
     def test_virtual_find_edge_scans_past_old_cap(self):
         create = mcp_mod.create_signal_expression(
             "a_passthru",
@@ -1037,6 +1156,404 @@ class CrossLinkingTests(unittest.TestCase):
         self.assertEqual(virtual["status"], "success")
         self.assertEqual(real["data"], 200000001)
         self.assertEqual(virtual["data"], real["data"])
+
+    def test_virtual_find_edge_virtual_leaf_max_limit_is_overridable(self):
+        create = mcp_mod.create_signal_expression(
+            "a_limit_passthru",
+            "a",
+            waveform_path=self.virtual_waveform_path,
+        )
+        self.assertEqual(create["status"], "success")
+        clear_virtual_cache()
+
+        overridden = mcp_mod.find_edge(
+            vcd_path=self.virtual_waveform_path,
+            path="a_limit_passthru",
+            edge_type="posedge",
+            start_time=0,
+            direction="forward",
+            virtual_leaf_max_limit=4,
+        )
+        limited = mcp_mod.find_edge(
+            vcd_path=self.virtual_waveform_path,
+            path="a_limit_passthru",
+            edge_type="posedge",
+            start_time=0,
+            direction="forward",
+            virtual_leaf_max_limit=1,
+        )
+
+        self.assertEqual(overridden["status"], "success")
+        self.assertEqual(overridden["data"], 10)
+        self.assertEqual(limited["status"], "error")
+        self.assertIn("virtual_leaf_max_limit", limited.get("message", ""))
+
+    def test_virtual_find_edge_preserves_chunk_boundary_edges(self):
+        create = mcp_mod.create_signal_expression(
+            "a_boundary_passthru",
+            "a",
+            waveform_path=self.boundary_waveform_path,
+        )
+        self.assertEqual(create["status"], "success")
+
+        forward_real = mcp_mod.find_edge(
+            vcd_path=self.boundary_waveform_path,
+            path="a",
+            edge_type="posedge",
+            start_time=0,
+            direction="forward",
+        )
+        forward_virtual = mcp_mod.find_edge(
+            vcd_path=self.boundary_waveform_path,
+            path="a_boundary_passthru",
+            edge_type="posedge",
+            start_time=0,
+            direction="forward",
+        )
+        backward_real = mcp_mod.find_edge(
+            vcd_path=self.boundary_waveform_path,
+            path="a",
+            edge_type="posedge",
+            start_time=1999999,
+            direction="backward",
+        )
+        backward_virtual = mcp_mod.find_edge(
+            vcd_path=self.boundary_waveform_path,
+            path="a_boundary_passthru",
+            edge_type="posedge",
+            start_time=1999999,
+            direction="backward",
+        )
+
+        self.assertEqual(forward_real["status"], "success")
+        self.assertEqual(forward_virtual["status"], "success")
+        self.assertEqual(backward_real["status"], "success")
+        self.assertEqual(backward_virtual["status"], "success")
+        self.assertEqual(forward_real["data"], 1000000)
+        self.assertEqual(forward_virtual["data"], forward_real["data"])
+        self.assertEqual(backward_real["data"], 1000000)
+        self.assertEqual(backward_virtual["data"], backward_real["data"])
+
+    def test_virtual_count_transitions_includes_edge_at_window_start(self):
+        create = mcp_mod.create_signal_expression(
+            "a_count_passthru",
+            "a",
+            waveform_path=self.virtual_waveform_path,
+        )
+        self.assertEqual(create["status"], "success")
+
+        real = mcp_mod.count_transitions(
+            vcd_path=self.virtual_waveform_path,
+            path="a",
+            start_time=10,
+            end_time=50,
+            edge_type="posedge",
+        )
+        virtual = mcp_mod.count_transitions(
+            vcd_path=self.virtual_waveform_path,
+            path="a_count_passthru",
+            start_time=10,
+            end_time=50,
+            edge_type="posedge",
+        )
+
+        self.assertEqual(real["status"], "success")
+        self.assertEqual(virtual["status"], "success")
+        self.assertEqual(real["data"]["count"], 2)
+        self.assertEqual(virtual["data"]["count"], real["data"]["count"])
+
+    def test_virtual_count_transitions_matches_real_backend_at_time_zero(self):
+        create = mcp_mod.create_signal_expression(
+            "a_time_zero_passthru",
+            "a",
+            waveform_path=self.virtual_waveform_path,
+        )
+        self.assertEqual(create["status"], "success")
+
+        real = mcp_mod.count_transitions(
+            vcd_path=self.virtual_waveform_path,
+            path="a",
+            start_time=0,
+            end_time=10,
+            edge_type="anyedge",
+        )
+        virtual = mcp_mod.count_transitions(
+            vcd_path=self.virtual_waveform_path,
+            path="a_time_zero_passthru",
+            start_time=0,
+            end_time=10,
+            edge_type="anyedge",
+        )
+
+        self.assertEqual(real["status"], "success")
+        self.assertEqual(virtual["status"], "success")
+        self.assertEqual(real["data"]["count"], 2)
+        self.assertEqual(virtual["data"]["count"], real["data"]["count"])
+
+    def test_count_transitions_boundary_policy_can_exclude_start_edge(self):
+        create = mcp_mod.create_signal_expression(
+            "a_boundary_policy_passthru",
+            "a",
+            waveform_path=self.virtual_waveform_path,
+        )
+        self.assertEqual(create["status"], "success")
+
+        real = mcp_mod.count_transitions(
+            vcd_path=self.virtual_waveform_path,
+            path="a",
+            start_time=10,
+            end_time=50,
+            edge_type="posedge",
+            boundary_policy="exclusive",
+        )
+        virtual = mcp_mod.count_transitions(
+            vcd_path=self.virtual_waveform_path,
+            path="a_boundary_policy_passthru",
+            start_time=10,
+            end_time=50,
+            edge_type="posedge",
+            boundary_policy="exclusive",
+        )
+
+        self.assertEqual(real["status"], "success")
+        self.assertEqual(virtual["status"], "success")
+        self.assertEqual(real["data"]["boundary_policy"], "exclusive")
+        self.assertEqual(virtual["data"]["boundary_policy"], "exclusive")
+        self.assertEqual(real["data"]["count"], 1)
+        self.assertEqual(virtual["data"]["count"], real["data"]["count"])
+
+    def test_multibit_count_transitions_matches_toggle_mode_with_boundary_policy(self):
+        create = mcp_mod.create_signal_expression(
+            "bus_count_passthru",
+            "bus",
+            waveform_path=self.virtual_waveform_path,
+        )
+        self.assertEqual(create["status"], "success")
+
+        real_inclusive = mcp_mod.count_transitions(
+            vcd_path=self.virtual_waveform_path,
+            path="bus",
+            start_time=20,
+            end_time=50,
+            edge_type="posedge",
+            boundary_policy="inclusive",
+        )
+        virtual_inclusive = mcp_mod.count_transitions(
+            vcd_path=self.virtual_waveform_path,
+            path="bus_count_passthru",
+            start_time=20,
+            end_time=50,
+            edge_type="posedge",
+            boundary_policy="inclusive",
+        )
+        real_exclusive = mcp_mod.count_transitions(
+            vcd_path=self.virtual_waveform_path,
+            path="bus",
+            start_time=20,
+            end_time=50,
+            edge_type="posedge",
+            boundary_policy="exclusive",
+        )
+        virtual_exclusive = mcp_mod.count_transitions(
+            vcd_path=self.virtual_waveform_path,
+            path="bus_count_passthru",
+            start_time=20,
+            end_time=50,
+            edge_type="posedge",
+            boundary_policy="exclusive",
+        )
+
+        self.assertEqual(real_inclusive["status"], "success")
+        self.assertEqual(virtual_inclusive["status"], "success")
+        self.assertEqual(real_exclusive["status"], "success")
+        self.assertEqual(virtual_exclusive["status"], "success")
+        self.assertEqual(real_inclusive["data"]["effective_mode"], "toggle")
+        self.assertEqual(virtual_inclusive["data"]["effective_mode"], "toggle")
+        self.assertEqual(real_inclusive["data"]["count"], 4)
+        self.assertEqual(virtual_inclusive["data"]["count"], real_inclusive["data"]["count"])
+        self.assertEqual(real_exclusive["data"]["count"], 3)
+        self.assertEqual(virtual_exclusive["data"]["count"], real_exclusive["data"]["count"])
+
+    def test_multibit_count_transitions_matches_toggle_mode_at_time_zero(self):
+        create = mcp_mod.create_signal_expression(
+            "bus_time_zero_passthru",
+            "bus",
+            waveform_path=self.virtual_waveform_path,
+        )
+        self.assertEqual(create["status"], "success")
+
+        real = mcp_mod.count_transitions(
+            vcd_path=self.virtual_waveform_path,
+            path="bus",
+            start_time=0,
+            end_time=20,
+            edge_type="posedge",
+        )
+        virtual = mcp_mod.count_transitions(
+            vcd_path=self.virtual_waveform_path,
+            path="bus_time_zero_passthru",
+            start_time=0,
+            end_time=20,
+            edge_type="posedge",
+        )
+
+        self.assertEqual(real["status"], "success")
+        self.assertEqual(virtual["status"], "success")
+        self.assertEqual(real["data"]["count"], 2)
+        self.assertEqual(virtual["data"]["count"], real["data"]["count"])
+        self.assertEqual(real["data"]["effective_mode"], "toggle")
+        self.assertEqual(virtual["data"]["effective_mode"], "toggle")
+
+    def test_virtual_backward_find_edge_matches_real_backend_at_time_zero(self):
+        create = mcp_mod.create_signal_expression(
+            "a_backward_zero_passthru",
+            "a",
+            waveform_path=self.virtual_waveform_path,
+        )
+        self.assertEqual(create["status"], "success")
+
+        real = mcp_mod.find_edge(
+            vcd_path=self.virtual_waveform_path,
+            path="a",
+            edge_type="anyedge",
+            start_time=0,
+            direction="backward",
+        )
+        virtual = mcp_mod.find_edge(
+            vcd_path=self.virtual_waveform_path,
+            path="a_backward_zero_passthru",
+            edge_type="anyedge",
+            start_time=0,
+            direction="backward",
+        )
+
+        self.assertEqual(real["status"], "success")
+        self.assertEqual(virtual["status"], "success")
+        self.assertEqual(real["data"], 0)
+        self.assertEqual(virtual["data"], real["data"])
+
+    def test_virtual_find_edge_preserves_later_chunk_boundary_edges(self):
+        create = mcp_mod.create_signal_expression(
+            "a_late_boundary_passthru",
+            "a",
+            waveform_path=self.late_boundary_waveform_path,
+        )
+        self.assertEqual(create["status"], "success")
+
+        real = mcp_mod.find_edge(
+            vcd_path=self.late_boundary_waveform_path,
+            path="a",
+            edge_type="posedge",
+            start_time=0,
+            direction="forward",
+        )
+        virtual = mcp_mod.find_edge(
+            vcd_path=self.late_boundary_waveform_path,
+            path="a_late_boundary_passthru",
+            edge_type="posedge",
+            start_time=0,
+            direction="forward",
+        )
+
+        self.assertEqual(real["status"], "success")
+        self.assertEqual(virtual["status"], "success")
+        self.assertEqual(real["data"], 2000000)
+        self.assertEqual(virtual["data"], real["data"])
+
+    def test_virtual_count_transitions_matches_scalar_edge_modes(self):
+        create = mcp_mod.create_signal_expression(
+            "a_count_modes_passthru",
+            "a",
+            waveform_path=self.virtual_waveform_path,
+        )
+        self.assertEqual(create["status"], "success")
+
+        expected_counts = {"posedge": 2, "negedge": 1, "anyedge": 3}
+        for edge_type, expected_count in expected_counts.items():
+            with self.subTest(edge_type=edge_type):
+                real = mcp_mod.count_transitions(
+                    vcd_path=self.virtual_waveform_path,
+                    path="a",
+                    start_time=10,
+                    end_time=50,
+                    edge_type=edge_type,
+                )
+                virtual = mcp_mod.count_transitions(
+                    vcd_path=self.virtual_waveform_path,
+                    path="a_count_modes_passthru",
+                    start_time=10,
+                    end_time=50,
+                    edge_type=edge_type,
+                )
+
+                self.assertEqual(real["status"], "success")
+                self.assertEqual(virtual["status"], "success")
+                self.assertEqual(real["data"]["count"], expected_count)
+                self.assertEqual(virtual["data"]["count"], real["data"]["count"])
+                self.assertEqual(virtual["data"]["effective_mode"], real["data"]["effective_mode"])
+
+    def test_virtual_signal_overview_matches_real_backend_contract(self):
+        create = mcp_mod.create_signal_expression(
+            "overview_bus_passthru",
+            "tb.bus[3:0]",
+            waveform_path=self.overview_waveform_path,
+        )
+        self.assertEqual(create["status"], "success")
+
+        real = mcp_mod.get_signal_overview(
+            vcd_path=self.overview_waveform_path,
+            path="tb.bus[3:0]",
+            start_time=0,
+            end_time=80,
+            resolution=10,
+            radix="hex",
+        )
+        virtual = mcp_mod.get_signal_overview(
+            vcd_path=self.overview_waveform_path,
+            path="overview_bus_passthru",
+            start_time=0,
+            end_time=80,
+            resolution=10,
+            radix="hex",
+        )
+
+        self.assertEqual(real["status"], "success")
+        self.assertEqual(virtual["status"], "success")
+        self.assertEqual(virtual["requested_resolution"], real["requested_resolution"])
+        self.assertEqual(virtual["resolution"], real["resolution"])
+        self.assertEqual(virtual["timescale"], real["timescale"])
+        self.assertEqual(virtual["width"], real["width"])
+        self.assertEqual(virtual["radix"], real["radix"])
+        self.assertEqual(virtual["segments"], real["segments"])
+        self.assertEqual(virtual["signal"], "overview_bus_passthru")
+
+    def test_virtual_analyze_pattern_matches_real_backend_contract(self):
+        create = mcp_mod.create_signal_expression(
+            "fast_passthru",
+            "tb.fast",
+            waveform_path=self.overview_waveform_path,
+        )
+        self.assertEqual(create["status"], "success")
+
+        real = mcp_mod.analyze_pattern(
+            vcd_path=self.overview_waveform_path,
+            path="tb.fast",
+            start_time=0,
+            end_time=40,
+        )
+        virtual = mcp_mod.analyze_pattern(
+            vcd_path=self.overview_waveform_path,
+            path="fast_passthru",
+            start_time=0,
+            end_time=40,
+        )
+
+        self.assertEqual(real["status"], "success")
+        self.assertEqual(virtual["status"], "success")
+        self.assertIn("summary", real)
+        self.assertIn("summary", virtual)
+        self.assertNotIn("data", virtual)
+        self.assertEqual(virtual["summary"], real["summary"])
 
     # --- RTL trace MCP tool tests ---
 

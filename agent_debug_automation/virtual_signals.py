@@ -11,15 +11,15 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from .expression_evaluator import LogicValue, evaluate_expression, iter_virtual_transitions
 from .expression_parser import ParseError, collect_signal_refs, parse_expression
-from .models import MAX_VIRTUAL_SIGNAL_DEPTH
+from .models import DEFAULT_VIRTUAL_LEAF_MAX_LIMIT, MAX_VIRTUAL_SIGNAL_DEPTH
 
 
 # ---------------------------------------------------------------------------
 # In-memory transition cache
 # ---------------------------------------------------------------------------
 
-# Key: (waveform_path, session_name, signal_name, expression_hash, start_time, end_time)
-_virtual_cache: Dict[Tuple[str, str, str, str, int, int], List[Dict[str, Any]]] = {}
+# Key: (waveform_path, session_name, signal_name, expression_hash, start_time, end_time, leaf_max_limit)
+_virtual_cache: Dict[Tuple[str, str, str, str, int, int, int], List[Dict[str, Any]]] = {}
 
 # Maximum cache entries before eviction
 _MAX_CACHE_SIZE = 256
@@ -32,9 +32,10 @@ def _cache_key(
     expression: str,
     start_time: int,
     end_time: int,
-) -> Tuple[str, str, str, str, int, int]:
+    leaf_max_limit: int,
+) -> Tuple[str, str, str, str, int, int, int]:
     expr_hash = hashlib.sha256(expression.encode("utf-8")).hexdigest()[:16]
-    return (waveform_path, session_name, signal_name, expr_hash, start_time, end_time)
+    return (waveform_path, session_name, signal_name, expr_hash, start_time, end_time, leaf_max_limit)
 
 
 def _cache_get(
@@ -44,8 +45,19 @@ def _cache_get(
     expression: str,
     start_time: int,
     end_time: int,
+    leaf_max_limit: int,
 ) -> Optional[List[Dict[str, Any]]]:
-    return _virtual_cache.get(_cache_key(waveform_path, session_name, signal_name, expression, start_time, end_time))
+    return _virtual_cache.get(
+        _cache_key(
+            waveform_path,
+            session_name,
+            signal_name,
+            expression,
+            start_time,
+            end_time,
+            leaf_max_limit,
+        )
+    )
 
 
 def _cache_put(
@@ -55,12 +67,23 @@ def _cache_put(
     expression: str,
     start_time: int,
     end_time: int,
+    leaf_max_limit: int,
     transitions: List[Dict[str, Any]],
 ) -> None:
     if len(_virtual_cache) >= _MAX_CACHE_SIZE:
         oldest = next(iter(_virtual_cache))
         del _virtual_cache[oldest]
-    _virtual_cache[_cache_key(waveform_path, session_name, signal_name, expression, start_time, end_time)] = transitions
+    _virtual_cache[
+        _cache_key(
+            waveform_path,
+            session_name,
+            signal_name,
+            expression,
+            start_time,
+            end_time,
+            leaf_max_limit,
+        )
+    ] = transitions
 
 
 def _cache_invalidate(waveform_path: str, session_name: str, signal_name: str) -> None:
@@ -95,6 +118,36 @@ def _cache_invalidate_all(signal_name: str, session: Dict[str, Any]) -> None:
     for name in to_invalidate:
         if name in created:
             _cache_invalidate(waveform, session_name, name)
+
+
+def _normalize_leaf_max_limit(max_limit: Optional[int]) -> int:
+    if max_limit is None:
+        return DEFAULT_VIRTUAL_LEAF_MAX_LIMIT
+    try:
+        limit = int(max_limit)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("virtual_leaf_max_limit must be an integer > 0") from exc
+    if limit <= 0:
+        raise ValueError("virtual_leaf_max_limit must be > 0")
+    return limit
+
+
+def _dependent_signals(
+    signal_name: str,
+    created_signals: Dict[str, Dict[str, Any]],
+) -> List[str]:
+    """Return all created signals that transitively depend on *signal_name*."""
+    dependents: set = set()
+    frontier = [signal_name]
+    while frontier:
+        current = frontier.pop()
+        for name, info in created_signals.items():
+            if name in dependents or name == signal_name:
+                continue
+            if current in info.get("dependencies", []):
+                dependents.add(name)
+                frontier.append(name)
+    return sorted(dependents)
 
 
 def clear_virtual_cache() -> None:
@@ -181,6 +234,145 @@ class VirtualSignalService:
             return LogicValue.z_val(width_hint)
         return value.with_width(width_hint)
 
+    @staticmethod
+    def _entry_kind(info: Dict[str, Any]) -> str:
+        return str(info.get("kind", "expression"))
+
+    @staticmethod
+    def _build_display_concat(source_signals: Sequence[str]) -> str:
+        return "{" + ", ".join(source_signals) + "}"
+
+    @staticmethod
+    def _build_display_slice(source_signal: str, msb: int, lsb: int) -> str:
+        return f"{source_signal}[{msb}:{lsb}]"
+
+    @staticmethod
+    def _build_display_reverse(source_signal: str) -> str:
+        return f"reverse({source_signal})"
+
+    def _build_entry(
+        self,
+        signal_name: str,
+        expression: str,
+        ast: Dict[str, Any],
+        description: str,
+        kind: str,
+        width: Optional[int],
+        operation: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, Dict[str, Any]]:
+        from .sessions import _validate_named_entity
+
+        key = _validate_named_entity(signal_name, "signal_name")
+        resolved_width = None if width is None else int(width)
+        if resolved_width is not None and resolved_width <= 0:
+            raise ValueError(f"invalid width for signal '{key}': {resolved_width}")
+
+        entry = {
+            "kind": kind,
+            "expression": expression,
+            "ast": ast,
+            "dependencies": collect_signal_refs(ast),
+            "description": description,
+            "width": resolved_width,
+            "operation": None if operation is None else dict(operation),
+        }
+        return key, entry
+
+    def _store_entries(
+        self,
+        session: Dict[str, Any],
+        entries: Sequence[Tuple[str, Dict[str, Any]]],
+    ) -> Dict[str, Any]:
+        from .sessions import _save_session_payload
+
+        created = session.setdefault("created_signals", {})
+        temp_created = dict(created)
+        for signal_name, entry in entries:
+            if signal_name in temp_created:
+                raise ValueError(f"virtual signal already exists: {signal_name}")
+            temp_created[signal_name] = entry
+            _topological_sort(signal_name, temp_created)
+
+        for signal_name, entry in entries:
+            created[signal_name] = entry
+        return _save_session_payload(session)
+
+    def _entry_metadata(self, signal_name: str, info: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "signal_name": signal_name,
+            "kind": self._entry_kind(info),
+            "expression": info.get("expression", ""),
+            "dependencies": list(info.get("dependencies", [])),
+            "description": info.get("description", ""),
+            "width": info.get("width"),
+            "operation": info.get("operation"),
+        }
+
+    def _resolve_signal_width(
+        self,
+        signal_name: str,
+        session: Dict[str, Any],
+        wave_cli_bin: Optional[str] = None,
+        width_cache: Optional[Dict[str, Optional[int]]] = None,
+    ) -> Optional[int]:
+        cache = width_cache if width_cache is not None else {}
+        if signal_name in cache:
+            return cache[signal_name]
+
+        created = session.get("created_signals", {})
+        if signal_name in created:
+            info = created[signal_name]
+            stored_width = info.get("width")
+            if isinstance(stored_width, int) and stored_width > 0:
+                cache[signal_name] = stored_width
+                return stored_width
+
+            ast = info.get("ast")
+            if ast is None:
+                if self._entry_kind(info) == "bus_op":
+                    raise ValueError(
+                        f"bus-created signal '{signal_name}' is missing persisted AST"
+                    )
+                ast = parse_expression(info["expression"])
+
+            width = self._infer_ast_width(
+                ast,
+                session,
+                wave_cli_bin=wave_cli_bin,
+                width_cache=cache,
+            )
+            cache[signal_name] = width
+            return width
+
+        width = self._fetch_signal_width(signal_name, session["waveform_path"], wave_cli_bin)
+        if width is not None:
+            width = int(width)
+        cache[signal_name] = width
+        return width
+
+    def _infer_ast_width(
+        self,
+        ast: Dict[str, Any],
+        session: Dict[str, Any],
+        wave_cli_bin: Optional[str] = None,
+        width_cache: Optional[Dict[str, Optional[int]]] = None,
+    ) -> Optional[int]:
+        operand_values: Dict[str, LogicValue] = {}
+        cache = width_cache if width_cache is not None else {}
+
+        for ref in collect_signal_refs(ast):
+            width = self._resolve_signal_width(
+                ref,
+                session,
+                wave_cli_bin=wave_cli_bin,
+                width_cache=cache,
+            )
+            if width is None:
+                return None
+            operand_values[ref] = LogicValue.zero(width)
+
+        return evaluate_expression(ast, operand_values).width
+
     def create(
         self,
         session: Dict[str, Any],
@@ -189,37 +381,222 @@ class VirtualSignalService:
         description: str = "",
     ) -> Dict[str, Any]:
         """Parse expression, store in session. Returns updated session."""
-        from .sessions import _save_session_payload, _validate_named_entity
-
-        signal_name = _validate_named_entity(signal_name, "signal_name")
-        created = session.setdefault("created_signals", {})
-
-        if signal_name in created:
-            raise ValueError(f"virtual signal already exists: {signal_name}")
-
-        # Parse expression
         try:
             ast = parse_expression(expression)
         except ParseError as e:
             raise ValueError(f"expression parse error: {e}") from e
 
-        deps = collect_signal_refs(ast)
+        entry = self._build_entry(
+            signal_name=signal_name,
+            expression=expression,
+            ast=ast,
+            description=description,
+            kind="expression",
+            width=self._infer_ast_width(ast, session),
+        )
+        return self._store_entries(session, [entry])
 
-        # Check for cycles
-        temp_created = dict(created)
-        temp_created[signal_name] = {"expression": expression, "dependencies": deps}
-        try:
-            _topological_sort(signal_name, temp_created)
-        except ValueError as e:
-            raise ValueError(str(e)) from e
+    def create_concat(
+        self,
+        session: Dict[str, Any],
+        signal_name: str,
+        source_signals: Sequence[str],
+        description: str = "",
+        wave_cli_bin: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Create a new bus by concatenating signals in Verilog order."""
+        sources = [str(source).strip() for source in source_signals if str(source).strip()]
+        if not sources:
+            raise ValueError("source_signals must contain at least one signal")
 
-        created[signal_name] = {
-            "expression": expression,
-            "ast": ast,
-            "dependencies": deps,
-            "description": description,
+        width_cache: Dict[str, Optional[int]] = {}
+        for source in sources:
+            width = self._resolve_signal_width(
+                source,
+                session,
+                wave_cli_bin=wave_cli_bin,
+                width_cache=width_cache,
+            )
+            if width is None:
+                raise ValueError(f"failed to resolve width for source signal: {source}")
+
+        entry = self._build_entry(
+            signal_name=signal_name,
+            expression=self._build_display_concat(sources),
+            ast={
+                "type": "ConcatOp",
+                "operands": [{"type": "SignalRef", "path": source} for source in sources],
+            },
+            description=description,
+            kind="bus_op",
+            width=sum(width_cache[source] or 0 for source in sources),
+            operation={
+                "type": "concat",
+                "source_signals": list(sources),
+            },
+        )
+        return self._store_entries(session, [entry])
+
+    def create_slice(
+        self,
+        session: Dict[str, Any],
+        signal_name: str,
+        source_signal: str,
+        msb: int,
+        lsb: int,
+        description: str = "",
+        wave_cli_bin: Optional[str] = None,
+        slice_width: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Create a new bus from an inclusive range of an existing bus."""
+        source = str(source_signal).strip()
+        if not source:
+            raise ValueError("source_signal must not be empty")
+        msb = int(msb)
+        lsb = int(lsb)
+        if lsb < 0:
+            raise ValueError("lsb must be >= 0")
+        if msb < lsb:
+            raise ValueError("msb must be >= lsb")
+
+        source_width = self._resolve_signal_width(
+            source,
+            session,
+            wave_cli_bin=wave_cli_bin,
+        )
+        if source_width is None:
+            raise ValueError(f"failed to resolve width for source signal: {source}")
+        if msb >= source_width:
+            raise ValueError(
+                f"slice range [{msb}:{lsb}] is out of bounds for source width {source_width}"
+            )
+
+        operation = {
+            "type": "slice",
+            "source_signal": source,
+            "msb": msb,
+            "lsb": lsb,
         }
-        return _save_session_payload(session)
+        if slice_width is not None:
+            operation["slice_width"] = int(slice_width)
+
+        entry = self._build_entry(
+            signal_name=signal_name,
+            expression=self._build_display_slice(source, msb, lsb),
+            ast={
+                "type": "SliceOp",
+                "operand": {"type": "SignalRef", "path": source},
+                "msb": msb,
+                "lsb": lsb,
+            },
+            description=description,
+            kind="bus_op",
+            width=msb - lsb + 1,
+            operation=operation,
+        )
+        return self._store_entries(session, [entry])
+
+    def create_reverse(
+        self,
+        session: Dict[str, Any],
+        signal_name: str,
+        source_signal: str,
+        description: str = "",
+        wave_cli_bin: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Create a new bus with reversed bit order."""
+        source = str(source_signal).strip()
+        if not source:
+            raise ValueError("source_signal must not be empty")
+
+        width = self._resolve_signal_width(
+            source,
+            session,
+            wave_cli_bin=wave_cli_bin,
+        )
+        if width is None:
+            raise ValueError(f"failed to resolve width for source signal: {source}")
+
+        entry = self._build_entry(
+            signal_name=signal_name,
+            expression=self._build_display_reverse(source),
+            ast={
+                "type": "ReverseOp",
+                "operand": {"type": "SignalRef", "path": source},
+            },
+            description=description,
+            kind="bus_op",
+            width=width,
+            operation={
+                "type": "reverse",
+                "source_signal": source,
+            },
+        )
+        return self._store_entries(session, [entry])
+
+    def create_slices(
+        self,
+        session: Dict[str, Any],
+        signal_name_prefix: str,
+        source_signal: str,
+        slice_width: int,
+        description: str = "",
+        wave_cli_bin: Optional[str] = None,
+    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        """Expand a bus into equal-width sub-buses in MSB-first order."""
+        from .sessions import _validate_named_entity
+
+        prefix = _validate_named_entity(signal_name_prefix, "signal_name_prefix")
+        source = str(source_signal).strip()
+        if not source:
+            raise ValueError("source_signal must not be empty")
+        slice_width = int(slice_width)
+        if slice_width <= 0:
+            raise ValueError("slice_width must be > 0")
+
+        source_width = self._resolve_signal_width(
+            source,
+            session,
+            wave_cli_bin=wave_cli_bin,
+        )
+        if source_width is None:
+            raise ValueError(f"failed to resolve width for source signal: {source}")
+        if source_width % slice_width != 0:
+            raise ValueError(
+                f"source width {source_width} is not divisible by slice_width {slice_width}"
+            )
+
+        entries: List[Tuple[str, Dict[str, Any]]] = []
+        created_names: List[str] = []
+        for msb in range(source_width - 1, -1, -slice_width):
+            lsb = msb - slice_width + 1
+            name = f"{prefix}_{msb}_{lsb}"
+            entries.append(
+                self._build_entry(
+                    signal_name=name,
+                    expression=self._build_display_slice(source, msb, lsb),
+                    ast={
+                        "type": "SliceOp",
+                        "operand": {"type": "SignalRef", "path": source},
+                        "msb": msb,
+                        "lsb": lsb,
+                    },
+                    description=description,
+                    kind="bus_op",
+                    width=slice_width,
+                    operation={
+                        "type": "slice",
+                        "source_signal": source,
+                        "msb": msb,
+                        "lsb": lsb,
+                        "slice_width": slice_width,
+                    },
+                )
+            )
+            created_names.append(name)
+
+        updated_session = self._store_entries(session, entries)
+        return updated_session, [self.get_info(name, updated_session) for name in created_names]
 
     def update(
         self,
@@ -236,19 +613,28 @@ class VirtualSignalService:
             raise ValueError(f"virtual signal not found: {signal_name}")
 
         info = created[signal_name]
+        kind = self._entry_kind(info)
 
-        if expression is not None and expression != info["expression"]:
+        if kind != "expression" and expression is not None and expression != info["expression"]:
+            raise ValueError(
+                "bus-created signals do not support expression updates; delete and recreate via a bus tool"
+            )
+
+        if kind == "expression" and expression is not None and expression != info["expression"]:
             try:
                 ast = parse_expression(expression)
             except ParseError as e:
                 raise ValueError(f"expression parse error: {e}") from e
             deps = collect_signal_refs(ast)
+            width = self._infer_ast_width(ast, session)
 
             # Validate cycles and depth with the new expression before committing
             temp_created = dict(created)
             temp_created[signal_name] = dict(info)
             temp_created[signal_name]["expression"] = expression
+            temp_created[signal_name]["ast"] = ast
             temp_created[signal_name]["dependencies"] = deps
+            temp_created[signal_name]["width"] = width
             try:
                 _topological_sort(signal_name, temp_created)
             except ValueError as e:
@@ -259,6 +645,7 @@ class VirtualSignalService:
             info["expression"] = expression
             info["ast"] = ast
             info["dependencies"] = deps
+            info["width"] = width
 
         if description is not None:
             info["description"] = description
@@ -270,12 +657,19 @@ class VirtualSignalService:
         session: Dict[str, Any],
         signal_name: str,
     ) -> Dict[str, Any]:
-        """Delete a virtual signal. Invalidates cache for dependents."""
+        """Delete a virtual signal when no other created signal depends on it."""
         from .sessions import _save_session_payload
 
         created = session.get("created_signals", {})
         if signal_name not in created:
             raise ValueError(f"virtual signal not found: {signal_name}")
+
+        dependents = _dependent_signals(signal_name, created)
+        if dependents:
+            joined = ", ".join(dependents)
+            raise ValueError(
+                f"cannot delete virtual signal '{signal_name}'; still referenced by: {joined}"
+            )
 
         # Invalidate cache before removing
         _cache_invalidate_all(signal_name, session)
@@ -287,12 +681,7 @@ class VirtualSignalService:
         created = session.get("created_signals", {})
         result = []
         for name, info in sorted(created.items()):
-            result.append({
-                "signal_name": name,
-                "expression": info.get("expression", ""),
-                "dependencies": info.get("dependencies", []),
-                "description": info.get("description", ""),
-            })
+            result.append(self._entry_metadata(name, info))
         return result
 
     def get_info(self, signal_name: str, session: Dict[str, Any]) -> Dict[str, Any]:
@@ -300,13 +689,7 @@ class VirtualSignalService:
         created = session.get("created_signals", {})
         if signal_name not in created:
             raise ValueError(f"virtual signal not found: {signal_name}")
-        info = created[signal_name]
-        return {
-            "signal_name": signal_name,
-            "expression": info.get("expression", ""),
-            "dependencies": info.get("dependencies", []),
-            "description": info.get("description", ""),
-        }
+        return self._entry_metadata(signal_name, created[signal_name])
 
     def eval_logic_at_time(
         self,
@@ -379,8 +762,11 @@ class VirtualSignalService:
         start_time: int,
         end_time: int,
         wave_cli_bin: Optional[str] = None,
+        leaf_max_limit: Optional[int] = None,
     ) -> Iterator[Dict[str, Any]]:
         """Lazy transition generator for a virtual signal."""
+        leaf_max_limit = _normalize_leaf_max_limit(leaf_max_limit)
+
         # Check cache first
         created = session.get("created_signals", {})
         info = created.get(signal_name)
@@ -397,6 +783,7 @@ class VirtualSignalService:
             expression,
             start_time,
             end_time,
+            leaf_max_limit,
         )
         if cached is not None:
             # Slice from cache
@@ -407,7 +794,12 @@ class VirtualSignalService:
 
         # Resolve dependencies and compute
         ast, operand_transitions, signal_widths = self._resolve_deps(
-            signal_name, session, start_time, end_time, wave_cli_bin=wave_cli_bin
+            signal_name,
+            session,
+            start_time,
+            end_time,
+            wave_cli_bin=wave_cli_bin,
+            leaf_max_limit=leaf_max_limit,
         )
 
         transitions = list(iter_virtual_transitions(
@@ -422,6 +814,7 @@ class VirtualSignalService:
             expression,
             start_time,
             end_time,
+            leaf_max_limit,
             transitions,
         )
 
@@ -435,6 +828,7 @@ class VirtualSignalService:
         start_time: int,
         end_time: int,
         wave_cli_bin: Optional[str] = None,
+        leaf_max_limit: Optional[int] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, List[Dict[str, Any]]], Dict[str, int]]:
         """Resolve dependency DAG, fetch leaf transitions.
 
@@ -444,6 +838,10 @@ class VirtualSignalService:
         info = created[signal_name]
         ast = info.get("ast")
         if ast is None:
+            if self._entry_kind(info) == "bus_op":
+                raise ValueError(
+                    f"bus-created signal '{signal_name}' is missing persisted AST"
+                )
             ast = parse_expression(info["expression"])
 
         leaf_refs = collect_signal_refs(ast)
@@ -454,17 +852,27 @@ class VirtualSignalService:
         for ref in leaf_refs:
             if ref in created:
                 # Virtual leaf — recursively compute
-                for tr in self.iter_transitions(ref, session, start_time, end_time, wave_cli_bin=wave_cli_bin):
+                for tr in self.iter_transitions(
+                    ref,
+                    session,
+                    start_time,
+                    end_time,
+                    wave_cli_bin=wave_cli_bin,
+                    leaf_max_limit=leaf_max_limit,
+                ):
                     operand_transitions.setdefault(ref, []).append(tr)
-                # Width from first transition
-                if ref in operand_transitions and operand_transitions[ref]:
-                    val = operand_transitions[ref][0]["v"]
-                    lv = LogicValue.from_string(val)
-                    signal_widths[ref] = lv.width
+                width = self._resolve_signal_width(ref, session, wave_cli_bin=wave_cli_bin)
+                if width is not None:
+                    signal_widths[ref] = width
             else:
                 # Real leaf — fetch from backend
                 trans = self._fetch_real_transitions(
-                    ref, session["waveform_path"], start_time, end_time, wave_cli_bin
+                    ref,
+                    session["waveform_path"],
+                    start_time,
+                    end_time,
+                    wave_cli_bin,
+                    leaf_max_limit=leaf_max_limit,
                 )
                 operand_transitions[ref] = trans
                 # Get width from signal info
@@ -481,6 +889,7 @@ class VirtualSignalService:
         start_time: int,
         end_time: int,
         wave_cli_bin: Optional[str] = None,
+        leaf_max_limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Fetch transitions for a real signal from the C++ backend.
 
@@ -492,6 +901,8 @@ class VirtualSignalService:
         Raises ValueError if the backend truncates the result.
         """
         from .clients import _wave_query
+
+        leaf_max_limit = _normalize_leaf_max_limit(leaf_max_limit)
 
         # 1. Fetch exactly the state immediately before the window
         seed_time = max(0, int(start_time) - 1)
@@ -514,7 +925,7 @@ class VirtualSignalService:
                 "path": signal_path,
                 "start_time": int(start_time),
                 "end_time": int(end_time),
-                "max_limit": 10000,
+                "max_limit": leaf_max_limit,
             },
             wave_cli_bin=wave_cli_bin,
         )
@@ -523,9 +934,10 @@ class VirtualSignalService:
 
         if result.get("truncated", False):
             raise ValueError(
-                f"virtual signal operand '{signal_path}' has more than 10,000 transitions "
+                f"virtual signal operand '{signal_path}' has more than {leaf_max_limit:,} transitions "
                 f"in the requested window [{start_time}, {end_time}]; "
-                "narrow the query window or simplify the expression to avoid silent data loss."
+                "raise virtual_leaf_max_limit, narrow the query window, or simplify the expression "
+                "to avoid silent data loss."
             )
 
         history.extend(result.get("data", []))
