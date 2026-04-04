@@ -982,6 +982,25 @@ json AgentAPI::get_value_at_time(const std::string& signal_path, uint64_t time, 
     return {{"status", "success"}, {"data", format_signal_value_at_time(db, signal_path, time, radix)}};
 }
 
+json AgentAPI::get_raw_value_at_time(const std::string& signal_path, uint64_t time) {
+    if (!db.has_signal(signal_path)) {
+        return {{"status", "error"}, {"message", "Signal not found"}};
+    }
+    return {{"status", "success"}, {"data", db.get_value_at_time(signal_path, time)}};
+}
+
+json AgentAPI::get_last_transition_time(const std::string& signal_path) {
+    if (!db.has_signal(signal_path)) {
+        return {{"status", "error"}, {"message", "Signal not found"}};
+    }
+
+    const auto& trans = db.get_transitions(signal_path);
+    if (trans.empty()) {
+        return {{"status", "success"}, {"data", -1}};
+    }
+    return {{"status", "success"}, {"data", trans.back().timestamp}};
+}
+
 json AgentAPI::find_edge(const std::string& signal_path, const std::string& edge_type, uint64_t start_time, const std::string& direction) {
     if (!db.has_signal(signal_path)) {
         return {{"status", "error"}, {"message", "Signal not found"}};

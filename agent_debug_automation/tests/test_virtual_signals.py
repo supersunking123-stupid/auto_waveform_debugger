@@ -300,5 +300,26 @@ class TestExpressionValidation(_TestBase):
         self.assertEqual(len(virtuals), len(ops))
 
 
+class TestVirtualSignalEvaluation(_TestBase):
+
+    def test_eval_after_operand_transition_uses_raw_seed(self):
+        service = VirtualSignalService()
+        session = self._make_session()
+        session = service.create(session, "and_ab", "a & b")
+
+        self.assertEqual(service.eval_at_time("and_ab", session, 21), "1")
+        self.assertEqual(
+            list(service.iter_transitions("and_ab", session, 21, 22)),
+            [{"t": 21, "v": "1"}],
+        )
+
+    def test_multibit_passthrough_preserves_width_after_transition(self):
+        service = VirtualSignalService()
+        session = self._make_session()
+        session = service.create(session, "bus_passthru", "bus")
+
+        self.assertEqual(service.eval_at_time("bus_passthru", session, 21), "b1010")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -46,8 +46,15 @@ class LogicValue:
     def from_string(v: str, signed: bool = False) -> "LogicValue":
         """Parse waveform backend value string."""
         v = v.strip()
-        if v in ("0", "1", "x", "z"):
-            return LogicValue(v, 1, signed)
+        lowered = v.lower()
+        if lowered in ("0", "1", "x", "z", "u", "?"):
+            return LogicValue("x" if lowered in ("u", "?") else lowered, 1, signed)
+        if v and all(ch in "01xXzZuU?" for ch in v):
+            bits = "".join(
+                "x" if ch.lower() in ("x", "u", "?") else ch.lower()
+                for ch in v
+            )
+            return LogicValue(bits, len(bits), signed)
         if v.startswith("b"):
             bits = v[1:]
             return LogicValue(bits, len(bits), signed)
@@ -601,14 +608,24 @@ def iter_virtual_transitions(
     def value_at(path: str, t: int) -> LogicValue:
         times = sig_times.get(path, [])
         vals = sig_vals.get(path, [])
+        width_hint = signal_widths.get(path, 1)
         if not times:
-            w = signal_widths.get(path, 1)
-            return LogicValue.x_val(w)
+            return LogicValue.x_val(width_hint)
         idx = bisect_right(times, t) - 1
         if idx < 0:
-            w = signal_widths.get(path, 1)
-            return LogicValue.x_val(w)
-        return LogicValue.from_string(vals[idx])
+            return LogicValue.x_val(width_hint)
+
+        raw = vals[idx]
+        value = LogicValue.from_string(raw)
+        if value.width == width_hint:
+            return value
+
+        lowered = raw.strip().lower()
+        if lowered in ("x", "u", "?"):
+            return LogicValue.x_val(width_hint)
+        if lowered == "z":
+            return LogicValue.z_val(width_hint)
+        return value.with_width(width_hint)
 
     # Collect all event times in [start_time, end_time] using heap-based k-way merge
     # This avoids materializing all event times upfront

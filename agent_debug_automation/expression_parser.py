@@ -57,7 +57,7 @@ _MULTI_CHAR_OPS = [
 
 _SINGLE_CHAR_OPS = set("~!&|^<>+-*/%")
 
-_IDENT_RE = re.compile(r"[A-Za-z_$][A-Za-z0-9_.]*")
+_IDENT_RE = re.compile(r"[A-Za-z_$][A-Za-z0-9_.$]*")
 _UNSIGNED_NUM_RE = re.compile(r"[0-9][0-9_]*")
 _HEX_DIGIT_RE = re.compile(r"[0-9a-fA-F_]+")
 _BIN_DIGIT_RE = re.compile(r"[01_xXzZ_]+")
@@ -126,7 +126,7 @@ def _tokenize(expr: str) -> List[_Token]:
             continue
 
         # identifier / signal path
-        if ch.isalpha() or ch == "_":
+        if ch.isalpha() or ch == "_" or ch == "$":
             m = _IDENT_RE.match(expr, i)
             if not m:
                 raise ParseError(f"invalid identifier at position {i}", i)

@@ -3,6 +3,7 @@
 import uuid
 from typing import Any, Dict, List, Optional
 
+from .expression_evaluator import LogicValue
 from .server import mcp
 
 from .clients import (
@@ -314,14 +315,291 @@ def get_snapshot(
         )
         session = time_session if signal_session is None else signal_session
         import agent_debug_automation.agent_debug_automation_mcp as _wrapper
-        result = _wrapper.wave_agent_query(
-            session["waveform_path"],
-            "get_snapshot",
-            {"signals": expanded_signals, "time": resolved_time, "radix": radix},
-        )
+
+        # Partition signals into real vs. virtual so each subset is handled correctly.
+        real_signals = [s for s in expanded_signals if not vs_service.is_virtual(s, session)]
+        virtual_signals_list = [s for s in expanded_signals if vs_service.is_virtual(s, session)]
+
+        # Fetch real signals from the C++ backend.
+        if real_signals:
+            result = _wrapper.wave_agent_query(
+                session["waveform_path"],
+                "get_snapshot",
+                {"signals": real_signals, "time": resolved_time, "radix": radix},
+            )
+        else:
+            result = {"status": "success", "data": {}}
+
+        if result.get("status") != "success":
+            return _with_session_metadata(result, session, time_info, signal_info)
+
+        # Evaluate each virtual signal and merge into the snapshot data.
+        snapshot_data = result.get("data", {})
+        for vsig in virtual_signals_list:
+            snapshot_data[vsig] = _format_virtual_value_at_time(vsig, session, resolved_time, radix)
+        result["data"] = snapshot_data
+
         return _with_session_metadata(result, session, time_info, signal_info)
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+def _normalize_logic_char(ch: str) -> str:
+    lowered = ch.lower()
+    if lowered in ("0", "1"):
+        return lowered
+    if lowered in ("x", "u", "?"):
+        return "x"
+    if lowered == "z":
+        return "z"
+    return "x"
+
+
+def _simplify_scalar_value(value: str) -> str:
+    if value in ("0", "1", "x", "z"):
+        return value
+    if value in ("U", "u", "?"):
+        return "x"
+    if not value:
+        return "x"
+
+    ch = value[0].lower()
+    if ch in ("0", "1", "x", "z"):
+        return ch
+    if ch in ("u", "?"):
+        return "x"
+    return "x"
+
+
+def _normalize_radix(radix: str) -> str:
+    normalized = radix.lower()
+    if normalized in ("bin", "binary", "2"):
+        return "bin"
+    if normalized in ("dec", "decimal", "10"):
+        return "dec"
+    return "hex"
+
+
+def _normalize_multibit_bits(value: str, width: int) -> str:
+    if not value:
+        return ""
+
+    hex_digits = max(1, (width + 3) // 4)
+    bit_digits = max(1, width)
+    first = value[0]
+
+    if first in ("h", "H"):
+        hex_map = {
+            "0": "0000", "1": "0001", "2": "0010", "3": "0011",
+            "4": "0100", "5": "0101", "6": "0110", "7": "0111",
+            "8": "1000", "9": "1001", "a": "1010", "b": "1011",
+            "c": "1100", "d": "1101", "e": "1110", "f": "1111",
+            "z": "zzzz",
+        }
+        bits = "".join(hex_map.get(ch.lower(), "xxxx") for ch in value[1:])
+        if len(bits) < hex_digits * 4:
+            bits = "0" * (hex_digits * 4 - len(bits)) + bits
+        if len(bits) > bit_digits:
+            bits = bits[-bit_digits:]
+        return bits
+
+    if first in ("b", "B"):
+        bits = "".join(_normalize_logic_char(ch) for ch in value[1:])
+        if not bits:
+            return ""
+        if len(bits) < bit_digits:
+            bits = "0" * (bit_digits - len(bits)) + bits
+        elif len(bits) > bit_digits:
+            bits = bits[-bit_digits:]
+        return bits
+
+    return value.lower()
+
+
+def _binary_bits_to_decimal(bits: str) -> str:
+    decimal = "0"
+    for bit in bits:
+        carry = 1 if bit == "1" else 0
+        digits = list(decimal)
+        for idx in range(len(digits) - 1, -1, -1):
+            digit = (ord(digits[idx]) - ord("0")) * 2 + carry
+            digits[idx] = chr(ord("0") + (digit % 10))
+            carry = digit // 10
+        if carry > 0:
+            digits.insert(0, chr(ord("0") + carry))
+        decimal = "".join(digits)
+    return decimal
+
+
+def _decimal_string_to_bits(decimal: str) -> str:
+    if not decimal:
+        return ""
+    if any(not ch.isdigit() for ch in decimal):
+        return ""
+
+    decimal = decimal.lstrip("0") or "0"
+    if decimal == "0":
+        return "0"
+
+    bits: List[str] = []
+    while decimal and decimal != "0":
+        carry = 0
+        quotient: List[str] = []
+        for ch in decimal:
+            cur = carry * 10 + (ord(ch) - ord("0"))
+            q = cur // 2
+            carry = cur % 2
+            if quotient or q != 0:
+                quotient.append(chr(ord("0") + q))
+        bits.append(chr(ord("0") + carry))
+        decimal = "".join(quotient) if quotient else "0"
+
+    bits.reverse()
+    return "".join(bits)
+
+
+def _normalize_query_value_to_bits(value: str, width: int, radix: str) -> str:
+    if not value:
+        return ""
+
+    bit_digits = max(1, width)
+    prefix = value[0].lower()
+    normalized_radix = _normalize_radix(radix)
+
+    if width <= 1:
+        if value in ("0", "1", "x", "z"):
+            return value
+        if prefix in ("b", "d", "h"):
+            nested_radix = "bin" if prefix == "b" else ("dec" if prefix == "d" else "hex")
+            return _normalize_query_value_to_bits(value[1:], width, nested_radix)
+        return _simplify_scalar_value(value)
+
+    if prefix == "b":
+        bits = "".join(_normalize_logic_char(ch) for ch in value[1:])
+        if not bits:
+            return ""
+        if len(bits) < bit_digits:
+            bits = "0" * (bit_digits - len(bits)) + bits
+        elif len(bits) > bit_digits:
+            bits = bits[-bit_digits:]
+        return bits
+
+    if prefix == "h":
+        return _normalize_multibit_bits(value, width)
+
+    if prefix == "d" or normalized_radix == "dec":
+        decimal_digits = value[1:] if prefix == "d" else value
+        bits = _decimal_string_to_bits(decimal_digits)
+        if not bits:
+            return ""
+        if len(bits) < bit_digits:
+            bits = "0" * (bit_digits - len(bits)) + bits
+        elif len(bits) > bit_digits:
+            bits = bits[-bit_digits:]
+        return bits
+
+    if normalized_radix == "bin":
+        bits = "".join(_normalize_logic_char(ch) for ch in value)
+        if not bits:
+            return ""
+        if len(bits) < bit_digits:
+            bits = "0" * (bit_digits - len(bits)) + bits
+        elif len(bits) > bit_digits:
+            bits = bits[-bit_digits:]
+        return bits
+
+    return _normalize_multibit_bits("h" + value, width)
+
+
+def _raw_value_matches_query(raw_value: str, width: int, query_bits: str) -> bool:
+    if not query_bits:
+        return False
+    if width <= 1:
+        return _simplify_scalar_value(raw_value) == query_bits
+    return _normalize_multibit_bits(raw_value, width) == query_bits
+
+
+def _format_multibit_value(value: str, width: int, radix: str) -> str:
+    hex_digits = max(1, (width + 3) // 4)
+    bit_digits = max(1, width)
+    normalized_radix = _normalize_radix(radix)
+    normalized = _normalize_multibit_bits(value, width)
+    if not normalized:
+        if normalized_radix == "dec":
+            return "dx"
+        if normalized_radix == "bin":
+            return "bx"
+        return "hx"
+
+    if normalized[0] not in ("0", "1", "x", "z"):
+        return normalized
+
+    if normalized_radix == "bin":
+        bits = normalized
+        if len(bits) < bit_digits:
+            bits = "0" * (bit_digits - len(bits)) + bits
+        return "b" + bits
+
+    if normalized_radix == "dec":
+        if any(bit not in ("0", "1") for bit in normalized):
+            return "b" + normalized
+        return "d" + _binary_bits_to_decimal(normalized)
+
+    bits = normalized
+    if not bits:
+        return "hx"
+    if len(bits) < hex_digits * 4:
+        bits = "0" * (hex_digits * 4 - len(bits)) + bits
+
+    out = ["h"]
+    for idx in range(0, len(bits), 4):
+        nibble = bits[idx:idx + 4]
+        if all(bit == "z" for bit in nibble):
+            out.append("z")
+            continue
+        if any(bit in ("x", "z") for bit in nibble):
+            out.append("x")
+            continue
+        out.append(format(int(nibble, 2), "x"))
+    return "".join(out)
+
+
+def _virtual_logic_values_at_time(path: str, session: Dict[str, Any], time: int) -> tuple[LogicValue, Optional[LogicValue]]:
+    current = vs_service.eval_logic_at_time(path, session, time)
+    if time <= 0:
+        return current, None
+    previous = vs_service.eval_logic_at_time(path, session, time - 1)
+    return current, previous
+
+
+def _format_virtual_logic_value(current: LogicValue, previous: Optional[LogicValue], radix: str) -> str:
+    current_raw = current.to_string()
+    previous_raw = "U" if previous is None else previous.to_string()
+    width = max(current.width, previous.width if previous is not None else current.width)
+
+    if width <= 1:
+        if previous_raw == "0" and current_raw == "1":
+            return "rising"
+        if previous_raw == "1" and current_raw == "0":
+            return "falling"
+        return _simplify_scalar_value(current_raw)
+
+    if previous_raw != current_raw:
+        return "changing"
+    return _format_multibit_value(current_raw, width, radix)
+
+
+def _format_virtual_value_at_time(path: str, session: Dict[str, Any], time: int, radix: str) -> str:
+    current, previous = _virtual_logic_values_at_time(path, session, time)
+    return _format_virtual_logic_value(current, previous, radix)
+
+
+def _virtual_edge_matches(previous_value: str, current_value: str, edge_type: str) -> bool:
+    if edge_type == "posedge":
+        return previous_value == "0" and current_value == "1"
+    if edge_type == "negedge":
+        return previous_value == "1" and current_value == "0"
+    return previous_value != current_value
 
 
 @mcp.tool()
@@ -340,8 +618,10 @@ def get_value_at_time(
     try:
         resolved_time, time_info, session = _resolve_time_reference(time, waveform_path=vcd_path, session_name=session_name)
         if vs_service.is_virtual(path, session):
-            val = vs_service.eval_at_time(path, session, resolved_time)
-            result = {"status": "success", "data": val, "path": path, "time": resolved_time}
+            result = {
+                "status": "success",
+                "data": _format_virtual_value_at_time(path, session, resolved_time, radix),
+            }
             return _with_session_metadata(result, session, time_info)
         import agent_debug_automation.agent_debug_automation_mcp as _wrapper
         result = _wrapper.wave_agent_query(
@@ -368,29 +648,51 @@ def find_edge(
         edge_type = _normalize_edge_type(edge_type)
         resolved_time, time_info, session = _resolve_time_reference(start_time, waveform_path=vcd_path, session_name=session_name)
         if vs_service.is_virtual(path, session):
-            transitions = list(vs_service.iter_transitions(path, session, 0, resolved_time + 1000000))
-            prev = None
-            last_match = None
-            for tr in transitions:
-                val = tr["v"]
-                is_edge = False
-                if edge_type == "posedge" and prev is not None and prev == "0" and val == "1":
-                    is_edge = True
-                elif edge_type == "negedge" and prev is not None and prev == "1" and val == "0":
-                    is_edge = True
-                elif edge_type == "anyedge" and prev is not None and prev != val:
-                    is_edge = True
-                if is_edge:
-                    if direction == "forward" and tr["t"] >= resolved_time:
-                        result = {"status": "success", "data": {"time": tr["t"], "value": val}}
+            CHUNK_SIZE = 1000000
+            if direction == "forward":
+                max_time = vs_service.max_leaf_transition_time(path, session)
+                if max_time <= resolved_time:
+                    result = {"status": "success", "data": -1}
+                    return _with_session_metadata(result, session, time_info)
+
+                curr_start = resolved_time
+                while curr_start <= max_time:
+                    curr_end = min(max_time, curr_start + CHUNK_SIZE - 1)
+                    transitions = list(vs_service.iter_transitions(path, session, curr_start, curr_end))
+                    prev = None
+                    for tr in transitions:
+                        val = tr["v"]
+                        if prev is not None and _virtual_edge_matches(prev, val, edge_type) and tr["t"] > resolved_time:
+                            result = {"status": "success", "data": tr["t"]}
+                            return _with_session_metadata(result, session, time_info)
+                        prev = val
+                    if curr_end >= max_time:
+                        break
+                    curr_start = curr_end + 1
+            elif direction == "backward":
+                curr_end = resolved_time
+                while True:
+                    curr_start = max(0, curr_end - CHUNK_SIZE + 1)
+                    transitions = list(vs_service.iter_transitions(path, session, curr_start, curr_end))
+                    prev = None
+                    last_match = None
+                    for tr in transitions:
+                        val = tr["v"]
+                        if prev is not None and _virtual_edge_matches(prev, val, edge_type) and curr_start <= tr["t"] <= resolved_time:
+                            last_match = tr["t"]
+                        prev = val
+
+                    if last_match is not None:
+                        result = {"status": "success", "data": last_match}
                         return _with_session_metadata(result, session, time_info)
-                    elif direction == "backward" and tr["t"] <= resolved_time:
-                        last_match = tr
-                prev = val
-            if direction == "backward" and last_match is not None:
-                result = {"status": "success", "data": {"time": last_match["t"], "value": last_match["v"]}}
-                return _with_session_metadata(result, session, time_info)
-            return _with_session_metadata({"status": "success", "data": None, "message": "no edge found"}, session, time_info)
+
+                    if curr_start == 0:
+                        break
+
+                    curr_end = curr_start - 1
+
+            result = {"status": "success", "data": -1}
+            return _with_session_metadata(result, session, time_info)
         import agent_debug_automation.agent_debug_automation_mcp as _wrapper
         result = _wrapper.wave_agent_query(
             session["waveform_path"],
@@ -425,6 +727,38 @@ def find_value_intervals(
             waveform_path=vcd_path,
             session_name=session_name,
         )
+        if vs_service.is_virtual(path, session):
+            current_logic, _ = _virtual_logic_values_at_time(path, session, resolved_start)
+            width = current_logic.width
+            query_bits = _normalize_query_value_to_bits(value, width, radix)
+            if not query_bits:
+                return {"status": "error", "message": "failed to parse query value"}
+
+            transitions = list(vs_service.iter_transitions(
+                path, session, resolved_start, resolved_end,
+            ))
+            intervals = []
+            current_raw = transitions[0]["v"] if transitions else current_logic.to_string()
+            interval_start: Optional[int] = None
+            if _raw_value_matches_query(current_raw, width, query_bits):
+                interval_start = resolved_start
+
+            for tr in transitions[1:]:
+                next_matches = _raw_value_matches_query(tr["v"], width, query_bits)
+                if interval_start is not None and not next_matches:
+                    intervals.append({"start": interval_start, "end": tr["t"] - 1})
+                    interval_start = None
+                elif interval_start is None and next_matches:
+                    interval_start = tr["t"]
+
+            if interval_start is not None:
+                intervals.append({"start": interval_start, "end": resolved_end})
+            result = {
+                "status": "success",
+                "data": intervals,
+            }
+            result["resolved_time_range"] = {"start": start_info, "end": end_info}
+            return _with_session_metadata(result, session)
         import agent_debug_automation.agent_debug_automation_mcp as _wrapper
         result = _wrapper.wave_agent_query(
             session["waveform_path"],
@@ -529,6 +863,31 @@ def count_transitions(
             waveform_path=vcd_path,
             session_name=session_name,
         )
+        if vs_service.is_virtual(path, session):
+            # Count transitions in the virtual signal's computed timeline.
+            transitions = list(vs_service.iter_transitions(
+                path, session, resolved_start, resolved_end,
+            ))
+            count = 0
+            prev_v: Optional[str] = None
+            for tr in transitions:
+                v = tr["v"]
+                if prev_v is not None and v != prev_v:
+                    if edge_type == "anyedge":
+                        count += 1
+                    elif edge_type == "posedge" and prev_v == "0" and v == "1":
+                        count += 1
+                    elif edge_type == "negedge" and prev_v == "1" and v == "0":
+                        count += 1
+                prev_v = v
+            result = {
+                "status": "success",
+                "data": {"count": count, "signal": path,
+                         "requested_edge_type": edge_type,
+                         "start_time": resolved_start, "end_time": resolved_end},
+            }
+            result["resolved_time_range"] = {"start": start_info, "end": end_info}
+            return _with_session_metadata(result, session)
         import agent_debug_automation.agent_debug_automation_mcp as _wrapper
         result = _wrapper.wave_agent_query(
             session["waveform_path"],
@@ -622,6 +981,33 @@ def get_signal_overview(
             waveform_path=vcd_path,
             session_name=session_name,
         )
+        if vs_service.is_virtual(path, session):
+            # Evaluate using iter_transitions to get full timeline
+            transitions = list(vs_service.iter_transitions(path, session, resolved_start, resolved_end))
+            num_transitions = max(0, len(transitions) - 1)
+            # Create a simple preview of the last few transitions
+            preview = []
+            for t in transitions[-5:]:
+                preview.append({
+                    "t": t["t"],
+                    "v": _format_virtual_value_at_time(path, session, t["t"], radix),
+                })
+                
+            result = {
+                "status": "success",
+                "data": {
+                    "signal": path,
+                    "type": "virtual",
+                    "width": "unknown",
+                    "transitions_in_window": num_transitions,
+                    "start_time": resolved_start,
+                    "end_time": resolved_end,
+                    "preview": preview,
+                }
+            }
+            result["resolved_time_range"] = {"start": start_info, "end": end_info}
+            return _with_session_metadata(result, session)
+            
         import agent_debug_automation.agent_debug_automation_mcp as _wrapper
         result = _wrapper.wave_agent_query(
             session["waveform_path"],
@@ -656,6 +1042,29 @@ def analyze_pattern(
             waveform_path=vcd_path,
             session_name=session_name,
         )
+        if vs_service.is_virtual(path, session):
+            transitions = list(vs_service.iter_transitions(path, session, resolved_start, resolved_end))
+            num_transitions = max(0, len(transitions) - 1)
+            
+            # Simple pattern analysis for virtual signals
+            result_data = {
+                "signal": path,
+                "is_static": num_transitions == 0,
+                "transitions": num_transitions,
+                "time_range": {"start": resolved_start, "end": resolved_end}
+            }
+            if num_transitions > 1:
+                intervals = [transitions[i]["t"] - transitions[i-1]["t"] for i in range(1, len(transitions))]
+                min_int = min(intervals)
+                max_int = max(intervals)
+                result_data["min_interval"] = min_int
+                result_data["max_interval"] = max_int
+                result_data["is_periodic"] = min_int == max_int
+            
+            result = {"status": "success", "data": result_data}
+            result["resolved_time_range"] = {"start": start_info, "end": end_info}
+            return _with_session_metadata(result, session)
+
         import agent_debug_automation.agent_debug_automation_mcp as _wrapper
         result = _wrapper.wave_agent_query(
             session["waveform_path"],

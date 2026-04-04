@@ -21,6 +21,8 @@ public:
     // 2. State Snapshot
     json get_snapshot(const std::vector<std::string>& signal_paths, uint64_t time, const std::string& radix = "hex");
     json get_value_at_time(const std::string& signal_path, uint64_t time, const std::string& radix = "hex");
+    json get_raw_value_at_time(const std::string& signal_path, uint64_t time);
+    json get_last_transition_time(const std::string& signal_path);
 
     // 3. Temporal Search
     json find_edge(const std::string& signal_path, const std::string& edge_type, uint64_t start_time, const std::string& direction = "forward");

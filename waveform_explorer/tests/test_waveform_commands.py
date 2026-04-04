@@ -162,6 +162,46 @@ class WaveformCommandTests(unittest.TestCase):
         })
         self.assertEqual(result["status"], "error")
 
+    def test_get_raw_value_at_time_returns_unformatted_state(self):
+        transitions = self._query("get_transitions", {
+            "path": "timer_tb.clk",
+            "start_time": 20000,
+            "end_time": 30000,
+            "max_limit": 10,
+        })
+        self.assertEqual(transitions["status"], "success")
+        self.assertGreater(len(transitions["data"]), 0)
+        first_transition = transitions["data"][0]
+
+        raw = self._query("get_raw_value_at_time", {
+            "path": "timer_tb.clk",
+            "time": first_transition["t"],
+        })
+        formatted = self._query("get_value_at_time", {
+            "path": "timer_tb.clk",
+            "time": first_transition["t"],
+        })
+
+        self.assertEqual(raw["status"], "success")
+        self.assertEqual(raw["data"], first_transition["v"])
+        self.assertNotEqual(raw["data"], formatted["data"])
+
+    def test_get_last_transition_time_matches_transition_history(self):
+        transitions = self._query("get_transitions", {
+            "path": "timer_tb.timeout",
+            "start_time": 0,
+            "end_time": 1000000,
+            "max_limit": 10000,
+        })
+        self.assertEqual(transitions["status"], "success")
+        self.assertGreater(len(transitions["data"]), 0)
+
+        result = self._query("get_last_transition_time", {
+            "path": "timer_tb.timeout",
+        })
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["data"], transitions["data"][-1]["t"])
+
     # ------------------------------------------------------------------
     # find_edge
     # ------------------------------------------------------------------

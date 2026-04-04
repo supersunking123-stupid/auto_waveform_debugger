@@ -31,6 +31,12 @@ json dispatch_query(AgentAPI& api, WaveDatabase& db, const json& q) {
             args.value("path", ""),
             args.value("time", 0ULL),
             args.value("radix", "hex"));
+    } else if (cmd == "get_raw_value_at_time") {
+        response = api.get_raw_value_at_time(
+            args.value("path", ""),
+            args.value("time", 0ULL));
+    } else if (cmd == "get_last_transition_time") {
+        response = api.get_last_transition_time(args.value("path", ""));
     } else if (cmd == "find_edge") {
         response = api.find_edge(args.value("path", ""), args.value("edge_type", "anyedge"),
                                  args.value("start_time", 0ULL), args.value("direction", "forward"));

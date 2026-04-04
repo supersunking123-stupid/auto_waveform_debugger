@@ -95,6 +95,57 @@ b0100 "
 """
 
 
+VIRTUAL_FIXTURE_VCD = """$date
+  virtual fixture
+$end
+$timescale 1ns $end
+$scope module TOP $end
+$var wire 1 ! a $end
+$var wire 1 " b $end
+$var wire 4 # bus[3:0] $end
+$upscope $end
+$enddefinitions $end
+#0
+0!
+0"
+b0000 #
+#10
+1!
+#20
+1"
+b1010 #
+#30
+0!
+b1111 #
+#40
+0"
+b0000 #
+#50
+1!
+1"
+b0101 #
+#60
+$end
+"""
+
+
+SPARSE_EDGE_FIXTURE_VCD = """$date
+  sparse edge fixture
+$end
+$timescale 1ns $end
+$scope module TOP $end
+$var wire 1 ! a $end
+$upscope $end
+$enddefinitions $end
+#0
+0!
+#200000001
+1!
+#200000002
+$end
+"""
+
+
 class CrossLinkingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -103,6 +154,10 @@ class CrossLinkingTests(unittest.TestCase):
         cls.temp_dir = tempfile.TemporaryDirectory()
         cls.overview_waveform_path = str(Path(cls.temp_dir.name) / "overview_fixture.vcd")
         Path(cls.overview_waveform_path).write_text(OVERVIEW_FIXTURE_VCD, encoding="ascii")
+        cls.virtual_waveform_path = str(Path(cls.temp_dir.name) / "virtual_fixture.vcd")
+        Path(cls.virtual_waveform_path).write_text(VIRTUAL_FIXTURE_VCD, encoding="ascii")
+        cls.sparse_waveform_path = str(Path(cls.temp_dir.name) / "sparse_edge_fixture.vcd")
+        Path(cls.sparse_waveform_path).write_text(SPARSE_EDGE_FIXTURE_VCD, encoding="ascii")
         cls.rtl_trace_bin = str(ROOT / "standalone_trace" / "build" / "rtl_trace")
         cls.wave_cli_bin = str(ROOT / "waveform_explorer" / "build" / "wave_agent_cli")
         fixture_dir = Path(__file__).parent / "fixtures"
@@ -880,6 +935,108 @@ class CrossLinkingTests(unittest.TestCase):
         info = result["data"]
         self.assertIsInstance(info, dict)
         self.assertIn("width", info)
+
+    def test_virtual_scalar_value_after_transition(self):
+        create = mcp_mod.create_signal_expression(
+            "and_ab",
+            "a & b",
+            waveform_path=self.virtual_waveform_path,
+        )
+        self.assertEqual(create["status"], "success")
+
+        value = mcp_mod.get_value_at_time(
+            vcd_path=self.virtual_waveform_path,
+            path="and_ab",
+            time=21,
+        )
+        self.assertEqual(value["status"], "success")
+        self.assertEqual(value["data"], "1")
+
+        transitions = mcp_mod.get_transitions(
+            vcd_path=self.virtual_waveform_path,
+            path="and_ab",
+            start_time=21,
+            end_time=22,
+            max_limit=10,
+        )
+        self.assertEqual(transitions["status"], "success")
+        self.assertEqual(transitions["data"], [{"t": 21, "v": "1"}])
+
+    def test_virtual_multibit_value_format_matches_real_backend(self):
+        create = mcp_mod.create_signal_expression(
+            "bus_passthru",
+            "bus",
+            waveform_path=self.virtual_waveform_path,
+        )
+        self.assertEqual(create["status"], "success")
+
+        for time_value, radix in ((20, "hex"), (21, "hex"), (21, "dec")):
+            real = mcp_mod.get_value_at_time(
+                vcd_path=self.virtual_waveform_path,
+                path="bus",
+                time=time_value,
+                radix=radix,
+            )
+            virtual = mcp_mod.get_value_at_time(
+                vcd_path=self.virtual_waveform_path,
+                path="bus_passthru",
+                time=time_value,
+                radix=radix,
+            )
+            self.assertEqual(real["status"], "success")
+            self.assertEqual(virtual["status"], "success")
+            self.assertEqual(virtual["data"], real["data"])
+
+    def test_virtual_snapshot_format_matches_real_backend(self):
+        create = mcp_mod.create_signal_expression(
+            "bus_passthru",
+            "bus",
+            waveform_path=self.virtual_waveform_path,
+        )
+        self.assertEqual(create["status"], "success")
+
+        real = mcp_mod.get_snapshot(
+            vcd_path=self.virtual_waveform_path,
+            signals=["bus"],
+            time=20,
+            radix="hex",
+        )
+        virtual = mcp_mod.get_snapshot(
+            vcd_path=self.virtual_waveform_path,
+            signals=["bus_passthru"],
+            time=20,
+            radix="hex",
+        )
+        self.assertEqual(real["status"], "success")
+        self.assertEqual(virtual["status"], "success")
+        self.assertEqual(virtual["data"]["bus_passthru"], real["data"]["bus"])
+
+    def test_virtual_find_edge_scans_past_old_cap(self):
+        create = mcp_mod.create_signal_expression(
+            "a_passthru",
+            "a",
+            waveform_path=self.sparse_waveform_path,
+        )
+        self.assertEqual(create["status"], "success")
+
+        real = mcp_mod.find_edge(
+            vcd_path=self.sparse_waveform_path,
+            path="a",
+            edge_type="posedge",
+            start_time=0,
+            direction="forward",
+        )
+        virtual = mcp_mod.find_edge(
+            vcd_path=self.sparse_waveform_path,
+            path="a_passthru",
+            edge_type="posedge",
+            start_time=0,
+            direction="forward",
+        )
+        self.assertEqual(real["status"], "success")
+        self.assertEqual(virtual["status"], "success")
+        self.assertEqual(real["data"], 200000001)
+        self.assertEqual(virtual["data"], real["data"])
 
     # --- RTL trace MCP tool tests ---
 

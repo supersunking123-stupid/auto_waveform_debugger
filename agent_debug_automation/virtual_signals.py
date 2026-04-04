@@ -18,49 +18,83 @@ from .models import MAX_VIRTUAL_SIGNAL_DEPTH
 # In-memory transition cache
 # ---------------------------------------------------------------------------
 
-# Key: (waveform_path, session_name, signal_name, expression_hash) -> list of transition dicts
-_virtual_cache: Dict[Tuple[str, str, str, str], List[Dict[str, Any]]] = {}
+# Key: (waveform_path, session_name, signal_name, expression_hash, start_time, end_time)
+_virtual_cache: Dict[Tuple[str, str, str, str, int, int], List[Dict[str, Any]]] = {}
 
 # Maximum cache entries before eviction
 _MAX_CACHE_SIZE = 256
 
 
-def _cache_key(waveform_path: str, session_name: str, signal_name: str, expression: str) -> Tuple[str, str, str, str]:
+def _cache_key(
+    waveform_path: str,
+    session_name: str,
+    signal_name: str,
+    expression: str,
+    start_time: int,
+    end_time: int,
+) -> Tuple[str, str, str, str, int, int]:
     expr_hash = hashlib.sha256(expression.encode("utf-8")).hexdigest()[:16]
-    return (waveform_path, session_name, signal_name, expr_hash)
+    return (waveform_path, session_name, signal_name, expr_hash, start_time, end_time)
 
 
-def _cache_get(waveform_path: str, session_name: str, signal_name: str, expression: str) -> Optional[List[Dict[str, Any]]]:
-    return _virtual_cache.get(_cache_key(waveform_path, session_name, signal_name, expression))
+def _cache_get(
+    waveform_path: str,
+    session_name: str,
+    signal_name: str,
+    expression: str,
+    start_time: int,
+    end_time: int,
+) -> Optional[List[Dict[str, Any]]]:
+    return _virtual_cache.get(_cache_key(waveform_path, session_name, signal_name, expression, start_time, end_time))
 
 
-def _cache_put(waveform_path: str, session_name: str, signal_name: str, expression: str, transitions: List[Dict[str, Any]]) -> None:
+def _cache_put(
+    waveform_path: str,
+    session_name: str,
+    signal_name: str,
+    expression: str,
+    start_time: int,
+    end_time: int,
+    transitions: List[Dict[str, Any]],
+) -> None:
     if len(_virtual_cache) >= _MAX_CACHE_SIZE:
         oldest = next(iter(_virtual_cache))
         del _virtual_cache[oldest]
-    _virtual_cache[_cache_key(waveform_path, session_name, signal_name, expression)] = transitions
+    _virtual_cache[_cache_key(waveform_path, session_name, signal_name, expression, start_time, end_time)] = transitions
 
 
-def _cache_invalidate(waveform_path: str, session_name: str, signal_name: str, expression: str) -> None:
-    key = _cache_key(waveform_path, session_name, signal_name, expression)
-    _virtual_cache.pop(key, None)
+def _cache_invalidate(waveform_path: str, session_name: str, signal_name: str) -> None:
+    keys_to_delete = [
+        key for key in _virtual_cache
+        if key[0] == waveform_path and key[1] == session_name and key[2] == signal_name
+    ]
+    for key in keys_to_delete:
+        _virtual_cache.pop(key, None)
 
 
 def _cache_invalidate_all(signal_name: str, session: Dict[str, Any]) -> None:
-    """Invalidate cache for *signal_name* and all dependents."""
+    """Invalidate cache for *signal_name* and all transitive dependents (BFS)."""
     waveform = session["waveform_path"]
     session_name = session["session_name"]
     created = session.get("created_signals", {})
 
-    # Invalidate the signal itself
-    if signal_name in created:
-        _cache_invalidate(waveform, session_name, signal_name, created[signal_name].get("expression", ""))
+    # BFS: collect the full set of signals to invalidate
+    to_invalidate: set = set()
+    frontier = [signal_name]
+    while frontier:
+        current = frontier.pop()
+        if current in to_invalidate:
+            continue
+        to_invalidate.add(current)
+        # Find all signals that directly depend on 'current'
+        for name, info in created.items():
+            if name not in to_invalidate and current in info.get("dependencies", []):
+                frontier.append(name)
 
-    # Invalidate any signal that depends on this one
-    for name, info in created.items():
-        deps = info.get("dependencies", [])
-        if signal_name in deps:
-            _cache_invalidate(waveform, session_name, name, info.get("expression", ""))
+    # Invalidate cache for every collected signal
+    for name in to_invalidate:
+        if name in created:
+            _cache_invalidate(waveform, session_name, name)
 
 
 def clear_virtual_cache() -> None:
@@ -133,6 +167,20 @@ class VirtualSignalService:
     def is_virtual(self, signal_name: str, session: Dict[str, Any]) -> bool:
         return signal_name in session.get("created_signals", {})
 
+    @staticmethod
+    def _logic_value_for_raw(raw_value: str, width_hint: Optional[int] = None) -> LogicValue:
+        """Parse a raw waveform value while preserving a known signal width."""
+        value = LogicValue.from_string(raw_value)
+        if width_hint is None or value.width == width_hint:
+            return value
+
+        lowered = raw_value.strip().lower()
+        if lowered in ("x", "u", "?"):
+            return LogicValue.x_val(width_hint)
+        if lowered == "z":
+            return LogicValue.z_val(width_hint)
+        return value.with_width(width_hint)
+
     def create(
         self,
         session: Dict[str, Any],
@@ -180,7 +228,7 @@ class VirtualSignalService:
         expression: Optional[str] = None,
         description: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Update an existing virtual signal. Invalidates cache for dependents."""
+        """Update an existing virtual signal. Validates cycles/depth, invalidates cache."""
         from .sessions import _save_session_payload
 
         created = session.get("created_signals", {})
@@ -195,12 +243,22 @@ class VirtualSignalService:
             except ParseError as e:
                 raise ValueError(f"expression parse error: {e}") from e
             deps = collect_signal_refs(ast)
-            old_expression = info["expression"]
+
+            # Validate cycles and depth with the new expression before committing
+            temp_created = dict(created)
+            temp_created[signal_name] = dict(info)
+            temp_created[signal_name]["expression"] = expression
+            temp_created[signal_name]["dependencies"] = deps
+            try:
+                _topological_sort(signal_name, temp_created)
+            except ValueError as e:
+                raise ValueError(str(e)) from e
+
+            # Invalidate cache before committing new deps
+            _cache_invalidate_all(signal_name, session)
             info["expression"] = expression
             info["ast"] = ast
             info["dependencies"] = deps
-            # Invalidate cache for this signal and dependents
-            _cache_invalidate_all(signal_name, session)
 
         if description is not None:
             info["description"] = description
@@ -250,6 +308,27 @@ class VirtualSignalService:
             "description": info.get("description", ""),
         }
 
+    def eval_logic_at_time(
+        self,
+        signal_name: str,
+        session: Dict[str, Any],
+        time: int,
+        wave_cli_bin: Optional[str] = None,
+    ) -> LogicValue:
+        """Evaluate virtual signal at a single time point and return LogicValue."""
+        ast, operand_transitions, signal_widths = self._resolve_deps(
+            signal_name, session, time, time, wave_cli_bin=wave_cli_bin
+        )
+
+        values: Dict[str, LogicValue] = {}
+        for path, trans in operand_transitions.items():
+            width_hint = signal_widths.get(path)
+            if trans:
+                values[path] = self._logic_value_for_raw(trans[-1]["v"], width_hint)
+            else:
+                values[path] = LogicValue.x_val(width_hint or 1)
+        return evaluate_expression(ast, values)
+
     def eval_at_time(
         self,
         signal_name: str,
@@ -258,18 +337,40 @@ class VirtualSignalService:
         wave_cli_bin: Optional[str] = None,
     ) -> str:
         """Evaluate virtual signal at a single time point. Returns value string."""
-        ast, operand_transitions, _ = self._resolve_deps(
-            signal_name, session, time, time + 1, wave_cli_bin=wave_cli_bin
-        )
-        # Get current values
-        values: Dict[str, LogicValue] = {}
-        for path, trans in operand_transitions.items():
-            if trans:
-                values[path] = LogicValue.from_string(trans[-1]["v"])
-            else:
-                values[path] = LogicValue.x_val(1)
-        result = evaluate_expression(ast, values)
-        return result.to_string()
+        return self.eval_logic_at_time(
+            signal_name, session, time, wave_cli_bin=wave_cli_bin
+        ).to_string()
+
+    def max_leaf_transition_time(
+        self,
+        signal_name: str,
+        session: Dict[str, Any],
+        wave_cli_bin: Optional[str] = None,
+    ) -> int:
+        """Return the maximum transition timestamp reachable from any real leaf."""
+        created = session.get("created_signals", {})
+        waveform_path = session["waveform_path"]
+        memo: Dict[str, int] = {}
+
+        def _max_for_ref(ref: str) -> int:
+            if ref in memo:
+                return memo[ref]
+
+            if ref not in created:
+                value = self._fetch_last_transition_time(ref, waveform_path, wave_cli_bin)
+                memo[ref] = value
+                return value
+
+            deps = created[ref].get("dependencies", [])
+            if not deps:
+                memo[ref] = -1
+                return -1
+
+            value = max((_max_for_ref(dep) for dep in deps), default=-1)
+            memo[ref] = value
+            return value
+
+        return _max_for_ref(signal_name)
 
     def iter_transitions(
         self,
@@ -289,7 +390,14 @@ class VirtualSignalService:
         expression = info.get("expression", "")
         waveform = session["waveform_path"]
         session_name_val = session.get("session_name", "")
-        cached = _cache_get(waveform, session_name_val, signal_name, expression)
+        cached = _cache_get(
+            waveform,
+            session_name_val,
+            signal_name,
+            expression,
+            start_time,
+            end_time,
+        )
         if cached is not None:
             # Slice from cache
             for tr in cached:
@@ -307,7 +415,15 @@ class VirtualSignalService:
         ))
 
         # Cache the result
-        _cache_put(waveform, session_name_val, signal_name, expression, transitions)
+        _cache_put(
+            waveform,
+            session_name_val,
+            signal_name,
+            expression,
+            start_time,
+            end_time,
+            transitions,
+        )
 
         for tr in transitions:
             yield tr
@@ -366,9 +482,31 @@ class VirtualSignalService:
         end_time: int,
         wave_cli_bin: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Fetch transitions for a real signal from the C++ backend."""
+        """Fetch transitions for a real signal from the C++ backend.
+
+        To guarantee that the evaluator's `bisect_right` has a proper seed value for
+        signals that are stable across the window start time, we explicitly fetch
+        the raw value exactly at `start_time - 1` and inject it as a pseudo-event at
+        the start of the list.
+
+        Raises ValueError if the backend truncates the result.
+        """
         from .clients import _wave_query
 
+        # 1. Fetch exactly the state immediately before the window
+        seed_time = max(0, int(start_time) - 1)
+        seed_res = _wave_query(
+            waveform_path,
+            "get_raw_value_at_time",
+            {"path": signal_path, "time": seed_time},
+            wave_cli_bin=wave_cli_bin,
+        )
+        history = []
+        if seed_res.get("status") == "success":
+            val = seed_res.get("data", "x")
+            history.append({"t": seed_time, "v": val, "glitch": False})
+
+        # 2. Fetch all transitions in the window [start_time, end_time]
         result = _wave_query(
             waveform_path,
             "get_transitions",
@@ -381,8 +519,39 @@ class VirtualSignalService:
             wave_cli_bin=wave_cli_bin,
         )
         if result.get("status") != "success":
-            return []
-        return result.get("data", [])
+            return history
+
+        if result.get("truncated", False):
+            raise ValueError(
+                f"virtual signal operand '{signal_path}' has more than 10,000 transitions "
+                f"in the requested window [{start_time}, {end_time}]; "
+                "narrow the query window or simplify the expression to avoid silent data loss."
+            )
+
+        history.extend(result.get("data", []))
+        return history
+
+    def _fetch_last_transition_time(
+        self,
+        signal_path: str,
+        waveform_path: str,
+        wave_cli_bin: Optional[str] = None,
+    ) -> int:
+        """Fetch the last transition timestamp for a real signal."""
+        from .clients import _wave_query
+
+        result = _wave_query(
+            waveform_path,
+            "get_last_transition_time",
+            {"path": signal_path},
+            wave_cli_bin=wave_cli_bin,
+        )
+        if result.get("status") != "success":
+            return -1
+        try:
+            return int(result.get("data", -1))
+        except (TypeError, ValueError):
+            return -1
 
     def _fetch_signal_width(
         self,
