@@ -135,6 +135,7 @@ The first session the Debugger creates should capture the complete error scenari
 ```python
 # 1. Create the anchor session
 create_session(waveform_path="wave.fsdb", session_name="error_scenario")
+switch_session(session_name="error_scenario", waveform_path="wave.fsdb")
 
 # 2. Bookmark the failure time
 set_cursor(time=T_fail)

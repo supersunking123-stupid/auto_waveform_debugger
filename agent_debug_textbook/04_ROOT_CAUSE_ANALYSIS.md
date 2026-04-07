@@ -44,6 +44,7 @@ This playbook draws from all other playbooks. The tools are organized by the pha
      entire debug. Every investigation branch starts here and must ultimately
      explain the signals captured in this snapshot.
      → create_session(waveform_path=<path>, session_name="error_scenario")
+     → switch_session(session_name="error_scenario", waveform_path=<path>)
      → set_cursor(time=T_fail)
      → create_bookmark(bookmark_name="error_point", time=T_fail,
                         description="<failure desc + time precision note>")
@@ -80,7 +81,7 @@ This playbook draws from all other playbooks. The tools are organized by the pha
      → rank_cone_by_time(
            db_path="rtl_trace.db",
            signal=failing_signal,
-           time="BM_failure",
+           time="BM_error_point",
            mode="drivers",
            window_start=T_fail - search_window,
            window_end=T_fail
@@ -96,7 +97,7 @@ This playbook draws from all other playbooks. The tools are organized by the pha
      → trace_with_snapshot(
            db_path="rtl_trace.db",
            signal=failing_signal,
-           time="BM_failure",
+           time="BM_error_point",
            mode="drivers",
            clock_path="top.clk",
            cycle_offsets=[-3, -2, -1, 0]
@@ -116,7 +117,7 @@ This playbook draws from all other playbooks. The tools are organized by the pha
      → explain_edge_cause(
            db_path="rtl_trace.db",
            signal=failing_signal,
-           time="BM_failure",
+           time="BM_error_point",
            edge_type=<the edge type that represents the failure>,
            direction="backward"
        )
@@ -237,7 +238,7 @@ Phase 4:
 ## Tips
 
 - **Always start with Phase 1.** Skipping observation leads to chasing the wrong signal.
-- **Use bookmarks aggressively.** They let you reference times symbolically (`"BM_failure"`, `"BM_root_cause"`) instead of memorizing numbers.
+- **Use bookmarks aggressively.** They let you reference times symbolically (`"BM_error_point"`, `"BM_root_cause"`) instead of memorizing numbers.
 - **Use signal groups** to keep track of suspects and related signals across phases.
 - **The debug loop is iterative.** Phase 3 often reveals a deeper cause that sends you back to Phase 2 with a new target signal. This is normal.
 - **Stop when you reach a primary input or testbench stimulus.** That is the boundary of RTL responsibility.

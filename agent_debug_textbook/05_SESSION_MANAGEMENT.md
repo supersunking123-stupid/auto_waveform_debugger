@@ -47,7 +47,7 @@
 
 ## Key concepts
 
-**Session:** A saved workspace bound to one waveform file. Contains a cursor, bookmarks, and signal groups. Each waveform can have multiple sessions.
+**Session:** A saved workspace bound to one waveform file. Contains a cursor, bookmarks, signal groups, and created signals (virtual signals). Each waveform can have multiple sessions.
 
 **Default_Session:** Created automatically on the first session-aware tool call for a waveform if no session is specified. You don't need to explicitly create it.
 
@@ -66,6 +66,10 @@ create_session(
     session_name="bug_123_investigation",
     description="Investigating FIFO overflow in test_fail"
 )
+
+# 1b. Activate it. create_session() does not switch the active session.
+switch_session(session_name="bug_123_investigation",
+               waveform_path="sim_results/test_fail.fsdb")
 
 # 2. Set the cursor to the region of interest
 set_cursor(time=320000)
@@ -153,7 +157,9 @@ delete_signal_group(group_name="suspects")
 ## Tips
 
 - **Name sessions after bug IDs or investigation goals**, not waveform filenames. Example: `"bug_123_overflow"` not `"test_fail_session"`.
+- **`create_session` does not activate the session.** Call `switch_session(...)` after creation if the following tool calls should use that named session.
 - **Bookmark liberally.** Bookmarks are cheap, and `"BM_<name>"` references are more readable than raw time values in subsequent tool calls.
 - **Signal groups integrate with `get_snapshot`.** Use `signals_are_groups=True` to expand a group name into its full signal list automatically.
 - **Cursor is global.** `set_cursor` changes the cursor for the active session. If you are switching between sessions, the cursor context switches with you.
 - **Sessions are waveform-bound.** You cannot use a session created for `wave_a.fsdb` to query `wave_b.fsdb`. Create a separate session for each waveform file.
+- **Created signals (virtual signals) also live in the session.** When you create a handshake signal or a bus slice with the virtual signal tools, it persists in the active session alongside bookmarks and signal groups. Switching sessions switches the virtual signal context too. See `07_VIRTUAL_SIGNALS.md`.

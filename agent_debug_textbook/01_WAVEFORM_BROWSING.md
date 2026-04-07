@@ -18,6 +18,8 @@
 | `find_value_intervals` | Find all time intervals where a signal holds a specific value |
 | `find_condition` | Find the next/previous time a Boolean expression is true |
 | `get_transitions` | List all value changes on a signal in a time range |
+| `count_transitions` | Count edges or toggles on a signal in a time range |
+| `dump_waveform_data` | Export large transition streams or sampled waveform data to JSONL for offline analysis |
 | `get_signal_overview` | Get a downsampled summary of a signal across a time range |
 | `analyze_pattern` | Detect repeating patterns (e.g., clock periods, duty cycles) |
 
@@ -50,6 +52,9 @@ What do you need to know?
 │   ├─ Next/previous edge → find_edge(path="top.x", edge_type=..., start_time=T, direction=...)
 │   └─ All changes in range → get_transitions(path="top.x", start_time=T1, end_time=T2)
 │
+├─ "How many times did signal X toggle / assert in this window?"
+│   └─ count_transitions(path="top.x", start_time=T1, end_time=T2, edge_type=...)
+│
 ├─ "When does signal X equal value V?"
 │   └─ find_value_intervals(path="top.x", value="V", start_time=T1, end_time=T2)
 │
@@ -58,6 +63,9 @@ What do you need to know?
 │
 ├─ "Give me a high-level view of signal X over a range"
 │   └─ get_signal_overview(path="top.x", start_time=T1, end_time=T2, resolution="auto")
+│
+├─ "I need the raw data outside MCP because the range is too large"
+│   └─ dump_waveform_data(signals=["top.x"], start_time=T1, end_time=T2, output_path="wave.jsonl")
 │
 └─ "Is signal X periodic? What is its frequency?"
     └─ analyze_pattern(path="top.x", start_time=T1, end_time=T2)
@@ -96,6 +104,11 @@ What do you need to know?
 1. `analyze_pattern(path="top.clk", start_time=0, end_time=100000)` — detect period, duty cycle.
 2. If you need exact edges: `get_transitions(path="top.clk", start_time=T1, end_time=T2, max_limit=50)`.
 
+### Sequence E — Count and export activity in a large window
+
+1. `count_transitions(path="top.awvalid", start_time=0, end_time=1000000, edge_type="posedge")` — count assertions without pulling every transition into context.
+2. If you need the full dataset, `dump_waveform_data(signals=["top.awvalid"], start_time=0, end_time=1000000, output_path="awvalid_transitions.jsonl")`.
+
 ---
 
 ## Tips
@@ -105,7 +118,14 @@ What do you need to know?
 - `get_snapshot` with a signal group is efficient: create a group via Session Management, then call `get_snapshot(signals=["MyGroup"], signals_are_groups=True)`.
 - `find_condition` accepts compound Boolean expressions — use it instead of chaining multiple `find_edge` calls.
 - `max_limit` in `get_transitions` defaults to 50. Increase it only if you truly need more; large results are harder to reason about.
+- Prefer `count_transitions` when you need a count, not the full transition list.
+  - For **single-bit** signals, `edge_type` accepts `"posedge"`, `"negedge"`, or `"anyedge"`.
+  - For **multi-bit** signals (buses), `edge_type` must be `"anyedge"` — it counts value toggles rather than directional edges.
+  - Use `boundary_policy="exclusive"` to exclude transitions exactly at `start_time`/`end_time` (default is `"inclusive"`).
+- Prefer `dump_waveform_data` when the time window is too large to inspect comfortably through MCP response text.
+  - The `mode` parameter selects the output format: `"transitions"` (default) exports every value change; `"sampled"` exports values at regular intervals defined by `sample_period` (in waveform time units). Use `"sampled"` when you need uniform time resolution rather than event-driven data.
 - Prefer `get_signal_overview` over `get_transitions` when you need a big-picture view of a long time range.
+- **For a compound condition you will query more than once** — handshake, error flag, protocol event — create a virtual signal with `create_signal_expression` instead of repeating the same expression in every `find_condition` call. All browsing tools accept virtual signal names transparently. See `07_VIRTUAL_SIGNALS.md`.
 
 ### `list_signals` — avoiding context explosion
 

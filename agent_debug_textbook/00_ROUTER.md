@@ -4,7 +4,7 @@
 
 This is not background reading. Work through this checklist first.
 
-- [ ] **1. Confirm the `EDA_for_agent` MCP server is available.** If it is not in your tool list, report this and stop — do not attempt RTL debugging without it.
+- [ ] **1. Confirm the RTL debug MCP tool surface is available.** The server may be exposed as `EDA_for_agent`, `agent_debug_automation`, or another equivalent name, but the required tools must be present. At minimum, verify that you can see `get_signal_info`, `rtl_trace`, and `explain_signal_at_time`. If this tool surface is not available, report this and stop — do not attempt RTL debugging without it.
 - [ ] **2. Check the waveform time precision.** Call `get_signal_info` on any signal in the waveform and record the time unit. All time arguments must be converted to that unit before use (Rule 12).
 - [ ] **3. Identify your task type** using the table below and open the matching playbook.
 - [ ] **4. Follow that playbook as a step-by-step procedure.** Do not skip steps. Do not substitute source-code reading for a tool call.
@@ -23,6 +23,7 @@ If at any point two consecutive tool results are empty or nonsensical, stop and 
 | **Root-Cause Analysis** | Find the source of a bug by combining structural and waveform analysis | `04_ROOT_CAUSE_ANALYSIS.md` |
 | **Session Management** | Set up, organize, or switch debugging workspaces (cursors, bookmarks, signal groups) | `05_SESSION_MANAGEMENT.md` |
 | **Supervised Debug** | Debug with a two-agent setup (Debugger + Supervisor) when single-agent attempts have failed or the model is prone to carelessness/hallucination | `06_SUPERVISED_DEBUG.md` |
+| **Virtual Signals** | Create derived signals (compound conditions, bus slices/concatenations) so that browsing and search tools can operate on them directly | `07_VIRTUAL_SIGNALS.md` |
 
 ## Step 2 — Routing rules
 
@@ -37,6 +38,7 @@ Follow these rules to pick the right playbook:
 7. **"What caused this bug / failure / assertion?"** → Root-Cause Analysis
 8. **"Set a bookmark / create a signal group / switch session"** → Session Management
 9. **"Debug failed with single agent" / "Agent keeps making mistakes" / "Use supervised mode"** → Supervised Debug
+10. **"Create a handshake / condition / error-flag signal" / "Slice or reassemble a bus" / "Define a derived observable"** → Virtual Signals
 
 ## Step 3 — Chaining playbooks
 
@@ -46,6 +48,7 @@ Some tasks require chaining. Common chains:
 - **Full root-cause debug** → Session Management → Root-Cause Analysis (which internally chains Structural Exploration + Waveform Browsing)
 - **Supervised root-cause debug** → Supervised Debug (wraps Root-Cause Analysis with a Supervisor agent reviewing each phase)
 - **Design review / connectivity audit** → Structural Exploration → Waveform Browsing (verify structural understanding against simulation)
+- **Protocol or condition search** → Virtual Signals (define the handshake or condition as a named signal) → Waveform Browsing (search and count occurrences) → Signal Investigation (trace the real drivers of an anomalous event)
 
 ## Step 4 — Tool inventory by playbook
 
@@ -53,11 +56,12 @@ Quick reference of which tools belong to which playbook. **Only use the tools li
 
 | Playbook | Primary tools |
 |---|---|
-| Waveform Browsing | `get_snapshot`, `get_value_at_time`, `find_edge`, `find_value_intervals`, `find_condition`, `get_transitions`, `get_signal_overview`, `analyze_pattern`, `list_signals`, `get_signal_info` |
-| Structural Exploration | `rtl_trace` (`compile`, `trace`, `find`, `hier`), `rtl_trace_serve_start/query/stop` |
+| Waveform Browsing | `get_snapshot`, `get_value_at_time`, `find_edge`, `find_value_intervals`, `find_condition`, `get_transitions`, `count_transitions`, `dump_waveform_data`, `get_signal_overview`, `analyze_pattern`, `list_signals`, `get_signal_info` |
+| Structural Exploration | `rtl_trace` (`compile`, `trace`, `find`, `hier`, `whereis-instance`), `rtl_trace_serve_start/query/stop` |
 | Signal Investigation | `explain_signal_at_time`, `explain_edge_cause`, `trace_with_snapshot`, `rank_cone_by_time` |
 | Root-Cause Analysis | All Signal Investigation tools + Waveform Browsing tools + Structural Exploration tools (used in a prescribed sequence) |
 | Session Management | `create_session`, `list_sessions`, `get_session`, `switch_session`, `delete_session`, `set_cursor`, `move_cursor`, `get_cursor`, `create_bookmark`, `delete_bookmark`, `list_bookmarks`, `create_signal_group`, `update_signal_group`, `delete_signal_group`, `list_signal_groups` |
+| Virtual Signals | `create_signal_expression`, `update_signal_expression`, `delete_signal_expression`, `list_signal_expressions`, `create_bus_concat`, `create_bus_slice`, `create_bus_slices`, `create_reversed_bus` — plus all Waveform Browsing tools (they accept virtual signal names transparently) |
 | Supervised Debug | All tools from Root-Cause Analysis, used by the Debugger agent; Supervisor uses no MCP tools (review only) |
 
 ---
@@ -66,7 +70,7 @@ Quick reference of which tools belong to which playbook. **Only use the tools li
 
 - **`TimeReference`** accepts an integer, `"Cursor"`, or `"BM_<bookmark_name>"`.
 - **`radix`** accepts `"hex"`, `"bin"`, or `"dec"`.
-- **`EdgeType`** accepts `"rise"`, `"rising"`, `"fall"`, `"falling"`, `"edge"`, `"any"`, or `"anyedge"`.
+- **`EdgeType`** accepts `"posedge"` / `"rising"` / `"rise"` (rising edge), `"negedge"` / `"falling"` / `"fall"` (falling edge), `"edge"` / `"any"` / `"anyedge"` (any change). The `posedge`/`negedge` forms and `rising`/`falling` forms are interchangeable aliases.
 - **`Direction`** is `"forward"` or `"backward"`.
 - **`TraceMode`** is `"drivers"` or `"loads"`.
 - If `vcd_path` is omitted in a session-aware tool, the active Session's waveform is used.
