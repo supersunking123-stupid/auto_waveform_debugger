@@ -32,6 +32,7 @@ agent_debug_automation/.session_store/
 
 # AI tool artifacts
 .qwen/
+node_modules/
 
 # Lab / course materials
 UVM_knowledge/
