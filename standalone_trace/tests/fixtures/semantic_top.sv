@@ -21,6 +21,18 @@ module consumer (
   assign hi_nibble = in_bus[7:4];
 endmodule
 
+module param_leaf #(
+    parameter int WIDTH = 4,
+    parameter type T = logic [WIDTH-1:0]
+) (
+    input  T     in_bus,
+    output logic match
+);
+  localparam int DOUBLE_WIDTH = WIDTH * 2;
+
+  assign match = (DOUBLE_WIDTH > WIDTH) ? in_bus[0] : 1'b0;
+endmodule
+
 module semantic_top (
     input  logic       clk,
     input  logic       rst_n,
@@ -29,6 +41,10 @@ module semantic_top (
     output logic       flag
 );
   logic [7:0] data;
+  logic [5:0] param_bus;
+  logic       param_hit;
+
+  assign param_bus = 6'h15;
 
   producer u_prod (
       .clk (clk),
@@ -40,6 +56,14 @@ module semantic_top (
       .in_bus   (data),
       .hit      (hit),
       .hi_nibble(hi_nibble)
+  );
+
+  param_leaf #(
+      .WIDTH(6),
+      .T(logic [5:0])
+  ) u_param (
+      .in_bus(param_bus),
+      .match (param_hit)
   );
 
   always_ff @(posedge clk or negedge rst_n) begin

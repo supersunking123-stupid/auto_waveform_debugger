@@ -22,6 +22,7 @@
 #include "slang/ast/statements/MiscStatements.h"
 #include "slang/ast/symbols/BlockSymbols.h"
 #include "slang/ast/symbols/InstanceSymbols.h"
+#include "slang/ast/symbols/ParameterSymbols.h"
 #include "slang/ast/symbols/PortSymbols.h"
 #include "slang/driver/Driver.h"
 #include "slang/text/SourceManager.h"
@@ -1158,6 +1159,7 @@ void CollectInstanceHierarchy(const slang::ast::RootSymbol &root, const slang::S
     std::string module;
     std::string source_file;
     uint32_t source_line = 0;
+    std::vector<InstanceParameterRecord> parameters;
   };
 
   slang::flat_hash_map<std::string, HierInstanceInfo> modules;
@@ -1169,6 +1171,28 @@ void CollectInstanceHierarchy(const slang::ast::RootSymbol &root, const slang::S
     if (loc.valid()) {
       info.source_file = std::string(sm.getFileName(loc));
       info.source_line = sm.getLineNumber(loc);
+    }
+    const auto params = inst.body.getParameters();
+    info.parameters.reserve(params.size());
+    for (const slang::ast::ParameterSymbolBase *param_base : params) {
+      InstanceParameterRecord param;
+      param.name = std::string(param_base->symbol.name);
+      param.is_local = param_base->isLocalParam();
+      param.is_port = param_base->isPortParam();
+      if (param_base->symbol.kind == slang::ast::SymbolKind::Parameter) {
+        const auto &value_param = param_base->symbol.as<slang::ast::ParameterSymbol>();
+        param.kind = InstanceParameterKind::kValue;
+        param.value = value_param.getValue().toString();
+        param.is_overridden = value_param.isOverridden();
+      } else if (param_base->symbol.kind == slang::ast::SymbolKind::TypeParameter) {
+        const auto &type_param = param_base->symbol.as<slang::ast::TypeParameterSymbol>();
+        param.kind = InstanceParameterKind::kType;
+        param.value = type_param.targetType.getType().toString();
+        param.is_overridden = type_param.isOverridden();
+      } else {
+        continue;
+      }
+      info.parameters.push_back(std::move(param));
     }
     modules.try_emplace(std::string(inst.getHierarchicalPath()), std::move(info));
   };
@@ -1207,6 +1231,7 @@ void CollectInstanceHierarchy(const slang::ast::RootSymbol &root, const slang::S
     node.module = info.module;
     node.source_file = info.source_file;
     node.source_line = info.source_line;
+    node.parameters = info.parameters;
   }
   for (const auto &[path, _] : db.hierarchy) {
     std::string_view parent = ParentPath(path);
@@ -1541,6 +1566,24 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &key
     for (const std::string &child : it->second.children)
       graph.hierarchy_children.push_back(intern(child));
     graph.hierarchy.push_back(gh);
+
+    if (!it->second.parameters.empty()) {
+      GraphPathRefRange range;
+      range.path_str_id = gh.path_str_id;
+      range.begin = static_cast<uint32_t>(graph.hierarchy_params.size());
+      range.count = static_cast<uint32_t>(it->second.parameters.size());
+      graph.hierarchy_param_ranges.push_back(range);
+      for (const InstanceParameterRecord &param : it->second.parameters) {
+        GraphInstanceParamRecord gp;
+        gp.name_str_id = intern(param.name);
+        gp.value_str_id = intern(param.value);
+        gp.kind = param.kind == InstanceParameterKind::kValue ? 0 : 1;
+        gp.is_local = param.is_local ? 1 : 0;
+        gp.is_port = param.is_port ? 1 : 0;
+        gp.is_overridden = param.is_overridden ? 1 : 0;
+        graph.hierarchy_params.push_back(gp);
+      }
+    }
   }
 
   std::vector<std::string> global_sources;
@@ -1611,6 +1654,14 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &key
       !WriteBinaryVector(out, graph.global_nets) || !WriteBinaryVector(out, graph.global_sinks)) {
     return false;
   }
+  const uint64_t hierarchy_param_range_count = graph.hierarchy_param_ranges.size();
+  const uint64_t hierarchy_param_count = graph.hierarchy_params.size();
+  if (!WriteBinaryValue(out, hierarchy_param_range_count) ||
+      !WriteBinaryVector(out, graph.hierarchy_param_ranges) ||
+      !WriteBinaryValue(out, hierarchy_param_count) ||
+      !WriteBinaryVector(out, graph.hierarchy_params)) {
+    return false;
+  }
   const auto t_write_end = Clock::now();
   if (logger != nullptr) {
     logger->Log("save_graph_db: write_file done elapsed_s=" +
@@ -1656,6 +1707,10 @@ bool ValidateGraphDb(const GraphDb &graph) {
     if (!ValidateGraphRange(gh.child_begin, gh.child_count, graph.hierarchy_children.size())) return false;
   }
 
+  for (const GraphPathRefRange &range : graph.hierarchy_param_ranges) {
+    if (!ValidateGraphRange(range.begin, range.count, graph.hierarchy_params.size())) return false;
+  }
+
   for (const GraphGlobalNetRecord &gg : graph.global_nets) {
     if (!ValidateGraphRange(gg.sink_begin, gg.sink_count, graph.global_sinks.size())) return false;
   }
@@ -1670,7 +1725,7 @@ bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db)
   GraphDbFileHeader header;
   if (!ReadBinaryValue(in, header)) return false;
   if (std::memcmp(header.magic, kGraphDbMagic, sizeof(header.magic)) != 0) return false;
-  if (header.version != 1 && header.version != 2 && header.version != 3) return false;
+  if (header.version != 1 && header.version != 2 && header.version != 3 && header.version != 4) return false;
 
   std::vector<uint32_t> string_offsets;
   if (!ReadBinaryVector(in, string_offsets, static_cast<size_t>(header.string_count + 1))) return false;
@@ -1728,9 +1783,22 @@ bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db)
       !ReadBinaryVector(in, graph.global_sinks, static_cast<size_t>(header.global_sink_count))) {
     return false;
   }
+  if (header.version >= 4) {
+    uint64_t hierarchy_param_range_count = 0;
+    uint64_t hierarchy_param_count = 0;
+    if (!ReadBinaryValue(in, hierarchy_param_range_count) ||
+        !ReadBinaryVector(in, graph.hierarchy_param_ranges,
+                          static_cast<size_t>(hierarchy_param_range_count)) ||
+        !ReadBinaryValue(in, hierarchy_param_count) ||
+        !ReadBinaryVector(in, graph.hierarchy_params,
+                          static_cast<size_t>(hierarchy_param_count))) {
+      return false;
+    }
+  }
   if (!ValidateGraphDb(graph)) return false;
 
   compat_db.db_dir = std::filesystem::path(db_path).parent_path().string();
+  compat_db.format_version = header.version;
   compat_db.signals.clear();
   compat_db.hierarchy.clear();
   compat_db.global_nets.clear();
@@ -1746,6 +1814,11 @@ bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db)
   for (size_t i = 0; i < graph.assignment_lhs_ref_ranges.size(); ++i)
     graph.assignment_lhs_ref_index.emplace(graph.assignment_lhs_ref_ranges[i].path_str_id, i);
 
+  slang::flat_hash_map<uint32_t, size_t> hierarchy_param_index;
+  hierarchy_param_index.reserve(graph.hierarchy_param_ranges.size());
+  for (size_t i = 0; i < graph.hierarchy_param_ranges.size(); ++i)
+    hierarchy_param_index.emplace(graph.hierarchy_param_ranges[i].path_str_id, i);
+
   for (const GraphHierarchyRecord &gh : graph.hierarchy) {
     const std::string &path = GraphString(graph, gh.path_str_id);
     auto &node = compat_db.hierarchy[path];
@@ -1753,6 +1826,22 @@ bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db)
     if (header.version >= 3 && gh.file_str_id != std::numeric_limits<uint32_t>::max()) {
       node.source_file = GraphString(graph, gh.file_str_id);
       node.source_line = gh.line;
+    }
+    auto param_it = hierarchy_param_index.find(gh.path_str_id);
+    if (param_it != hierarchy_param_index.end()) {
+      const GraphPathRefRange &range = graph.hierarchy_param_ranges[param_it->second];
+      node.parameters.reserve(range.count);
+      for (uint32_t i = 0; i < range.count; ++i) {
+        const GraphInstanceParamRecord &gp = graph.hierarchy_params[range.begin + i];
+        InstanceParameterRecord param;
+        param.name = GraphString(graph, gp.name_str_id);
+        param.value = GraphString(graph, gp.value_str_id);
+        param.kind = gp.kind == 0 ? InstanceParameterKind::kValue : InstanceParameterKind::kType;
+        param.is_local = gp.is_local != 0;
+        param.is_port = gp.is_port != 0;
+        param.is_overridden = gp.is_overridden != 0;
+        node.parameters.push_back(std::move(param));
+      }
     }
     node.children.reserve(gh.child_count);
     for (uint32_t i = 0; i < gh.child_count; ++i)
@@ -2224,7 +2313,7 @@ void PrintGeneralHelp() {
   std::cout << "  rtl_trace hier --db <file> [--root <hier.path>] [--depth <N>] "
                "[--max-nodes <N>] [--format <text|json>] [--show-source]\n";
   std::cout << "  rtl_trace whereis-instance --db <file> --instance <hier.path> "
-               "[--format <text|json>]\n";
+               "[--format <text|json>] [--show-params]\n";
   std::cout << "  rtl_trace find --db <file> --query <text|regex> [--regex] [--limit <N>] "
                "[--format <text|json>]\n";
   std::cout << "  rtl_trace serve [--db <file>]\n";
@@ -2245,7 +2334,7 @@ void PrintHierHelp() {
 
 void PrintWhereInstanceHelp() {
   std::cout << "Usage: rtl_trace whereis-instance --db <file> --instance <hier.path> "
-               "[--format <text|json>]\n";
+               "[--format <text|json>] [--show-params]\n";
 }
 
 void PrintFindHelp() {
@@ -2263,7 +2352,7 @@ void PrintServeHelp() {
   std::cout << "  find --query <text> [--regex] [--limit <N>] [--format <text|json>]\n";
   std::cout << "  trace --mode <drivers|loads> --signal <hier.path> [trace options]\n";
   std::cout << "  hier [--root <hier.path>] [--depth <N>] [--max-nodes <N>] [--format <text|json>] [--show-source]\n";
-  std::cout << "  whereis-instance --instance <hier.path> [--format <text|json>]\n";
+  std::cout << "  whereis-instance --instance <hier.path> [--format <text|json>] [--show-params]\n";
   std::cout << "  quit\n";
   std::cout << "\nEach response is followed by a line containing <<END>>.\n";
 }

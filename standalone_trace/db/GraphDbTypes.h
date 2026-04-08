@@ -49,10 +49,22 @@ struct SignalRecord {
   std::vector<EndpointRecord> loads;
 };
 
+enum class InstanceParameterKind : uint8_t { kValue = 0, kType = 1 };
+
+struct InstanceParameterRecord {
+  std::string name;
+  std::string value;
+  InstanceParameterKind kind = InstanceParameterKind::kValue;
+  bool is_local = false;
+  bool is_port = false;
+  bool is_overridden = false;
+};
+
 struct HierNodeRecord {
   std::string module;
   std::string source_file;
   uint32_t source_line = 0;
+  std::vector<InstanceParameterRecord> parameters;
   std::vector<std::string> children;
 };
 
@@ -69,6 +81,7 @@ struct TraceDb {
   std::vector<std::string> path_pool;
   std::vector<std::string> file_pool;
   std::string db_dir;
+  uint32_t format_version = 0;
 };
 
 // --- Graph DB binary format types ---
@@ -128,6 +141,15 @@ struct GraphGlobalNetRecord {
   uint32_t sink_count = 0;
 };
 
+struct GraphInstanceParamRecord {
+  uint32_t name_str_id = std::numeric_limits<uint32_t>::max();
+  uint32_t value_str_id = std::numeric_limits<uint32_t>::max();
+  uint8_t kind = 0;
+  uint8_t is_local = 0;
+  uint8_t is_port = 0;
+  uint8_t is_overridden = 0;
+};
+
 struct GraphDb {
   std::vector<std::string> strings;
   std::vector<GraphSignalRecord> signals;
@@ -141,6 +163,8 @@ struct GraphDb {
   std::vector<uint32_t> assignment_lhs_ref_signal_ids;
   std::vector<GraphHierarchyRecord> hierarchy;
   std::vector<uint32_t> hierarchy_children;
+  std::vector<GraphPathRefRange> hierarchy_param_ranges;
+  std::vector<GraphInstanceParamRecord> hierarchy_params;
   std::vector<GraphGlobalNetRecord> global_nets;
   std::vector<uint32_t> global_sinks;
   slang::flat_hash_map<uint32_t, size_t> load_ref_index;
@@ -219,6 +243,7 @@ struct HierOptions {
 struct WhereInstanceOptions {
   std::string instance;
   OutputFormat format = OutputFormat::kText;
+  bool show_params = false;
 };
 
 struct FindOptions {
@@ -250,6 +275,7 @@ struct WhereInstanceResult {
   std::string module;
   std::string source_file;
   uint32_t source_line = 0;
+  std::vector<InstanceParameterRecord> parameters;
 };
 
 enum class ParseStatus { kOk, kExitSuccess, kError };
@@ -262,7 +288,7 @@ constexpr char kGraphDbMagic[kGraphDbMagicSize] = {
 
 struct GraphDbFileHeader {
   char magic[kGraphDbMagicSize];
-  uint32_t version = 3;
+  uint32_t version = 4;
   uint32_t reserved = 0;
   uint64_t string_count = 0;
   uint64_t string_blob_size = 0;

@@ -11,7 +11,7 @@ static void PrintGeneralHelp() {
   std::cout << "  trace             Trace signal drivers/loads\n";
   std::cout << "  hier              Show design hierarchy\n";
   std::cout << "  find              Search for signals\n";
-  std::cout << "  whereis-instance  Locate instance source\n";
+  std::cout << "  whereis-instance  Locate instance source and parameters\n";
   std::cout << "  serve             Interactive serve mode\n";
   std::cout << "\nRun 'rtl_trace <subcommand> --help' for details.\n";
 }

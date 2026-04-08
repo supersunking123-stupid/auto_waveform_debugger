@@ -304,6 +304,54 @@ def main():
         ):
             raise AssertionError(f"unexpected whereis source info: {whereis}")
 
+        whereis_params = run_json_cmd(
+            [
+                str(rtl_trace),
+                "whereis-instance",
+                "--db",
+                str(db),
+                "--instance",
+                "semantic_top.u_param",
+                "--format",
+                "json",
+                "--show-params",
+            ]
+        )
+        if whereis_params.get("module") != "param_leaf":
+            raise AssertionError(f"unexpected parameterized instance module info: {whereis_params}")
+        params = {p["name"]: p for p in whereis_params.get("parameters", [])}
+        for required in ("WIDTH", "T", "DOUBLE_WIDTH"):
+            if required not in params:
+                raise AssertionError(f"missing expected instance parameter {required}: {whereis_params}")
+        width = params["WIDTH"]
+        if (
+            width.get("kind") != "value"
+            or width.get("is_local")
+            or not width.get("is_port")
+            or not width.get("is_overridden")
+            or "6" not in width.get("value", "")
+        ):
+            raise AssertionError(f"unexpected WIDTH parameter payload: {width}")
+        type_param = params["T"]
+        if (
+            type_param.get("kind") != "type"
+            or type_param.get("is_local")
+            or not type_param.get("is_port")
+            or not type_param.get("is_overridden")
+            or "logic" not in type_param.get("value", "")
+            or "5:0" not in type_param.get("value", "")
+        ):
+            raise AssertionError(f"unexpected T parameter payload: {type_param}")
+        double_width = params["DOUBLE_WIDTH"]
+        if (
+            double_width.get("kind") != "value"
+            or not double_width.get("is_local")
+            or double_width.get("is_port")
+            or double_width.get("is_overridden")
+            or "12" not in double_width.get("value", "")
+        ):
+            raise AssertionError(f"unexpected DOUBLE_WIDTH parameter payload: {double_width}")
+
         # ---- Tests 9-20 (new test additions) ----
 
         # 11) Test 9 — Trace with --cone-level 2

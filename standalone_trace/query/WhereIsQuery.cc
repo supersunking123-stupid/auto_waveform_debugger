@@ -11,6 +11,28 @@
 
 namespace rtl_trace {
 
+std::string InstanceParameterKindName(InstanceParameterKind kind) {
+  return kind == InstanceParameterKind::kType ? "type" : "value";
+}
+
+std::optional<std::string> SourceUnavailableReason(const TraceDb &db,
+                                                   const WhereInstanceResult &result) {
+  if (!result.source_file.empty()) return std::nullopt;
+  if (db.format_version != 0 && db.format_version < 3) {
+    return "db version " + std::to_string(db.format_version) +
+           " does not store hierarchy source metadata; rebuild with current rtl_trace compile";
+  }
+  return "no source metadata recorded for this instance definition";
+}
+
+std::optional<std::string> ParamsUnavailableReason(const TraceDb &db) {
+  if (db.format_version != 0 && db.format_version < 4) {
+    return "db version " + std::to_string(db.format_version) +
+           " does not store instance parameter metadata; rebuild with current rtl_trace compile";
+  }
+  return std::nullopt;
+}
+
 std::optional<WhereInstanceResult> LookupWhereInstance(const TraceDb &db, const std::string &instance) {
   const auto it = db.hierarchy.find(instance);
   if (it == db.hierarchy.end()) return std::nullopt;
@@ -19,20 +41,48 @@ std::optional<WhereInstanceResult> LookupWhereInstance(const TraceDb &db, const 
   result.module = it->second.module;
   result.source_file = it->second.source_file;
   result.source_line = it->second.source_line;
+  result.parameters = it->second.parameters;
   return result;
 }
 
-void PrintWhereInstanceText(const TraceDb &db, const WhereInstanceResult &result) {
+void PrintWhereInstanceText(const TraceDb &db, const WhereInstanceResult &result, bool show_params) {
   std::cout << "instance: " << result.instance << "\n";
   std::cout << "module: " << result.module << "\n";
   if (!result.source_file.empty()) {
     std::cout << "source: " << ResolveSourcePath(db, result.source_file) << ":" << result.source_line << "\n";
   } else {
-    std::cout << "source: <unavailable>\n";
+    std::cout << "source: <unavailable>";
+    if (const auto reason = SourceUnavailableReason(db, result); reason.has_value()) {
+      std::cout << " (" << *reason << ")";
+    }
+    std::cout << "\n";
+  }
+  if (!show_params) return;
+  if (const auto reason = ParamsUnavailableReason(db); reason.has_value()) {
+    std::cout << "parameters: <unavailable> (" << *reason << ")\n";
+    return;
+  }
+  std::cout << "parameters: " << result.parameters.size() << "\n";
+  for (const InstanceParameterRecord &param : result.parameters) {
+    std::cout << "  param " << InstanceParameterKindName(param.kind) << " " << param.name
+              << " = " << param.value;
+    std::vector<std::string> attrs;
+    if (param.is_port) attrs.push_back("port");
+    if (param.is_local) attrs.push_back("local");
+    if (param.is_overridden) attrs.push_back("overridden");
+    if (!attrs.empty()) {
+      std::cout << " [";
+      for (size_t i = 0; i < attrs.size(); ++i) {
+        if (i) std::cout << ",";
+        std::cout << attrs[i];
+      }
+      std::cout << "]";
+    }
+    std::cout << "\n";
   }
 }
 
-void PrintWhereInstanceJson(const TraceDb &db, const WhereInstanceResult &result) {
+void PrintWhereInstanceJson(const TraceDb &db, const WhereInstanceResult &result, bool show_params) {
   std::cout << "{\"instance\":\"" << JsonEscape(result.instance) << "\",\"module\":\""
             << JsonEscape(result.module) << "\"";
   if (!result.source_file.empty()) {
@@ -40,6 +90,28 @@ void PrintWhereInstanceJson(const TraceDb &db, const WhereInstanceResult &result
               << "\",\"line\":" << result.source_line << "}";
   } else {
     std::cout << ",\"source\":null";
+    if (const auto reason = SourceUnavailableReason(db, result); reason.has_value()) {
+      std::cout << ",\"source_unavailable_reason\":\"" << JsonEscape(*reason) << "\"";
+    }
+  }
+  if (show_params) {
+    if (const auto reason = ParamsUnavailableReason(db); reason.has_value()) {
+      std::cout << ",\"parameters\":null"
+                << ",\"parameters_unavailable_reason\":\"" << JsonEscape(*reason) << "\"";
+    } else {
+      std::cout << ",\"parameters\":[";
+      for (size_t i = 0; i < result.parameters.size(); ++i) {
+        if (i) std::cout << ",";
+        const InstanceParameterRecord &param = result.parameters[i];
+        std::cout << "{\"name\":\"" << JsonEscape(param.name)
+                  << "\",\"kind\":\"" << JsonEscape(InstanceParameterKindName(param.kind))
+                  << "\",\"value\":\"" << JsonEscape(param.value)
+                  << "\",\"is_local\":" << (param.is_local ? "true" : "false")
+                  << ",\"is_port\":" << (param.is_port ? "true" : "false")
+                  << ",\"is_overridden\":" << (param.is_overridden ? "true" : "false") << "}";
+      }
+      std::cout << "]";
+    }
   }
   std::cout << "}\n";
 }
@@ -75,6 +147,10 @@ ParseStatus ParseWhereInstanceArgs(const std::vector<std::string> &args,
       opts.format = *fmt;
       continue;
     }
+    if (arg == "--show-params") {
+      opts.show_params = true;
+      continue;
+    }
     return std::cerr << "Unknown option: " << arg << "\n", ParseStatus::kError;
   }
   if ((require_db && (db_path == nullptr || !db_path->has_value())) || opts.instance.empty()) {
@@ -96,9 +172,9 @@ int RunWhereInstanceWithSession(TraceSession &session, const WhereInstanceOption
     return 2;
   }
   if (opts.format == OutputFormat::kJson) {
-    PrintWhereInstanceJson(session.db, *result);
+    PrintWhereInstanceJson(session.db, *result, opts.show_params);
   } else {
-    PrintWhereInstanceText(session.db, *result);
+    PrintWhereInstanceText(session.db, *result, opts.show_params);
   }
   return 0;
 }
