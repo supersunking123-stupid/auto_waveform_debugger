@@ -83,6 +83,27 @@ rtl_trace(args=["whereis-instance", "--db", "rtl_trace.db",
 
 **If no DB exists yet:** skip this step and write the filelist manually based on your knowledge of the design, or compile the DB first (Step 4 below also compiles one for the scratch test).
 
+### Step 1.6 — Reuse the existing Makefile (preferred when available)
+
+If the project already has a Makefile for the full-system simulation, **reuse it instead of building compile flags from scratch.** The Makefile is the single source of truth for all `+define+`, `+incdir+`, file lists, and compile flags. Rebuilding these manually leads to compile-error-retry cycles that waste time.
+
+**Workflow:**
+
+1. Get the DUT's source file and parameters via `whereis-instance`.
+2. Get the DUT's port widths via `list_signals` on the existing full-system waveform.
+3. Write a minimal testbench that instantiates the DUT.
+4. Copy the Makefile to your scratch directory and modify **only** the testbench file list — replace `tb_top.v` with your new testbench, keep all other testbench support files (like the DUT sub-modules). Remove the DUT file list (`dut.f`) if your DUT is a standalone module that doesn't need the full design.
+5. Run `make build` and `make run`.
+
+**Why this is better:** The existing Makefile already contains all the defines (`+define+NO_PERFMON_HISTOGRAM`, `+define+PRAND_OFF`, etc.), include paths (`+incdir+`), and compile flags that the design needs. Discovering these from source files requires multiple compile-error-retry cycles. The Makefile has already solved this problem.
+
+**Example:** For the NVDLA `synth_tb` Makefile at `verif/sim/Makefile`:
+- `VCS_ARGS` (line 419) contains all compile flags including `+define+NO_PERFMON_HISTOGRAM`
+- `TB_FILES` (line 205) contains all testbench source files including `id_fifo.v`
+- `TB_VCS_BLD_ARGS` (line 218) contains all `+incdir+` paths
+- To test `id_fifo` in isolation, copy the Makefile and change `TB_FILES` to: `my_tb_id_fifo.sv ${TBDIR}/id_fifo.v`
+- Remove `-f ${DUTFILE}` from the build command since the full DUT is not needed
+
 ---
 
 ## Step 2 — Write a minimal testbench

@@ -17,7 +17,7 @@ These contracts are IMMUTABLE during Phases 1–3 of the refactor. Any change re
 | `trace` | `--db`, `--mode`, `--signal` | `--cone-level N`, `--prefer-port-hop`, `--depth N`, `--max-nodes N`, `--include RE`, `--exclude RE`, `--stop-at RE`, `--format text\|json` |
 | `find` | `--db`, `--query` | `--regex`, `--limit N`, `--format text\|json` |
 | `hier` | `--db` | `--root <path>`, `--depth N`, `--max-nodes N`, `--format text\|json`, `--show-source` |
-| `whereis-instance` | `--db`, `--instance` | `--format text\|json` |
+| `whereis-instance` | `--db`, `--instance` | `--format text\|json`, `--show-params` |
 | `serve` | `--db` | (interactive mode) |
 
 ### trace --mode values
@@ -35,7 +35,7 @@ These contracts are IMMUTABLE during Phases 1–3 of the refactor. Any change re
 - Supports: `find`, `trace`, `hier`, `whereis-instance`
 
 ### GraphDb binary format
-- Current version: **v3**
+- Current version: **v4**
 - Do NOT bump unless necessary
 
 ### JSON output schema (trace --format json)

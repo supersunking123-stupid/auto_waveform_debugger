@@ -29,6 +29,16 @@ class TestTokenizer(unittest.TestCase):
         self.assertEqual(toks[0].tt, _TT.SIGNAL)
         self.assertEqual(toks[0].text, "top.module.sig")
 
+    def test_bracketed_signal(self):
+        toks = self._tokens("tb.bus[3:0]")
+        self.assertEqual(toks[0].tt, _TT.SIGNAL)
+        self.assertEqual(toks[0].text, "tb.bus[3:0]")
+
+    def test_multiple_bracket_suffixes(self):
+        toks = self._tokens("top.arr[3][1:0]")
+        self.assertEqual(toks[0].tt, _TT.SIGNAL)
+        self.assertEqual(toks[0].text, "top.arr[3][1:0]")
+
     def test_decimal_literal(self):
         toks = self._tokens("42")
         self.assertEqual(toks[0].tt, _TT.LITERAL)
@@ -123,6 +133,10 @@ class TestParserBasic(unittest.TestCase):
     def test_simple_signal_ref(self):
         ast = parse_expression("a")
         self.assertEqual(ast, {"type": "SignalRef", "path": "a"})
+
+    def test_bracketed_signal_ref(self):
+        ast = parse_expression("tb.bus[3:0]")
+        self.assertEqual(ast, {"type": "SignalRef", "path": "tb.bus[3:0]"})
 
     def test_simple_literal(self):
         ast = parse_expression("1")
@@ -426,6 +440,28 @@ class TestCollectSignalRefs(unittest.TestCase):
         refs = collect_signal_refs(parse_expression("top.module.sig"))
         self.assertEqual(refs, ["top.module.sig"])
 
+    def test_bracketed_path(self):
+        refs = collect_signal_refs(parse_expression("tb.bus[3:0] & top.arr[1]"))
+        self.assertEqual(refs, ["tb.bus[3:0]", "top.arr[1]"])
+
+    def test_manual_bus_op_nodes(self):
+        refs = collect_signal_refs({
+            "type": "ConcatOp",
+            "operands": [
+                {
+                    "type": "SliceOp",
+                    "operand": {"type": "SignalRef", "path": "bus"},
+                    "msb": 3,
+                    "lsb": 2,
+                },
+                {
+                    "type": "ReverseOp",
+                    "operand": {"type": "SignalRef", "path": "other_bus"},
+                },
+            ],
+        })
+        self.assertEqual(refs, ["bus", "other_bus"])
+
 
 class TestComplexExpressions(unittest.TestCase):
 
@@ -480,6 +516,14 @@ class TestErrorHandling(unittest.TestCase):
     def test_invalid_sized_constant(self):
         with self.assertRaises(ParseError):
             parse_expression("4'x1010")
+
+    def test_unmatched_bracket(self):
+        with self.assertRaises(ParseError):
+            parse_expression("tb.bus[3:0")
+
+    def test_empty_bracket_suffix(self):
+        with self.assertRaises(ParseError):
+            parse_expression("tb.bus[]")
 
 
 class TestLiteralParsing(unittest.TestCase):

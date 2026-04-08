@@ -176,6 +176,33 @@ class TestVirtualSignalCRUD(_TestBase):
         with self.assertRaises(ValueError):
             service.delete(session, "nonexistent")
 
+    def test_delete_rejects_direct_dependents(self):
+        service = VirtualSignalService()
+        session = self._make_session()
+        session = service.create(session, "v1", "a & b")
+        session = service.create(session, "v2", "v1 | a")
+
+        original = dict(session["created_signals"])
+        with self.assertRaises(ValueError) as ctx:
+            service.delete(session, "v1")
+
+        self.assertIn("still referenced by: v2", str(ctx.exception))
+        self.assertEqual(session["created_signals"], original)
+
+    def test_delete_rejects_transitive_dependents(self):
+        service = VirtualSignalService()
+        session = self._make_session()
+        session = service.create(session, "v1", "a & b")
+        session = service.create(session, "v2", "v1 | a")
+        session = service.create(session, "v3", "v2 ^ b")
+
+        original = dict(session["created_signals"])
+        with self.assertRaises(ValueError) as ctx:
+            service.delete(session, "v1")
+
+        self.assertIn("v2, v3", str(ctx.exception))
+        self.assertEqual(session["created_signals"], original)
+
     def test_is_virtual(self):
         service = VirtualSignalService()
         session = self._make_session()
@@ -190,6 +217,71 @@ class TestVirtualSignalCRUD(_TestBase):
         info = service.get_info("v1", session)
         self.assertIn("a", info["dependencies"])
         self.assertIn("b", info["dependencies"])
+
+
+class TestBusOperations(_TestBase):
+
+    def test_concat_records_metadata_and_value(self):
+        service = VirtualSignalService()
+        session = self._make_session()
+
+        session = service.create_concat(session, "ab", ["a", "b"], "concat")
+        info = service.get_info("ab", session)
+        self.assertEqual(info["kind"], "bus_op")
+        self.assertEqual(info["width"], 2)
+        self.assertEqual(info["operation"]["type"], "concat")
+        self.assertEqual(info["operation"]["source_signals"], ["a", "b"])
+        self.assertEqual(service.eval_at_time("ab", session, 21), "b11")
+
+    def test_slice_reverse_and_expand(self):
+        service = VirtualSignalService()
+        session = self._make_session()
+
+        session = service.create_slice(session, "upper", "bus", 3, 2)
+        session = service.create_reverse(session, "rev_bus", "bus")
+        session, created = service.create_slices(session, "parts", "bus", 2)
+
+        self.assertEqual([item["signal_name"] for item in created], ["parts_3_2", "parts_1_0"])
+        self.assertEqual(service.eval_at_time("upper", session, 21), "b10")
+        self.assertEqual(service.eval_at_time("rev_bus", session, 21), "b0101")
+        self.assertEqual(service.eval_at_time("parts_3_2", session, 31), "b11")
+        self.assertEqual(service.eval_at_time("parts_1_0", session, 31), "b11")
+
+    def test_bus_op_persistence_and_expression_dependency(self):
+        service = VirtualSignalService()
+        session = self._make_session("bus_persist")
+
+        session = service.create_slice(session, "upper", "bus", 3, 2)
+        session = service.create(session, "upper_or_one", "upper | 2'b01")
+        saved = _save_session_payload(session)
+        reloaded = _normalize_session_payload(saved)
+
+        self.assertEqual(reloaded["created_signals"]["upper"]["kind"], "bus_op")
+        self.assertEqual(reloaded["created_signals"]["upper"]["width"], 2)
+        self.assertEqual(
+            reloaded["created_signals"]["upper"]["operation"]["source_signal"],
+            "bus",
+        )
+        self.assertEqual(service.eval_at_time("upper_or_one", reloaded, 21), "b11")
+
+    def test_update_rejects_bus_expression_changes(self):
+        service = VirtualSignalService()
+        session = self._make_session()
+        session = service.create_reverse(session, "rev_bus", "bus")
+
+        with self.assertRaises(ValueError) as ctx:
+            service.update(session, "rev_bus", expression="bus")
+        self.assertIn("delete and recreate", str(ctx.exception).lower())
+
+    def test_expand_is_atomic_on_collision(self):
+        service = VirtualSignalService()
+        session = self._make_session()
+        session = service.create(session, "parts_3_2", "a")
+
+        with self.assertRaises(ValueError) as ctx:
+            service.create_slices(session, "parts", "bus", 2)
+        self.assertIn("already exists", str(ctx.exception))
+        self.assertNotIn("parts_1_0", session["created_signals"])
 
 
 class TestSessionPersistence(_TestBase):
@@ -238,6 +330,13 @@ class TestChainedDependencies(_TestBase):
         session = service.update(session, "v1", expression="a | b")
         info = service.get_info("v1", session)
         self.assertEqual(info["expression"], "a | b")
+
+    def test_create_accepts_bracketed_waveform_path(self):
+        service = VirtualSignalService()
+        session = self._make_session()
+
+        session = service.create(session, "bus_passthru", "bus[3:0]")
+        self.assertEqual(service.eval_at_time("bus_passthru", session, 21), "b1010")
 
 
 class TestExpressionValidation(_TestBase):

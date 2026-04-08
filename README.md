@@ -95,14 +95,20 @@ agent_debug_automation/
 
 ```bash
 # standalone_trace
-cd standalone_trace && cmake -B build -GNinja . && ninja -C build
+(cd standalone_trace && cmake -B build -GNinja . && ninja -C build)
 
 # waveform_explorer (add -DVERDI_HOME=... -DENABLE_FSDB=ON for FSDB)
-cd waveform_explorer && cmake -B build . && cmake --build build -j$(nproc)
+(cd waveform_explorer && cmake -B build . && cmake --build build -j$(nproc))
 
-# Python runtime
-uv pip install fastmcp   # or: pip install fastmcp
+# Python environment (repo root)
+python3 -m venv .venv
+.venv/bin/python3 -m pip install --upgrade pip
+.venv/bin/python3 -m pip install -r requirements.txt
 ```
+
+`requirements.txt` is the supported Python environment for the repo. It includes
+the MCP runtime (`fastmcp`) plus the other Python dependencies used by the
+project tests and tooling.
 
 ## Run MCP Service
 
@@ -117,14 +123,14 @@ All tests use the project venv:
 
 ```bash
 # standalone_trace (C++ ctest)
-cd standalone_trace && ctest --test-dir build --output-on-failure
+(cd standalone_trace && ctest --test-dir build --output-on-failure)
 
 # waveform_explorer
-.venv/bin/python3 -m unittest waveform_explorer.tests.test_signal_overview
-.venv/bin/python3 -m unittest waveform_explorer.tests.test_waveform_commands
+./.venv/bin/python3 -m unittest waveform_explorer.tests.test_signal_overview
+./.venv/bin/python3 -m unittest waveform_explorer.tests.test_waveform_commands
 
 # agent_debug_automation
-.venv/bin/python3 -m unittest agent_debug_automation.tests.test_cross_linking
+./.venv/bin/python3 -m unittest agent_debug_automation.tests.test_cross_linking
 
 # Integration test cases (tc01-tc27)
 ./test_cases/run_all_tests.sh

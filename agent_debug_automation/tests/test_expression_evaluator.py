@@ -476,6 +476,51 @@ class TestEvaluateExpression(unittest.TestCase):
         self.assertEqual(r.bits, "1010")
 
 
+class TestBusOperationNodes(unittest.TestCase):
+    """Manual AST tests for non-parser bus-operation nodes."""
+
+    def test_concat_eval(self):
+        ast = {
+            "type": "ConcatOp",
+            "operands": [
+                {"type": "SignalRef", "path": "a"},
+                {"type": "SignalRef", "path": "b"},
+            ],
+        }
+        result = evaluate_expression(
+            ast,
+            {
+                "a": LogicValue.from_string("b10"),
+                "b": LogicValue.from_string("b01"),
+            },
+        )
+        self.assertEqual(result.to_string(), "b1001")
+
+    def test_slice_eval(self):
+        ast = {
+            "type": "SliceOp",
+            "operand": {"type": "SignalRef", "path": "bus"},
+            "msb": 3,
+            "lsb": 1,
+        }
+        result = evaluate_expression(
+            ast,
+            {"bus": LogicValue.from_string("b1010")},
+        )
+        self.assertEqual(result.to_string(), "b101")
+
+    def test_reverse_eval(self):
+        ast = {
+            "type": "ReverseOp",
+            "operand": {"type": "SignalRef", "path": "bus"},
+        }
+        result = evaluate_expression(
+            ast,
+            {"bus": LogicValue.from_string("b1010")},
+        )
+        self.assertEqual(result.to_string(), "b0101")
+
+
 class TestIterTransitions(unittest.TestCase):
     """Event-driven transition iteration tests."""
 
@@ -527,6 +572,34 @@ class TestIterTransitions(unittest.TestCase):
         # Should yield seed value (x & x = x)
         self.assertEqual(len(trans), 1)
         self.assertEqual(trans[0]["v"], "x")
+
+    def test_concat_transitions(self):
+        ast = {
+            "type": "ConcatOp",
+            "operands": [
+                {"type": "SignalRef", "path": "a"},
+                {"type": "SignalRef", "path": "b"},
+            ],
+        }
+        a_trans = [{"t": 0, "v": "0"}, {"t": 10, "v": "1"}]
+        b_trans = [{"t": 0, "v": "0"}, {"t": 20, "v": "1"}]
+        trans = list(
+            iter_virtual_transitions(
+                ast,
+                {"a": a_trans, "b": b_trans},
+                0,
+                25,
+                signal_widths={"a": 1, "b": 1},
+            )
+        )
+        self.assertEqual(
+            trans,
+            [
+                {"t": 0, "v": "b00"},
+                {"t": 10, "v": "b10"},
+                {"t": 20, "v": "b11"},
+            ],
+        )
 
 
 if __name__ == "__main__":

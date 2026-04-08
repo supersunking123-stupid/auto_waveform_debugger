@@ -500,6 +500,27 @@ def _eval_ternary(cond: LogicValue, true_val: LogicValue, false_val: LogicValue)
     return false_val
 
 
+def _eval_concat(values: Sequence[LogicValue]) -> LogicValue:
+    """Concatenate operands in Verilog order (first operand is MSB side)."""
+    if not values:
+        return LogicValue.x_val(1)
+    bits = "".join(value.bits for value in values)
+    return LogicValue(bits, len(bits))
+
+
+def _eval_slice(value: LogicValue, msb: int, lsb: int) -> LogicValue:
+    """Inclusive part-select using Verilog indexing semantics."""
+    if msb < lsb:
+        return LogicValue.x_val(1)
+    bits = "".join(value.bit(bit_idx) for bit_idx in range(msb, lsb - 1, -1))
+    return LogicValue(bits, len(bits))
+
+
+def _eval_reverse(value: LogicValue) -> LogicValue:
+    """Reverse the operand bit order."""
+    return LogicValue(value.bits[::-1], value.width, value.signed)
+
+
 # ---------------------------------------------------------------------------
 # AST evaluator — single time point
 # ---------------------------------------------------------------------------
@@ -531,6 +552,21 @@ def evaluate_expression(
         if path not in operand_values:
             return LogicValue.x_val(1)
         return operand_values[path]
+
+    if node_type == "ConcatOp":
+        operands = [
+            evaluate_expression(operand, operand_values)
+            for operand in ast.get("operands", [])
+        ]
+        return _eval_concat(operands)
+
+    if node_type == "SliceOp":
+        operand = evaluate_expression(ast["operand"], operand_values)
+        return _eval_slice(operand, int(ast["msb"]), int(ast["lsb"]))
+
+    if node_type == "ReverseOp":
+        operand = evaluate_expression(ast["operand"], operand_values)
+        return _eval_reverse(operand)
 
     if node_type == "UnaryOp":
         op = ast["op"]

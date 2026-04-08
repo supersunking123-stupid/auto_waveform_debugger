@@ -26,14 +26,21 @@ cmake --build build -j"$(nproc)"
 Install the Python MCP runtime:
 
 ```bash
-uv pip install fastmcp
+cd /home/qsun/AI_PROJ/auto_waveform_debugger
+python3 -m venv .venv
+.venv/bin/python3 -m pip install --upgrade pip
+.venv/bin/python3 -m pip install -r requirements.txt
 ```
+
+Use the repo-level virtualenv for both MCP startup and tests. `requirements.txt`
+includes `fastmcp` and the rest of the Python dependencies used by this merged
+service.
 
 ## Run MCP service
 
 ```bash
 cd /home/qsun/AI_PROJ/auto_waveform_debugger
-python -m agent_debug_automation.agent_debug_automation_mcp
+.venv/bin/python3 -m agent_debug_automation.agent_debug_automation_mcp
 ```
 
 ## MCP client config
@@ -135,12 +142,22 @@ For multi-bit value queries, `radix` may be `hex`, `bin`, or `dec`; the default 
 - `update_signal_group(group_name, signals=None, description=None, waveform_path=None, session_name=None)`
 - `delete_signal_group(group_name, waveform_path=None, session_name=None)`
 - `list_signal_groups(waveform_path=None, session_name=None)`
+- `create_bus_concat(signal_name, source_signals, description="", waveform_path=None, session_name=None)`
+- `create_bus_slices(signal_name_prefix, source_signal, slice_width, description="", waveform_path=None, session_name=None)`
+- `create_reversed_bus(signal_name, source_signal, description="", waveform_path=None, session_name=None)`
+- `create_bus_slice(signal_name, source_signal, msb, lsb, description="", waveform_path=None, session_name=None)`
+- `create_signal_expression(signal_name, expression, description="", waveform_path=None, session_name=None)`
+- `update_signal_expression(signal_name, expression=None, description=None, waveform_path=None, session_name=None)`
+- `delete_signal_expression(signal_name, waveform_path=None, session_name=None)`
+- `list_signal_expressions(waveform_path=None, session_name=None)`
 
 Session state is stored on disk under `agent_debug_automation/.session_store`.
 Each waveform gets a default `Default_Session` on first session-aware use.
 Time-taking merged tools accept either an integer time, `"Cursor"`, or `"BM_<bookmark_name>"`.
 `get_snapshot` can expand saved Signal Groups when `signals_are_groups=true`.
 The active Session is global, but every saved Session is bound to a single waveform path.
+
+Created buses and expression-based virtual signals are both stored in the session file under the same created-signal registry. `list_signal_expressions(...)` returns both kinds and includes metadata such as `kind`, `width`, and `operation`.
 
 Common session-aware workflow:
 

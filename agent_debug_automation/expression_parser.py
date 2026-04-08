@@ -127,11 +127,9 @@ def _tokenize(expr: str) -> List[_Token]:
 
         # identifier / signal path
         if ch.isalpha() or ch == "_" or ch == "$":
-            m = _IDENT_RE.match(expr, i)
-            if not m:
-                raise ParseError(f"invalid identifier at position {i}", i)
-            tokens.append(_Token(_TT.SIGNAL, m.group(), i))
-            i = m.end()
+            signal_path, end = _scan_signal_path(expr, i)
+            tokens.append(_Token(_TT.SIGNAL, signal_path, i))
+            i = end
             continue
 
         # multi-char operators (maximal munch)
@@ -176,6 +174,30 @@ def _tokenize(expr: str) -> List[_Token]:
 
     tokens.append(_Token(_TT.EOF, "", n))
     return tokens
+
+
+def _scan_signal_path(expr: str, start: int) -> Tuple[str, int]:
+    """Scan one waveform signal path, including bracket suffixes."""
+    ident = _IDENT_RE.match(expr, start)
+    if not ident:
+        raise ParseError(f"invalid identifier at position {start}", start)
+
+    end = ident.end()
+    n = len(expr)
+    while end < n and expr[end] == "[":
+        close = expr.find("]", end + 1)
+        if close == -1:
+            raise ParseError(f"unmatched '[' at position {end}", end)
+
+        inner = expr[end + 1:close]
+        if not inner:
+            raise ParseError(f"empty bracket suffix at position {end}", end)
+        if any(ch in "[] \t\r\n" for ch in inner):
+            raise ParseError(f"invalid bracket suffix at position {end}", end)
+
+        end = close + 1
+
+    return expr[start:end], end
 
 
 def _sized_constant_to_value(size: int, radix: str, digits: str) -> str:
@@ -537,6 +559,13 @@ def _collect_refs_recursive(node: Dict[str, Any], refs: List[str], seen: set) ->
         if path not in seen:
             seen.add(path)
             refs.append(path)
+    elif node_type == "ConcatOp":
+        for operand in node.get("operands", []):
+            _collect_refs_recursive(operand, refs, seen)
+    elif node_type == "SliceOp":
+        _collect_refs_recursive(node["operand"], refs, seen)
+    elif node_type == "ReverseOp":
+        _collect_refs_recursive(node["operand"], refs, seen)
     elif node_type == "UnaryOp":
         _collect_refs_recursive(node["operand"], refs, seen)
     elif node_type == "BinaryOp":

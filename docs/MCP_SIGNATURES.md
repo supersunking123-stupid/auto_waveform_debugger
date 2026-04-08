@@ -57,6 +57,7 @@ rtl_trace(args=["find", "--db", "rtl_trace.db", "--query", "foo.bar"])
 rtl_trace(args=["hier", "--db", "rtl_trace.db", "--root", "top.u0", "--depth", "2", "--format", "json"])
 rtl_trace(args=["hier", "--db", "rtl_trace.db", "--root", "top.u0", "--depth", "0", "--format", "json", "--show-source"])
 rtl_trace(args=["whereis-instance", "--db", "rtl_trace.db", "--instance", "top.u0", "--format", "json"])
+rtl_trace(args=["whereis-instance", "--db", "rtl_trace.db", "--instance", "top.u0", "--format", "json", "--show-params"])
 ```
 
 Supported subcommands:
@@ -165,18 +166,20 @@ Quick lookup for one hierarchy node.
 CLI form:
 
 ```text
-rtl_trace whereis-instance --db <db_path> --instance <hier.path> [--format text|json]
+rtl_trace whereis-instance --db <db_path> --instance <hier.path> [--format text|json] [--show-params]
 ```
 
 Common flags:
 - `--db <db_path>`
 - `--instance <hier.path>`
 - `--format text|json`
+- `--show-params`
 
 Behavior:
 - returns the instance path
 - returns the instantiated module type
 - returns the module definition source file and line when available in the DB
+- with `--show-params`, returns elaborated parameter / localparam values and type parameters for that instance when the DB contains v4 parameter metadata
 
 #### Serve mode tools
 
@@ -254,11 +257,42 @@ delete_signal_group(group_name: str, waveform_path: Optional[str] = None, sessio
 list_signal_groups(waveform_path: Optional[str] = None, session_name: Optional[str] = None)
 ```
 
-### Virtual signal expression tools
+### Virtual bus construction and expression tools
 
-Create, update, delete, and list virtual signals defined by Verilog-like expressions. Virtual signals are computed on demand from real waveform signals (or other virtual signals) and behave like real signals in all session-aware waveform tools.
+Create, update, delete, and list session-persisted created signals. These include both Verilog-like expression signals and bus-construction helpers such as concat, slicing, expansion, and bit-reversal. Created signals are computed on demand from real waveform signals (or other created signals) and behave like real signals in all session-aware waveform tools.
 
 ```python
+create_bus_concat(
+    signal_name: str,
+    source_signals: List[str],
+    description: str = "",
+    waveform_path: Optional[str] = None,
+    session_name: Optional[str] = None,
+)
+create_bus_slices(
+    signal_name_prefix: str,
+    source_signal: str,
+    slice_width: int,
+    description: str = "",
+    waveform_path: Optional[str] = None,
+    session_name: Optional[str] = None,
+)
+create_reversed_bus(
+    signal_name: str,
+    source_signal: str,
+    description: str = "",
+    waveform_path: Optional[str] = None,
+    session_name: Optional[str] = None,
+)
+create_bus_slice(
+    signal_name: str,
+    source_signal: str,
+    msb: int,
+    lsb: int,
+    description: str = "",
+    waveform_path: Optional[str] = None,
+    session_name: Optional[str] = None,
+)
 create_signal_expression(
     signal_name: str,
     expression: str,
@@ -284,6 +318,13 @@ list_signal_expressions(
 )
 ```
 
+Bus helper defaults:
+
+- `create_bus_concat` follows Verilog concatenation order: the first source becomes the MSB side.
+- `create_bus_slices` requires exact divisibility and creates MSB-first range-suffixed names such as `data_1023_992`, `data_991_960`, ..., `data_31_0`.
+- `create_reversed_bus` reverses bit order without changing width.
+- `create_bus_slice` uses inclusive `[msb:lsb]` selection.
+
 #### Supported operators
 
 | Category | Operators | Notes |
@@ -302,6 +343,12 @@ list_signal_expressions(
 | Literals | `0` `1` `4'b1010` `32'hFF` `8'd255` `'x` `'z` | Sized/unsized Verilog constants |
 
 Signal paths follow standard hierarchy: `top.module.signal`. The `$` character is supported in identifiers for synthesized nets.
+
+`list_signal_expressions(...)` returns both expression-created and bus-created signals. Each item includes:
+
+- `kind`: `expression` or `bus_op`
+- `width`: inferred width when known
+- `operation`: structured bus metadata for bus-created signals
 
 #### Interaction with existing tools
 

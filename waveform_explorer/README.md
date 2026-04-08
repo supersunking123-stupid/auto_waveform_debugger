@@ -155,11 +155,16 @@ The tool can be run as an MCP (Model Context Protocol) service, allowing AI Agen
 ### Setup MCP
 Ensure the virtual environment is set up and `fastmcp` is installed:
 ```bash
-uv pip install fastmcp
+cd /home/qsun/AI_PROJ/auto_waveform_debugger
+python3 -m venv .venv
+.venv/bin/python3 -m pip install --upgrade pip
+.venv/bin/python3 -m pip install -r requirements.txt
 ```
+For this repo, use the shared root virtualenv. `requirements.txt` includes
+`fastmcp` and the other Python packages used by the MCP wrappers and tests.
 ### Run MCP Server
 ```bash
-python waveform_mcp.py
+.venv/bin/python3 waveform_mcp.py
 ```
 
 ## Integration with AI Agents (MCP)
