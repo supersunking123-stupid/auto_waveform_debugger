@@ -154,7 +154,8 @@ const SymbolRefList &GetCachedRhsSignals(
 const SymbolRefList &GetCachedStatementLhsSignals(
     const slang::ast::Statement &stmt, TraceCompileCache &cache);
 EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManager &sm,
-                                  bool drivers_mode, TraceCompileCache *cache);
+                                  bool drivers_mode, TraceCompileCache *cache,
+                                  const slang::flat_hash_map<const slang::ast::Symbol *, uint32_t> *symbol_path_ids = nullptr);
 const slang::ast::InstanceBodySymbol *GetContainingInstance(const slang::ast::Symbol *sym) {
   while (sym != nullptr && sym->kind != slang::ast::SymbolKind::InstanceBody) {
     if (sym->kind == slang::ast::SymbolKind::Root) return nullptr;
@@ -585,17 +586,18 @@ std::vector<TraceResult> ComputeIndexedTraceResults(
 }
 
 SignalRecord BuildSignalRecord(const slang::ast::Symbol *sym, const slang::SourceManager &sm,
-                               TraceCompileCache &cache) {
+                               TraceCompileCache &cache,
+                               const slang::flat_hash_map<const slang::ast::Symbol *, uint32_t> *symbol_path_ids = nullptr) {
   SignalRecord rec;
   std::unordered_set<const slang::ast::Symbol *> visited_drivers;
   visited_drivers.insert(sym);
   for (const TraceResult &r : ComputeIndexedTraceResults</*DRIVERS*/ true>(sym, cache, visited_drivers))
-    rec.drivers.push_back(ResolveTraceResult(r, sm, true, &cache));
+    rec.drivers.push_back(ResolveTraceResult(r, sm, true, &cache, symbol_path_ids));
 
   std::unordered_set<const slang::ast::Symbol *> visited_loads;
   visited_loads.insert(sym);
   for (const TraceResult &r : ComputeIndexedTraceResults</*DRIVERS*/ false>(sym, cache, visited_loads))
-    rec.loads.push_back(ResolveTraceResult(r, sm, false, &cache));
+    rec.loads.push_back(ResolveTraceResult(r, sm, false, &cache, symbol_path_ids));
 
   return rec;
 }
@@ -656,12 +658,21 @@ std::pair<std::string_view, std::string_view> SplitPathPrefixLeaf(std::string_vi
   return {path.substr(0, pos), path.substr(pos + 1)};
 }
 
-uint32_t InternString(const std::string &s, std::vector<std::string> &pool,
-                      slang::flat_hash_map<std::string, uint32_t> &index) {
-  auto it = index.find(s);
+uint32_t InternString(std::string_view sv, std::vector<std::string> &pool,
+                      slang::flat_hash_map<std::string_view, uint32_t> &index) {
+  auto it = index.find(sv);
   if (it != index.end()) return it->second;
   const uint32_t id = static_cast<uint32_t>(pool.size());
-  pool.push_back(s);
+  // If the pool would reallocate, all existing string_view keys in the index
+  // would dangle.  Re-emit them into the new buffer before inserting.
+  if (pool.size() == pool.capacity()) {
+    pool.emplace_back(sv);
+    index.clear();
+    for (size_t i = 0; i < pool.size(); ++i)
+      index.emplace(std::string_view(pool[i]), static_cast<uint32_t>(i));
+    return id;
+  }
+  pool.emplace_back(sv);
   index.emplace(pool.back(), id);
   return id;
 }
@@ -1040,13 +1051,15 @@ const SymbolRefList &GetCachedStatementLhsSignals(
 }
 
 EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManager &sm, bool drivers_mode,
-                                  TraceCompileCache *cache) {
+                                  TraceCompileCache *cache,
+                                  const slang::flat_hash_map<const slang::ast::Symbol *, uint32_t> *symbol_path_ids) {
   EndpointRecord rec;
   std::visit(
       [&](const auto &item) {
         using T = std::decay_t<decltype(item)>;
         if constexpr (std::is_same_v<T, const slang::ast::PortSymbol *>) {
           rec.kind = EndpointKind::kPort;
+          // Port endpoints are usually not in the symbol cache, so use getHierarchicalPath().
           rec.path = item->getHierarchicalPath();
           rec.direction = DirectionToString(item->direction);
           const auto loc = item->location;
@@ -1054,7 +1067,15 @@ EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManag
           rec.line = sm.getLineNumber(loc);
         } else {
           rec.kind = EndpointKind::kExpr;
-          rec.path = item.symbol != nullptr ? item.symbol->getHierarchicalPath() : "";
+          if (item.symbol != nullptr && symbol_path_ids != nullptr) {
+            auto it = symbol_path_ids->find(item.symbol);
+            if (it != symbol_path_ids->end()) {
+              rec.path_id = it->second;
+            }
+          }
+          if (rec.path_id == std::numeric_limits<uint32_t>::max()) {
+            rec.path = item.symbol != nullptr ? item.symbol->getHierarchicalPath() : "";
+          }
           const auto loc = item.expr->sourceRange.start();
           rec.file = std::string(sm.getFileName(loc));
           rec.line = sm.getLineNumber(loc);
@@ -1402,7 +1423,7 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &key
   }
 
   GraphDb graph;
-  slang::flat_hash_map<std::string, uint32_t> string_index;
+  slang::flat_hash_map<std::string_view, uint32_t> string_index;
   std::vector<std::pair<uint32_t, uint32_t>> load_refs_flat;
   std::vector<std::pair<uint32_t, uint32_t>> driver_refs_flat;
   std::vector<std::pair<uint32_t, uint32_t>> assignment_lhs_refs_flat;
@@ -1410,14 +1431,18 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &key
   TraceCompileCache trace_cache;
   EndpointMergeGroups merge_groups;
 
-  graph.endpoints.reserve(5000000);
-  string_index.reserve(2000000);
+  // Reserve pool to guarantee stable string_view keys — must not reallocate.
+  // Heuristic: ~1 unique string per signal + ~0.5 per endpoint for file/path/direction.
+  const size_t estimated_strings = keys.size() * 2 + hier_db.hierarchy.size();
+  graph.strings.reserve(estimated_strings);
+  graph.endpoints.reserve(keys.size() * 5);
+  string_index.reserve(estimated_strings);
   load_refs_flat.reserve(5000000);
   driver_refs_flat.reserve(5000000);
   assignment_lhs_refs_flat.reserve(5000000);
 
-  auto intern = [&](const std::string &s) -> uint32_t {
-    return InternString(s, graph.strings, string_index);
+  auto intern = [&](std::string_view sv) -> uint32_t {
+    return InternString(sv, graph.strings, string_index);
   };
   auto append_signal_refs = [&](const std::vector<std::string> &signals, uint32_t &begin, uint32_t &count) {
     begin = static_cast<uint32_t>(graph.signal_refs.size());
@@ -1427,7 +1452,9 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &key
   };
   auto append_endpoint = [&](const EndpointRecord &e) {
     GraphEndpointRecord ge;
-    ge.path_str_id = intern(e.path);
+    ge.path_str_id = (e.path_id != std::numeric_limits<uint32_t>::max())
+                         ? e.path_id
+                         : intern(e.path);
     ge.file_str_id = intern(e.file);
     ge.direction_str_id = e.direction.empty() ? std::numeric_limits<uint32_t>::max() : intern(e.direction);
     ge.bit_map_str_id = e.bit_map.empty() ? std::numeric_limits<uint32_t>::max() : intern(e.bit_map);
@@ -1441,13 +1468,22 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &key
     ge.has_assignment_range = e.has_assignment_range ? 1u : 0u;
     graph.endpoints.push_back(ge);
   };
-  auto build_signal_record = [&](const slang::ast::Symbol *sym) -> SignalRecord {
-    return BuildSignalRecord(sym, sm, trace_cache);
-  };
 
+  // Pre-intern signal path names and build Symbol* → path_id reverse index.
+  // This lets ResolveTraceResult skip getHierarchicalPath() for known symbols.
   graph.signals.resize(keys.size());
-  for (size_t i = 0; i < keys.size(); ++i)
+  slang::flat_hash_map<const slang::ast::Symbol *, uint32_t> symbol_path_ids;
+  symbol_path_ids.reserve(symbols.size());
+  for (size_t i = 0; i < keys.size(); ++i) {
     graph.signals[i].name_str_id = intern(keys[i]);
+    auto it = symbols.find(keys[i]);
+    if (it != symbols.end())
+      symbol_path_ids[it->second] = graph.signals[i].name_str_id;
+  }
+
+  auto build_signal_record = [&](const slang::ast::Symbol *sym) -> SignalRecord {
+    return BuildSignalRecord(sym, sm, trace_cache, &symbol_path_ids);
+  };
 
   const auto t_build_start = Clock::now();
   signal_count = 0;
@@ -1488,13 +1524,19 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &key
     gs.driver_count = static_cast<uint32_t>(rec.drivers.size());
     for (const EndpointRecord &e : rec.drivers) {
       append_endpoint(e);
-      if (!e.path.empty()) driver_refs_flat.push_back({intern(e.path), static_cast<uint32_t>(sig_id)});
+      const uint32_t driver_path_id =
+          (e.path_id != std::numeric_limits<uint32_t>::max()) ? e.path_id : intern(e.path);
+      if (driver_path_id != std::numeric_limits<uint32_t>::max())
+        driver_refs_flat.push_back({driver_path_id, static_cast<uint32_t>(sig_id)});
     }
     gs.load_begin = static_cast<uint32_t>(graph.endpoints.size());
     gs.load_count = static_cast<uint32_t>(rec.loads.size());
     for (const EndpointRecord &e : rec.loads) {
       append_endpoint(e);
-      if (!e.path.empty()) load_refs_flat.push_back({intern(e.path), static_cast<uint32_t>(sig_id)});
+      const uint32_t load_path_id =
+          (e.path_id != std::numeric_limits<uint32_t>::max()) ? e.path_id : intern(e.path);
+      if (load_path_id != std::numeric_limits<uint32_t>::max())
+        load_refs_flat.push_back({load_path_id, static_cast<uint32_t>(sig_id)});
       const std::vector<std::string> lhs_paths =
           e.lhs_signals.empty() ? InferAssignmentLhsPathsFromText(e.path, e.assignment_text) : e.lhs_signals;
       for (const std::string &lhs : lhs_paths) {
