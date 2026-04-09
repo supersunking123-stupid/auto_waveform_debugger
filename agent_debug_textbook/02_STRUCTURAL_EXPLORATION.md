@@ -23,7 +23,17 @@
 
 ## Prerequisite: the structural database
 
-All structural exploration requires a compiled database. If one does not exist yet, compile first:
+All structural exploration requires a compiled database.
+
+Before compiling, determine whether a usable DB already exists and what path to use:
+
+1. Check local context for an existing `rtl_trace.db` path.
+2. If local context is unclear, ask the user whether a DB has already been generated and which path to use.
+3. If no DB exists yet, ask the user for the exact command or flow used in this project to generate it.
+
+Do **not** guess the project's compile recipe when the filelist / top-module / required flags are unknown.
+
+If a DB truly does not exist yet and you have the correct project-specific compile flow, compile first:
 
 ```python
 rtl_trace(args=["compile", "--db", "rtl_trace.db", "--top", "top_module", "-f", "files.f"])
@@ -35,7 +45,7 @@ Common compile flags for tricky designs:
 - `--mfcu` — multi-file compilation unit mode.
 - `--low-mem` — reduce memory usage for very large designs.
 
-**Do not proceed to other commands until compile succeeds.**
+**Do not proceed to other structural commands until you know the correct DB path or compile succeeds.**
 
 ---
 

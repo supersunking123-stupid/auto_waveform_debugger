@@ -13,6 +13,7 @@ Debugging is not random exploration. Follow this phased approach.
 Before touching any waveform, understand what you are looking at.
 
 1. **Read the failure description.** Extract the failing signal, the time of failure, the test name, and any error or assertion message. If the description is vague ("test hangs", "output mismatch"), your first job is to make it concrete.
+   - When reading a simulation log, do **not** dump the whole file into context. Start with targeted extraction such as `grep` for `UVM_ERROR` / `UVM_FATAL` / assertion text, plus `head` and `tail` for setup/final status. Expand only around the relevant matches.
 2. **Understand the design context.** Use structural exploration (`hier`, `find`) to understand the module hierarchy around the failure point. You do not need to understand the entire chip — just the neighborhood of the symptom.
 3. **Identify the clock domain(s).** Determine which clock drives the failing logic. If multiple clock domains are nearby, note the boundaries immediately — they will matter later.
 4. **Determine the waveform time precision. Do this before passing any time value to any tool.** Call `get_signal_info` on any signal in the waveform and read the timescale it reports. The waveform timestamps are in units of the *precision* — the second number in the `` `timescale `` directive. See Rule 12 for the full explanation and conversion procedure.
@@ -90,6 +91,7 @@ The waveform and design hierarchy can be very complex, and your context window f
 - **Summarize after every 3–5 tool calls.** Write a brief note to yourself: "What have I learned? What is my current theory? What should I check next?"
 - **Anchor summaries to session state.** Attach bookmarks and signal groups to your summaries so you can reconstruct the context later without re-querying.
 - **Discard raw data after summarizing.** You do not need to remember the exact value of every signal at every time point. Remember conclusions, not data.
+- **Treat simulation logs the same way.** Do not paste full `test.log` / `sim.log` files into context. Use `grep`, `head`, and `tail` to extract the failing error, nearby context, and end-of-run status; then summarize.
 
 ### Rule 2 — Maintain a hypothesis checklist
 
@@ -129,11 +131,14 @@ These components share a dangerous property: they work correctly 99% of the time
 
 ### Rule 4 — Spawn subagents for local verification
 
-If a component is suspicious and waveform debugging is painful (the cone is too deep, the behavior is stateful and hard to trace, or the timing is too subtle to see in the waveform), spawn a subagent to build a standalone test for that component.
+If a component is suspicious and waveform debugging is proving difficult — the cone is too deep, the behavior is stateful, or the timing too subtle — spawn a subagent to build a standalone test for that component.
+
+**Escalation trigger:** If you have made more than ~10 tool calls focused on a single block's internal signals without identifying a concrete root cause, stop passive waveform observation and escalate to a local testbench. More queries on the same block are unlikely to converge faster than targeted simulation would.
 
 - The subagent should create a minimal testbench exercising the suspected corner case.
 - Consult `EDA_USE.md` for simulator setup on this machine.
-- This is especially effective for FIFOs, CDC logic, arbiters, and complex state machines — components where targeted stimulus is more revealing than passive waveform observation.
+- This is effective for any component where targeted stimulus reveals internal behavior more directly than passive observation: counters and pointers (exercise boundary conditions), arbiters (drive concurrent requests), state machines (force edge-case transitions), CDC logic (vary sampling edge timing), FIFOs (fill-drain across the wrap boundary).
+- The resulting waveform can be loaded into an MCP session and analyzed with the same playbooks as a full-system waveform.
 
 ### Rule 5 — Distinguish the symptom from the cause
 
@@ -340,28 +345,27 @@ When tool results are empty, contradictory, or cannot be explained, the correct 
 
 ---
 
-### Rule 14 — Respect the golden boundary: never question VIPs, assertions, or protocol checkers
+### Rule 14 — Respect the golden boundary: vendor VIP protocol checkers are golden; home-grown models are not
 
-Certain components are **golden** — they define what correct behavior is. When they fire or flag an error, the DUT is wrong, not the golden component. Questioning the golden boundary is almost always a waste of debug cycles and leads the investigation astray.
+Do not invent a giant "golden" boundary around the entire testbench. In this project, the default golden boundary is **EDA-vendor protocol VIP monitors/checkers**. If one of those fires, trust the checker. But do **not** extend that trust automatically to home-grown memory models, BFMs, scoreboards, reference models, monitors, or assertions. Those components may themselves be buggy and may be the source of the bad interface value that the VIP observed.
 
-**Golden components:**
+**Trust levels:**
 
-| Component | Why it is trusted |
-|---|---|
-| **Verification IP (VIPs)** | Protocol monitors from commercial or mature VIP libraries are validated across thousands of designs. If a VIP flags a violation, the DUT violated the protocol. |
-| **Assertions** | Written by the verification team to define correct behavior. An assertion firing means the DUT violated its specification. |
-| **Protocol checkers** | Embedded or external checkers (e.g., AXI protocol checker) enforce bus protocol rules. They are the reference, not the suspect. |
-| **Scoreboards and reference models** | Define the expected input/output relationship. Mismatches mean the DUT diverged. |
-| **Testbench stimulus** | Defines the test intent. "Wrong stimulus" means a different test, not a DUT bug (unless the user explicitly says the testbench may be wrong). |
+| Component | Trust level | How to treat it |
+|---|---|---|
+| **EDA-vendor VIP monitors / protocol checkers** | Golden | Trust the checker; trace the interface signal that reached it |
+| **Home-grown memory models / BFMs / monitor wrappers** | Not golden | If they drive the failing signal, debug them directly |
+| **Home-grown assertions / scoreboards / reference models** | Evidence, not proof | Cross-check against waveform + driver trace before treating them as authoritative |
+| **Testbench stimulus generators** | Inputs, not golden | They may be wrong; prove it from waveform evidence before concluding |
 
 **How to apply:**
 
-1. **Never hypothesize that a golden component is buggy** unless the user explicitly says "the assertion may be wrong" or "check the VIP configuration."
-2. **Trace inward from the golden boundary.** If a VIP fires, the DUT signal feeding the VIP has the wrong value. Trace that signal backward using Playbook 03/04 — do not investigate the VIP's checker logic.
-3. **An assertion's condition is the starting point for backward tracing**, not a suspect to be debugged. Extract the signals from the assertion expression and begin Phase 1 (observe the symptom) on those signals.
-4. **If you find yourself explaining why the assertion "shouldn't have fired"**, you are on the wrong track. The assertion did fire. The question is why the DUT reached the state that triggered it.
-
-**Exception:** The user may say "the testbench has a known issue" or "this assertion has false positives." In that case, proceed with caution but still check the DUT first — the exception is rare, and defaulting to trust-the-golden-component is correct more than 95% of the time.
+1. **Never hypothesize that an EDA-vendor VIP checker is buggy** unless the user explicitly says to check the VIP configuration or connection.
+2. **Start from the interface signal the VIP/checker flagged, then trace its immediate driver.** Do not assume the source is the DUT until the driver trace shows that.
+3. If the driver is **DUT RTL**: proceed into the DUT.
+4. If the driver is **home-grown testbench RTL** (memory model, BFM, wrapper, monitor logic): the investigation shifts to that testbench logic. This is not questioning the VIP; it is identifying the real producer of the wrong value.
+5. If a **home-grown assertion/checker/scoreboard** fires, treat it as a strong clue, not an unchallengeable fact. Cross-check the waveform and structural trace before declaring it correct.
+6. **If you find yourself explaining why a vendor VIP "shouldn't have fired"**, stop. The VIP did fire. The question is which RTL block produced the wrong value that reached it.
 
 ---
 
@@ -411,7 +415,7 @@ If you have exhausted your hypothesis checklist and still cannot find the root c
 
 4. **Compare with a passing test.** If you have a waveform from a passing test, compare the signal values at the same logical point (same transaction number, same state machine state, not necessarily the same absolute time). The difference often reveals the bug.
 
-5. **Question the testbench (with caution — see Rule 14).** The testbench itself may be incorrect — wrong expected values, wrong timing constraints, or wrong stimulus. However, Rule 14 applies: VIPs, assertions, and protocol checkers are golden by default. Only question them after you have exhausted all DUT-side explanations, or if the user explicitly says the testbench may be wrong.
+5. **Question the testbench (with caution — see Rule 14).** The testbench itself may be incorrect — wrong expected values, wrong timing constraints, or wrong stimulus. Rule 14 still applies: trust EDA-vendor VIP protocol checkers, but do not automatically treat home-grown models, assertions, or scoreboards as golden. Use the driver trace and waveform to decide whether the source is DUT RTL or testbench RTL.
 
 6. **Spawn a subagent (Rule 4).** Isolate the suspicious block and test it independently. Sometimes the system-level waveform is too complex to debug efficiently.
 

@@ -43,6 +43,8 @@ Once created, a virtual signal behaves like a real signal in:
 
 **Structural trace tools do not support virtual signal names.**  `trace_with_snapshot`, `explain_signal_at_time`, `rank_cone_by_time`, and `explain_edge_cause` require a real signal path. Do not pass a virtual signal name to these tools. The correct workflow is: use virtual signals for *observation*, then trace the *real* signals that contribute to the condition.
 
+**In Root-Cause Analysis, virtual signals are the default optimization for repeated protocol events.**  If you will search the same handshake, error predicate, or burst-complete condition more than once, create it once here instead of repeating the same `find_condition` expression throughout Playbook 04.
+
 ---
 
 ## Expression operator reference

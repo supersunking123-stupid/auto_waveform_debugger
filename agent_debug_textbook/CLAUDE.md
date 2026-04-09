@@ -9,6 +9,7 @@ These instructions apply whenever you are asked to debug, analyze, or investigat
 1. **Read `agent_debug_textbook/00_ROUTER.md`** and identify which playbook applies to your task.
 2. **Open that playbook** and follow it as a numbered procedure from top to bottom. Do not skip steps. Do not substitute source-code reading for a tool call.
 3. **Confirm the `EDA_for_agent` MCP server is available.** If it is not listed in your tools, report this immediately before proceeding.
+4. **For any task that needs structural tracing or RCA, determine the `rtl_trace.db` path before making structural calls.** If local context does not clearly show whether a DB already exists, ask the user. If no DB exists, ask the user for the exact project command or flow used to generate it.
 
 ---
 
@@ -32,6 +33,9 @@ In all other cases: use the tools first. If a tool fails, report the failure (Ru
 ### On guessing
 **NEVER state an assumption as a fact or use "probably" / "likely" as the basis for the next tool call.** If you do not know the value of a signal, query it. If a tool is failing and you cannot recover, report the failure rather than speculating past it.
 
+### On simulation logs
+**NEVER dump an entire simulation log into your context window.** When reviewing `test.log`, `sim.log`, `comp.log`, or similar files, extract only the useful parts with targeted commands such as `head`, `tail`, and `grep`. Pull the failing error message, nearby lines, summary counts, and the final status first; only widen the slice if those do not answer the question.
+
 ---
 
 ## The prescribed debug workflow
@@ -50,12 +54,18 @@ Phase 4: Verify and document (bookmarks, signal groups, causal chain)
 
 This workflow is fully prescribed in `agent_debug_textbook/04_ROOT_CAUSE_ANALYSIS.md`. Use it as a checklist.
 
+Efficiency defaults:
+- If you expect 3+ structural queries on the same DB, use `rtl_trace_serve_start/query/stop`.
+- If you need values for several signals at one time, use `get_snapshot` or `trace_with_snapshot`, not repeated `get_value_at_time`.
+- If a compound event will be queried more than once, create a virtual signal once and reuse it.
+- If a transition stream is long, export it with `dump_waveform_data` before writing a script.
+
 ## When to use supervised mode
 
 If a single-agent debug attempt has failed — the agent drifted from playbooks, made careless tool calls, or reached conclusions based on unverified assumptions — retry with the two-agent **Supervised Debug** architecture described in `agent_debug_textbook/06_SUPERVISED_DEBUG.md`.
 
 Key elements:
-- A **Supervisor** agent reviews every tool call and conclusion before the Debugger advances to the next phase.
+- A **Supervisor** agent reviews each phase or compact batch and the resulting conclusions before the Debugger advances to the next phase.
 - An **error-scenario anchor session** serves as the starting point and backtracking target for every investigation branch.
 - **Python scripts** replace manual inspection of long waveform data sequences (>20 transitions).
-- **Golden boundary rule** (Rule 14): never question VIPs, assertions, or protocol checkers — trace the DUT signals that feed them instead.
+- **Golden boundary rule** (Rule 14): trust EDA-vendor VIP protocol checkers, but do not automatically treat home-grown memory models, BFMs, scoreboards, or assertions as golden.

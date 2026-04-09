@@ -2,7 +2,7 @@
 
 **Role:** Two agents collaborate: a **Debugger** that executes the debug workflow, and a **Supervisor** that enforces playbook compliance, catches errors, and challenges conclusions. This architecture compensates for model weaknesses — carelessness, memory loss, hallucination, and poor reasoning over long data sequences.
 
-**When to use:** The model executing the debug is prone to drifting from playbooks, making tool calls that don't match stated intent, or drawing conclusions from unverified assumptions. If a single-agent debug session has already failed, retry with this two-agent setup.
+**When to use:** The model executing the debug is prone to drifting from playbooks, making tool calls that don't match stated intent, or drawing conclusions from unverified assumptions. If a single-agent debug session has already failed, or the debug is especially high-risk/ambiguous, retry with this two-agent setup. Do not use supervised mode by default for every short, routine debug.
 
 **Prerequisites:** Same as Playbook 04 — a compiled structural database and a waveform file. The Supervisor does not call MCP tools directly; it operates by reviewing the Debugger's actions and steering via structured feedback.
 
@@ -15,14 +15,14 @@
 The Debugger follows Playbooks 01–05 and `rtl_debug_guide.md` exactly as written. It:
 - Executes all MCP tool calls
 - Records observations and summaries after each phase
-- Presents its tool calls, results, and conclusions to the Supervisor for review before moving to the next phase
+- Presents compact batches of planned tool calls, then reports results and conclusions to the Supervisor before moving to the next phase
 - Generates Python scripts when instructed by the Supervisor (or proactively for long data sequences)
 
 ### Supervisor
 
 The Supervisor does **not** call MCP tools. It:
 - Holds the playbook rules in active context and enforces them
-- Reviews every tool call the Debugger proposes: checks that the arguments match the Debugger's stated intent
+- Reviews each proposed phase batch, plus any high-risk individual call: checks that the arguments match the Debugger's stated intent
 - Reviews every summary the Debugger produces: checks that conclusions follow from the actual tool results, not from assumptions
 - Challenges the Debugger with adversarial questions when a conclusion seems unsupported
 - Reviews Python scripts before the Debugger executes them
@@ -33,29 +33,37 @@ The Supervisor does **not** call MCP tools. It:
 
 ## Communication protocol
 
-The agents alternate in a structured exchange. Each phase of the debug workflow (Phase 0–4 from Playbook 04) follows this loop:
+The agents alternate in compact batches. Each phase of the debug workflow (Phase 0–4 from Playbook 04) follows this loop:
 
 ```
 ┌──────────────────────────────────────────────────────┐
 │                    Phase N loop                       │
 │                                                       │
-│  1. Debugger states what it will do and why            │
-│  2. Supervisor reviews the plan against the playbook  │
-│     → approve, correct, or reject                     │
-│  3. Debugger executes tool calls                      │
-│  4. Debugger summarizes results                       │
+│  1. Debugger states the phase goal and proposes the   │
+│     next batch of 1–3 related tool calls              │
+│  2. Supervisor reviews the batch against the          │
+│     playbook → approve, correct, or reject            │
+│  3. Debugger executes the approved batch              │
+│  4. Debugger summarizes verified results only         │
 │  5. Supervisor reviews the summary:                   │
 │     → Do the conclusions follow from the results?     │
-│     → Were any values hallucinated or assumed?         │
-│     → Does the stated intent match the actual call?   │
-│  6. If the Supervisor is satisfied → proceed to       │
-│     Phase N+1                                         │
-│     If not → Debugger must redo the step or explain   │
+│     → Were any values hallucinated or assumed?        │
+│     → Does the stated intent match the actual calls?  │
+│  6. Supervisor either approves another batch in the   │
+│     same phase, approves the phase transition, or     │
+│     blocks and redirects                              │
 │                                                       │
 └──────────────────────────────────────────────────────┘
 ```
 
-**Critical rule:** The Debugger must **never advance to the next phase** without Supervisor approval. The Supervisor must **never approve** a phase transition if there are unresolved contradictions or unverified assumptions in the Debugger's summary.
+**Critical rule:** The Debugger must **never advance to the next phase** without Supervisor approval. Per-call approval is only required in high-risk states (timescale uncertainty, path ambiguity, contradictory results, or golden-boundary ambiguity). Routine cursor/bookmark updates and tightly related read batches should be reviewed at the batch level, not one call at a time.
+
+## Efficiency rules for supervised mode
+
+- Prefer one high-information call over several narrow probes. `trace_with_snapshot`, `get_snapshot`, and `rank_cone_by_time` are better than long sequences of point queries.
+- Use `rtl_trace_serve_start/query/stop` when the phase will need 3+ structural queries on the same DB.
+- Use `create_signal_expression` for reusable handshakes or protocol events instead of repeating the same condition search.
+- Use `dump_waveform_data` plus a short script for long transition streams instead of pasting raw JSON into prompts.
 
 ---
 
@@ -99,30 +107,29 @@ This check enforces Rule 11 (layer-by-layer tracing). If the Debugger descends o
 
 ### Golden-boundary check
 
-> "You are questioning whether the assertion/VIP is correct. Stop. Assertions and VIPs are golden — trace the DUT logic that feeds them instead."
+> "You are questioning whether the vendor VIP is correct. Stop. The VIP is trusted. Trace the immediate driver of the interface signal instead; the source may be DUT RTL or home-grown testbench RTL."
 
-See Rule 14. If the Debugger hypothesizes that a VIP, assertion, or protocol checker is wrong, the Supervisor rejects the hypothesis unless the user has explicitly stated the golden component is suspect.
+See Rule 14. If the Debugger hypothesizes that an EDA-vendor VIP or protocol checker is wrong, the Supervisor rejects the hypothesis unless the user has explicitly stated that the VIP configuration or connection is suspect.
 
 ---
 
 ## Golden boundary rule (Rule 14)
 
-Certain components are **golden** — trusted by default unless the user explicitly says otherwise:
+Only **EDA-vendor protocol VIP monitors/checkers** are golden by default. Do not extend that trust automatically to the rest of the testbench.
 
-| Component | Why it is golden |
-|---|---|
-| **Verification IP (VIPs)** | Protocol monitors from commercial or mature open-source VIP libraries have been validated across thousands of designs |
-| **Assertions and protocol checkers** | Written by the verification team to define correct behavior; if they fire, the DUT is wrong, not the assertion |
-| **Testbench stimulus generators** | The stimulus defines the test intent; a "wrong stimulus" is a different test, not a DUT bug |
-| **Reference models** | Used as the golden standard for comparison; discrepancies indicate DUT errors |
-| **Scoreboards and checkers** | Define the expected relationship between inputs and outputs |
+| Component | Trust level | Supervisor stance |
+|---|---|---|
+| **EDA-vendor VIP monitors / protocol checkers** | Golden | Trust the checker; trace the flagged interface signal's immediate driver |
+| **Home-grown memory models / BFMs / wrappers** | Not golden | May be the real source of the bad value; investigate them if they drive it |
+| **Home-grown assertions / scoreboards / reference models** | Evidence, not proof | Cross-check with waveform + structural trace before treating them as authoritative |
+| **Stimulus generators** | Inputs, not golden | They may be wrong; require evidence before concluding that they are |
 
 **How to apply:**
 
-- **Never hypothesize** that a golden component is buggy unless the user says "the testbench may be wrong" or "check the VIP configuration."
-- **Trace inward** from the golden boundary. If a VIP flags a protocol violation, the DUT signal feeding the VIP is wrong — not the VIP's checker logic.
-- When an assertion fires, the assertion's condition is the **starting point** for backward tracing, not a suspect to be debugged.
-- If the Debugger starts questioning golden components, the Supervisor must redirect: "The VIP is golden. Instead of questioning RLAST assertion logic, trace what DUT signal drives RLAST and why it has the wrong value."
+- **Never hypothesize** that an EDA-vendor VIP checker is buggy unless the user says to check the VIP configuration or connection.
+- **Trace the immediate driver of the flagged interface signal first.** Do not assume the source is the DUT until the driver trace proves it.
+- When a **home-grown assertion/checker** fires, use it as a clue to choose what to observe next. Do not treat it as proof until the waveform supports it.
+- If the Debugger starts treating a home-grown memory model or BFM as "golden," the Supervisor must redirect: "The VIP may be golden, but this model is not. Trace the model's driver chain."
 
 ---
 
@@ -269,7 +276,7 @@ Quick reference for the Supervisor's most common interventions:
 | Debugger's tool call arguments don't match stated intent | Block the call, point out the mismatch, ask for correction |
 | Debugger's summary contains a value not returned by any tool | Flag as hallucination, require the Debugger to query the signal |
 | Debugger concludes root cause but hasn't checked all RHS drivers | Block conclusion, list unchecked drivers, require verification |
-| Debugger questions a VIP, assertion, or checker | Redirect: "Golden component. Trace the DUT signal that feeds it instead." |
+| Debugger questions an EDA-vendor VIP, or treats a home-grown model as golden | Redirect: "Trust the vendor VIP. Trace the immediate driver of the flagged signal; the source may be DUT RTL or home-grown testbench RTL." |
 | Debugger is processing >20 transitions by inspection | Instruct: "Write a Python script to process this data. I will review it." |
 | Debugger is stuck after two attempts on the same branch | Instruct: "Return to error_scenario session. Pick a different signal to trace." |
 | Debugger's conclusion doesn't explain the error-scenario snapshot | Block conclusion: "Your root cause must explain why <signal> was <value> at the error point. It currently doesn't." |
@@ -290,8 +297,8 @@ The user's session acts as the Supervisor. It spawns the Debugger as a subagent:
 Agent(
     prompt="""You are the Debugger agent. Follow the debug workflow in
     agent_debug_textbook/04_ROOT_CAUSE_ANALYSIS.md exactly. After each phase,
-    report your tool calls, results, and conclusions back to me for review.
-    Do not advance to the next phase until I approve.
+    report each phase or compact batch of tool calls, results, and conclusions
+    back to me for review. Do not advance to the next phase until I approve.
 
     The failure is: <error message>
     Waveform: <path>
@@ -301,7 +308,7 @@ Agent(
 )
 ```
 
-The Supervisor (outer agent) reviews each response and sends corrections or approval via `SendMessage`.
+The Supervisor (outer agent) reviews each batch/phase response and sends corrections or approval via `SendMessage`.
 
 ### Option B — Debugger spawns Supervisor for review
 
@@ -312,7 +319,8 @@ Agent(
     prompt="""You are the Supervisor. Review the following debug phase output.
     Check: (1) do tool call arguments match stated intent? (2) are all claimed
     values backed by tool results? (3) does the conclusion follow logically?
-    (4) are golden components being questioned? (5) were all RHS drivers checked?
+    (4) is a vendor VIP being questioned, or is a home-grown model being treated
+    as golden? (5) were all RHS drivers checked?
 
     Playbook rules: <paste relevant rules>
 
@@ -335,7 +343,7 @@ SELF-REVIEW CHECKPOINT — Phase N complete
 □ Is every factual claim backed by a tool result I can point to?
 □ Does my conclusion follow from the observations without unstated assumptions?
 □ Did I check all RHS drivers, not just the first suspicious one?
-□ Am I questioning any golden component? If so, stop.
+□ Am I questioning a vendor VIP, or treating a home-grown model as golden? If so, stop.
 □ Can I explain the error-scenario snapshot with my current theory?
 ```
 
@@ -343,7 +351,7 @@ SELF-REVIEW CHECKPOINT — Phase N complete
 
 ## Tips
 
-- **The Supervisor is cheap.** It makes no tool calls, so its cost is minimal. The value of catching one careless error (wrong `mode`, wrong signal path) easily exceeds the overhead of the review loop.
+- **Use supervised mode selectively.** It reduces false starts, but it adds review latency. Prefer it after a failed single-agent pass or when the session is large, ambiguous, or high-risk.
 - **Keep Supervisor prompts short and rule-based.** The Supervisor's effectiveness comes from mechanical checks, not from being a better debugger. A checklist is more reliable than open-ended reasoning.
 - **The error-scenario session is non-negotiable.** Every investigation branch must start from and reconnect to the error scenario. If the Debugger cannot explain the error snapshot, the investigation is incomplete.
 - **Python scripts are for data processing, not for tool calls.** The script processes data already returned by MCP tools. It does not replace the tools — it supplements them for tasks where humans would use a spreadsheet or a short script.

@@ -4,7 +4,7 @@
 
 **When to use:** A failure, assertion, or unexpected behavior has been observed, and you need to trace it back to its origin. This is the most complex playbook and prescribes a specific multi-phase workflow.
 
-**Prerequisites:** A compiled structural database and a waveform file must both be available. If not, compile first (see Playbook 02).
+**Prerequisites:** A compiled structural database and a waveform file must both be available. Before starting, determine whether a usable `rtl_trace.db` already exists and what path to use. If local context does not make that clear, ask the user. If no DB exists, ask the user for the exact command or flow used in this project to generate it rather than guessing compile flags. See Playbook 02.
 
 ---
 
@@ -12,20 +12,32 @@
 
 This playbook draws from all other playbooks. The tools are organized by the phase in which you use them.
 
-**Phase 1 — Observe the symptom:**
-`get_value_at_time`, `get_snapshot`, `find_edge`, `get_transitions`, `find_condition`
+**Phase 1 — Observe and anchor the failure:**
+`get_signal_info`, `create_session`, `switch_session`, `set_cursor`, `create_bookmark`, `get_snapshot`, `create_signal_group`, `find_edge`, `get_transitions`, `find_condition`
 
 **Phase 2 — Identify suspects:**
-`rank_cone_by_time`, `trace_with_snapshot`
+`rank_cone_by_time`, `trace_with_snapshot`, `rtl_trace` (trace), `get_snapshot`
 
 **Phase 3 — Explain causation:**
-`explain_signal_at_time`, `explain_edge_cause`
+`explain_signal_at_time`, `explain_edge_cause`, `rtl_trace_serve_start/query/stop`
 
-**Phase 4 — Trace deeper (if needed):**
-`rtl_trace` (trace, find, hier), `get_signal_overview`, `find_value_intervals`
+**Phase 4 — Verify and document:**
+`rtl_trace` (trace, find, hier, whereis-instance), `get_signal_overview`, `find_value_intervals`, `dump_waveform_data`
 
 **Throughout — Workspace management:**
-`set_cursor`, `create_bookmark`, `create_signal_group`
+`create_session`, `switch_session`, `set_cursor`, `create_bookmark`, `create_signal_group`
+
+**Optional efficiency chain:**
+`create_signal_expression`, `update_signal_expression`, `delete_signal_expression`, `list_signal_expressions`
+
+## Efficiency defaults
+
+Use these defaults unless you have a specific reason not to:
+
+- If you expect 3+ structural queries on the same DB, start `rtl_trace_serve_start` early and reuse it through the phase instead of paying one-shot startup cost repeatedly.
+- If you need values for multiple signals at one time, use `get_snapshot` or `trace_with_snapshot`; do not loop over `get_value_at_time`.
+- If a compound protocol event or handshake will be queried more than once, create a virtual signal once instead of repeating the same `find_condition` expression.
+- If a transition stream is too long to inspect comfortably in MCP output, export it with `dump_waveform_data` and analyze the file with a short script.
 
 ---
 
@@ -35,10 +47,21 @@ This playbook draws from all other playbooks. The tools are organized by the pha
 
 **Goal:** Establish the facts. What is wrong, where, and when?
 
+**Phase 1 watchlist** — verify before each step:
+- **Structural DB preflight:** Before the first structural call, confirm the `rtl_trace.db` path you will use. If that is unknown, stop and ask the user instead of guessing.
+- **Rule 12:** Call `get_signal_info` before any time argument — wrong units silently return empty or incorrect results (1ns/1ps precision means 100 ns → pass `100000`, not `100`).
+- **Rule 9:** Normalize before comparing waveform values to logs or VIP messages — ARLEN is 0-based on the waveform (VIP `LENGTH` is 1-based); verify radix and byte vs. word addresses.
+- **Rule 13:** Two consecutive empty or contradictory results → stop and diagnose (time unit? wrong signal path?) before making another call.
+- **Rule 14:** EDA-vendor VIP protocol monitors/checkers are golden. Home-grown BFMs, memory models, monitors, scoreboards, and assertions are evidence sources, not automatically golden. Never question the vendor VIP/checker itself; trace the signal path that reached it and identify who drives it.
+
 ```
 1.1  Identify the failing signal and the time of failure.
      If given an assertion failure or error message, extract the signal name and time.
      If given a vague description, use find_condition or find_value_intervals to locate it.
+     If the failure description comes from a simulation log, do not dump the full
+     log into context. Use targeted extraction (`grep`, `head`, `tail`, and small
+     surrounding slices) to capture the failing message, nearby context, and final
+     run status first.
 
 1.2  Create the error-scenario anchor session — this is your home base for the
      entire debug. Every investigation branch starts here and must ultimately
@@ -49,22 +72,42 @@ This playbook draws from all other playbooks. The tools are organized by the pha
      → create_bookmark(bookmark_name="error_point", time=T_fail,
                         description="<failure desc + time precision note>")
 
-1.3  Take a snapshot of the failing signal and ALL signals mentioned in the
+1.3  Trace the structural driver chain of the failing signal BEFORE waveform
+     browsing. This one call tells you whether the failing signal is driven by
+     DUT logic or testbench logic — which determines the entire direction of
+     the investigation.
+
+     → rtl_trace(args=["trace", "--db", "rtl_trace.db", "--mode", "drivers",
+                        "--signal", failing_signal, "--format", "json"])
+
+     Read the result before continuing:
+     - Driver is DUT RTL → proceed into the DUT in Phase 2.
+     - Driver is testbench RTL → the investigation shifts to the testbench.
+       Apply Phase 2–3 to the testbench driver chain, not the DUT.
+
+     If you already expect 3+ structural queries on the same DB in this debug,
+     start serve mode now and reuse it through Phases 2–4:
+     → rtl_trace_serve_start(serve_args=["--db", "rtl_trace.db"])
+
+1.4  Take a snapshot of the failing signal and ALL signals mentioned in the
      error message:
      → get_snapshot(signals=[failing_signal, related_signals...], time="Cursor")
      → create_signal_group(group_name="error_interface",
                             signals=[...the signals just snapshotted...])
 
-1.4  Check recent activity around the failure:
+1.5  Check recent activity around the failure:
      → get_transitions(path=failing_signal, start_time=T_fail-window, end_time=T_fail)
      → find_edge(path=failing_signal, edge_type="anyedge", start_time=T_fail, direction="backward")
 
-1.5  Understand how the waveform correlates with the error message BEFORE
+1.6  Understand how the waveform correlates with the error message BEFORE
      moving on. For each signal in the error message, explain how its waveform
      value at T_fail produced the specific error text. If you cannot explain the
-     correlation, you are not ready for Phase 2.
+     correlation, you are not ready for Phase 2. If the correlation depends on a
+     repeated compound event (for example a handshake or burst-complete pulse),
+     create a virtual signal once and browse that signal instead of repeating the
+     same `find_condition` expression.
 
-1.6  Record your observations. The error-scenario snapshot is the contract:
+1.7  Record your observations. The error-scenario snapshot is the contract:
      your final root cause must explain every value in it.
 ```
 
@@ -75,6 +118,11 @@ This playbook draws from all other playbooks. The tools are organized by the pha
 ### Phase 2 — Identify suspects
 
 **Goal:** Narrow down which signals in the driver cone are most likely responsible.
+
+**Phase 2 watchlist** — verify before each step:
+- **Rule 3:** If a FIFO, CDC synchronizer, or arbiter is in the suspect cone, check pointer/flag values explicitly — their failures are deferred and non-local, and waveform tools alone may not surface them.
+- **Rule 4:** If you have made >10 calls on a single block's internal signals without a concrete root cause, stop and escalate to a local testbench (see `EDA_USE.md`).
+- **Rule 11:** Do not stop at the first wrong signal — every wrong driver must be traced to its own root cause before declaring a conclusion.
 
 ```
 2.1  Rank the driver cone by transition recency:
@@ -102,6 +150,27 @@ This playbook draws from all other playbooks. The tools are organized by the pha
            clock_path="top.clk",
            cycle_offsets=[-3, -2, -1, 0]
        )
+
+2.5  If the prime suspect is still unclear, navigate the driver cone with iterative
+     structural tracing — but batch the waveform reads:
+
+     1. Use `rtl_trace trace --mode drivers` (or `rtl_trace_serve_query` if serve
+        mode is active) on the suspect signal to get a bounded driver list
+     2. Sample those drivers in one batch:
+        - `trace_with_snapshot(...)` if you want cone + values together, or
+        - `get_snapshot(signals=[driver1, driver2, ...], time=T_fail)` if you
+          already have the exact driver list
+     3. Recurse only on drivers whose values are wrong or whose transitions are
+        closest to the failure
+     4. On the deepest wrong signal, call `get_transitions` or
+        `dump_waveform_data` over a wide range to inspect its history in one place
+
+     ⚠ Anti-pattern: do not call `get_value_at_time` once per driver or query each
+     pipeline stage individually to build a manual "value map". That approach
+     turns one hypothesis into N waveform calls, misses structural relationships,
+     and does not scale. If you have made more than ~5 waveform queries on a
+     signal without a structural trace guiding them, stop and switch to iterative
+     structural tracing with batched reads.
 ```
 
 **Output of Phase 2:** You have a short list of suspect signals and can see their values leading up to the failure.
@@ -111,6 +180,12 @@ This playbook draws from all other playbooks. The tools are organized by the pha
 ### Phase 3 — Explain causation layer by layer
 
 **Goal:** Build a complete causal chain from symptom to root cause by descending the driver cone one level at a time. **Do not stop as soon as you find a signal that looks wrong. Every wrong signal must be traced further until you reach an actual root cause.**
+
+**Phase 3 watchlist** — verify before each step:
+- **Rule 11:** Trace EVERY wrong branch to a stop criterion. A state machine in an unexpected state is not a root cause — ask why it entered that state and keep tracing.
+- **Rule 5:** Each step must answer "why does this signal have this value?" not "what is this signal's value?" — distinguish observation (symptom) from explanation (cause).
+- **Rule 4:** The >10 calls escalation trigger still applies. If a block remains opaque after 10 calls in Phase 3, spawn a local test rather than continuing passive observation.
+- **Rule 13:** Contradictory driver values (same signal, two different values) → path mismatch or timescale error. Stop and verify before continuing.
 
 ```
 3.1  For the top suspect, explain the causal chain:
@@ -154,7 +229,7 @@ This playbook draws from all other playbooks. The tools are organized by the pha
 
 **Common mistake:** Finding that `signal B is 0 when it should be 1` and immediately concluding "the logic driving B is the bug — let me fix it." B's driver may itself be driven by a wrong signal. Check B's drivers before touching any code.
 
-**When data sequences are long (>20 transitions):** Do not try to reason over raw JSON output mentally. Write a short Python script to process the data — iterate transitions, compare expected vs. actual, flag anomalies. See `06_SUPERVISED_DEBUG.md` for the script structure and review protocol. This prevents miscounting, value confusion, and missed patterns.
+**When data sequences are long (>20 transitions):** Do not try to reason over raw JSON output mentally. First export the transition stream with `dump_waveform_data(..., output_path=...)`, then write a short Python script to process the file — iterate transitions, compare expected vs. actual, flag anomalies. See `06_SUPERVISED_DEBUG.md` for the script structure and review protocol. This prevents miscounting, value confusion, and prompt bloat from pasting large JSON blobs into the conversation.
 
 **Backtracking to the error-scenario anchor:** If a branch terminates at a correct signal (dead end), return to the error-scenario session and pick a different signal from the `error_interface` group to trace:
 ```
@@ -170,6 +245,10 @@ get_snapshot(signals=["error_interface"], signals_are_groups=True, time="BM_erro
 ### Phase 4 — Verify and explore (if needed)
 
 **Goal:** Confirm the root cause and understand the broader context.
+
+**Phase 4 watchlist** — verify before concluding:
+- **Completeness check:** Does your root cause explain every signal value in the Phase 1 error-scenario snapshot? If not, the investigation is incomplete — return to Phase 2 with the unexplained signal.
+- **Rule 7:** Trust the waveform over your mental model. If the evidence contradicts your expectation of how the design should behave, the expectation is wrong.
 
 ```
 4.1  If the root cause involves an unexpected state, check how the design got there:
@@ -243,5 +322,5 @@ Phase 4:
 - **The debug loop is iterative.** Phase 3 often reveals a deeper cause that sends you back to Phase 2 with a new target signal. This is normal.
 - **Stop when you reach a primary input or testbench stimulus.** That is the boundary of RTL responsibility.
 - **Window sizing:** When using `rank_cone_by_time`, start with a window of 5–10 clock cycles before the failure. Too wide a window dilutes the ranking; too narrow might miss the cause.
-- **Golden boundary (Rule 14):** VIPs, assertions, and protocol checkers are golden — never question their correctness. If an assertion fires, the DUT is wrong. Trace the DUT signals that triggered the assertion, not the assertion logic itself.
+- **Golden boundary (Rule 14):** Trust EDA-vendor VIP protocol checkers. Do not automatically treat home-grown assertions, scoreboards, memory models, or BFMs as golden. Trace the immediate driver of the flagged signal before deciding whether the source is DUT RTL or testbench RTL.
 - **Error-scenario anchor:** Your final conclusion must explain every value in the Phase 1 error-scenario snapshot. If it doesn't, the investigation is incomplete.
