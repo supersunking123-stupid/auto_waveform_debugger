@@ -20,7 +20,7 @@ Commit `494b78b` — no mimalloc, no string_view interning, no symbol path cache
 Note: the commit message claimed 46s wall time with 4.6 GB peak RSS. That benchmark was run
 without `--low-mem` (confirmed by back-to-back comparison). The commit message was misleading.
 
-## 677b77d + uncommitted — allocation elimination round
+## 8b04bc0 — allocation elimination round
 
 Changes on top of c2435ac: `from_chars` integer parsing, `string_view` SymbolPathLess,
 `MergeEndpointBitRangesInPlace` fast path, clock/reset name detection without allocation,
@@ -38,8 +38,8 @@ sort+unique skip for small vectors, explicit move semantics.
 | Baseline (494b78b) | no | 87.6s | 142s | 5.5 GB |
 | c2435ac | no | 29.2s | 44.1s | 5.35 GB |
 | c2435ac | yes | 58.8s | 1:16 | 4.35 GB |
-| New optimizations | **no** | **25.2s** | **39.4s** | 5.37 GB |
-| New optimizations | yes | 51.4s | 1:06 | 4.35 GB |
+| 8b04bc0 | **no** | **25.2s** | **39.4s** | 5.37 GB |
+| 8b04bc0 | yes | 51.4s | 1:06 | 4.35 GB |
 
 **Conclusion**: `--low-mem` is a net performance loss when ≥10 GB RAM is available.
 The full cache avoids ~25s of redundant AST re-traversal. Omit `--low-mem` unless
