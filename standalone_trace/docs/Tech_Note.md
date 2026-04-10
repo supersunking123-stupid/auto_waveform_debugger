@@ -262,6 +262,31 @@ To handle large designs like NVDLA within a reasonable memory envelope, several 
 6. **Bounded Cache Growth (`--low-mem`)**: Introduced an optional `--low-mem` flag that periodically flushes the `TraceCompileCache` when cross-module boundaries are detected. This bounds memory at the cost of some wall-time performance (due to AST re-evaluation).
 7. **Persisted Assignment-LHS Reverse Index**: Added a third compact reverse-reference table keyed by inferred assignment-LHS path. This removes the worst-case cold-query cost for interface-member `drivers` traces in standalone CLI mode, because the runtime no longer needs to scan every materialized `loads` endpoint to reconstruct that mapping.
 
+## Compile Performance Tuning
+
+The `--low-mem` flag bounds cache growth by flushing `TraceCompileCache` every 200 instance bodies. This trades AST re-traversal cost for lower peak RSS. Whether it is a net win depends on available RAM:
+
+**NVDLA benchmark (1M signals, 4.3M endpoints, 15 GB RAM machine):**
+
+| Config | Build Graph | Wall Time | Peak RSS |
+|---|---|---|---|
+| Without `--low-mem` | **28.7s** | **44.8s** | 5.37 GB |
+| With `--low-mem` | 51.4s | 1:06 | **4.35 GB** |
+
+Recommendation: omit `--low-mem` when the machine has ≥10 GB free RAM. The full cache avoids ~23s of redundant AST re-traversal and cuts build_graph time nearly in half.
+
+### Allocation-reduction optimizations (applied to the compile hot loop)
+
+- **`string_view`-keyed `InternString`**: Index maps `string_view → uint32_t` instead of `std::string → uint32_t`, pointing directly into the string pool. Eliminates one string copy per intern.
+- **Symbol* → path_id reverse index**: Pre-builds a `Symbol* → uint32_t` map from already-collected signal paths. `ResolveTraceResult` skips `getHierarchicalPath()` for known symbols.
+- **`SymbolPathLess`**: Compares `getHierarchicalPath()` string_views directly instead of materializing two `std::string` temporaries per sort comparison.
+- **`std::from_chars` for integer parsing**: `ParseExactBitMapText` and `TryParseSimpleInt` use `from_chars` on `string_view` instead of allocating a `std::string` and calling `std::stoll` with try/catch.
+- **Clock/reset name detection**: `LooksLikeClockOrResetName` and `ClassifyGlobalNetCategory` use `string_view`-based case-insensitive comparison instead of allocating and lowering a `std::string`.
+- **`MergeEndpointBitRangesInPlace` fast path**: Pre-scans endpoints and returns immediately when none have mergeable bit ranges, avoiding vector allocation and hash map operations for the common case.
+- **Move semantics**: `BuildSignalRecord` uses `std::move()` on `push_back(ResolveTraceResult(...))`.
+- **Sort+unique skip**: `ResolveTraceResult` skips sort+unique on `lhs_signals`/`rhs_signals` when the vector has ≤1 elements (avoids 8.6M function calls across 4.3M endpoints).
+- **mimalloc**: Enabled via `SLANG_USE_MIMALLOC ON` to reduce malloc/free overhead and heap fragmentation.
+
 ## Where to start if you need to change behavior
 
 - Change compile-time connectivity extraction:

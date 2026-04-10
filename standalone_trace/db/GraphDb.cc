@@ -28,6 +28,7 @@
 #include "slang/text/SourceManager.h"
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <cctype>
 #include <cstdint>
@@ -179,7 +180,7 @@ bool IsTraceable(const slang::ast::Symbol *sym) {
 
 bool SymbolPathLess(const slang::ast::Symbol *lhs, const slang::ast::Symbol *rhs) {
   if (lhs == rhs) return false;
-  return std::string(lhs->getHierarchicalPath()) < std::string(rhs->getHierarchicalPath());
+  return lhs->getHierarchicalPath() < rhs->getHierarchicalPath();
 }
 
 std::vector<std::string> MaterializeSignalPaths(const SymbolRefList &signals) {
@@ -592,12 +593,12 @@ SignalRecord BuildSignalRecord(const slang::ast::Symbol *sym, const slang::Sourc
   std::unordered_set<const slang::ast::Symbol *> visited_drivers;
   visited_drivers.insert(sym);
   for (const TraceResult &r : ComputeIndexedTraceResults</*DRIVERS*/ true>(sym, cache, visited_drivers))
-    rec.drivers.push_back(ResolveTraceResult(r, sm, true, &cache, symbol_path_ids));
+    rec.drivers.push_back(std::move(ResolveTraceResult(r, sm, true, &cache, symbol_path_ids)));
 
   std::unordered_set<const slang::ast::Symbol *> visited_loads;
   visited_loads.insert(sym);
   for (const TraceResult &r : ComputeIndexedTraceResults</*DRIVERS*/ false>(sym, cache, visited_loads))
-    rec.loads.push_back(ResolveTraceResult(r, sm, false, &cache, symbol_path_ids));
+    rec.loads.push_back(std::move(ResolveTraceResult(r, sm, false, &cache, symbol_path_ids)));
 
   return rec;
 }
@@ -715,17 +716,20 @@ std::vector<std::string> SplitJoinedField(const std::string &field) {
 
 std::optional<std::pair<int32_t, int32_t>> ParseExactBitMapText(std::string_view bit_map) {
   if (bit_map.size() < 3 || bit_map.front() != '[' || bit_map.back() != ']') return std::nullopt;
-  std::string inside(bit_map.substr(1, bit_map.size() - 2));
+  const std::string_view inside = bit_map.substr(1, bit_map.size() - 2);
   const size_t colon = inside.find(':');
-  try {
-    if (colon == std::string::npos) {
-      const int32_t v = static_cast<int32_t>(std::stoll(inside));
-      return std::make_pair(v, v);
-    }
-    const int32_t l = static_cast<int32_t>(std::stoll(inside.substr(0, colon)));
-    const int32_t r = static_cast<int32_t>(std::stoll(inside.substr(colon + 1)));
-    return std::make_pair(l, r);
-  } catch (...) { return std::nullopt; }
+  if (colon == std::string::npos) {
+    int32_t v = 0;
+    auto [ptr, ec] = std::from_chars(inside.data(), inside.data() + inside.size(), v);
+    if (ec != std::errc()) return std::nullopt;
+    return std::make_pair(v, v);
+  }
+  int32_t l = 0, r = 0;
+  auto [ptr1, ec1] = std::from_chars(inside.data(), inside.data() + colon, l);
+  if (ec1 != std::errc()) return std::nullopt;
+  auto [ptr2, ec2] = std::from_chars(inside.data() + colon + 1, inside.data() + inside.size(), r);
+  if (ec2 != std::errc()) return std::nullopt;
+  return std::make_pair(l, r);
 }
 
 std::string FormatBitRange(int32_t hi, int32_t lo) {
@@ -773,6 +777,16 @@ EndpointKeyView MakeEndpointKeyView(const EndpointRecord &e) {
 using EndpointMergeGroups = slang::flat_hash_map<EndpointKeyView, std::vector<std::pair<std::pair<int32_t, int32_t>, EndpointRecord>>, EndpointKeyHash>;
 
 void MergeEndpointBitRangesInPlace(std::vector<EndpointRecord>& endpoints, EndpointMergeGroups& groups) {
+  // Fast path: skip entirely when no endpoints have mergeable bit maps
+  bool has_mergeable = false;
+  for (const EndpointRecord &e : endpoints) {
+    if (!e.bit_map.empty() && !e.bit_map_approximate) {
+      has_mergeable = true;
+      break;
+    }
+  }
+  if (!has_mergeable) return;
+
   groups.clear();
   std::vector<EndpointRecord> out;
   out.reserve(endpoints.size());
@@ -819,24 +833,44 @@ void MergeEndpointBitRangesInPlace(std::vector<EndpointRecord>& endpoints, Endpo
 
 constexpr size_t kCompactGlobalNetThreshold = 1024;
 
+static bool CaseInsensitiveContains(std::string_view haystack, std::string_view needle) {
+  if (needle.size() > haystack.size()) return false;
+  for (size_t i = 0; i <= haystack.size() - needle.size(); ++i) {
+    bool match = true;
+    for (size_t j = 0; j < needle.size(); ++j) {
+      if (std::tolower(static_cast<unsigned char>(haystack[i + j])) != needle[j]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) return true;
+  }
+  return false;
+}
+
+static bool CaseInsensitiveEquals(std::string_view a, std::string_view b) {
+  if (a.size() != b.size()) return false;
+  for (size_t i = 0; i < a.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(a[i])) != b[i]) return false;
+  }
+  return true;
+}
+
 bool LooksLikeClockOrResetName(std::string_view path) {
-  std::string leaf = std::string(LeafName(path));
-  for (char &c : leaf)
-    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  if (leaf == "clk" || leaf == "clock" || leaf == "rst" || leaf == "reset" || leaf == "rst_n" ||
-      leaf == "reset_n" || leaf == "resetn" || leaf == "rstn")
+  const std::string_view leaf = LeafName(path);
+  if (CaseInsensitiveEquals(leaf, "clk") || CaseInsensitiveEquals(leaf, "clock") ||
+      CaseInsensitiveEquals(leaf, "rst") || CaseInsensitiveEquals(leaf, "reset") ||
+      CaseInsensitiveEquals(leaf, "rst_n") || CaseInsensitiveEquals(leaf, "reset_n") ||
+      CaseInsensitiveEquals(leaf, "resetn") || CaseInsensitiveEquals(leaf, "rstn"))
     return true;
-  return leaf.find("clk") != std::string::npos || leaf.find("clock") != std::string::npos ||
-         leaf.find("rst") != std::string::npos || leaf.find("reset") != std::string::npos;
+  return CaseInsensitiveContains(leaf, "clk") || CaseInsensitiveContains(leaf, "clock") ||
+         CaseInsensitiveContains(leaf, "rst") || CaseInsensitiveContains(leaf, "reset");
 }
 
 std::string ClassifyGlobalNetCategory(std::string_view path) {
-  std::string leaf = std::string(LeafName(path));
-  for (char &c : leaf)
-    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-  if (leaf.find("rst") != std::string::npos || leaf.find("reset") != std::string::npos) {
+  const std::string_view leaf = LeafName(path);
+  if (CaseInsensitiveContains(leaf, "rst") || CaseInsensitiveContains(leaf, "reset"))
     return "reset";
-  }
   return "clock";
 }
 
@@ -861,26 +895,17 @@ std::vector<std::string> ExtractCompactSinkPaths(const std::string &source,
 }
 
 bool TryParseSimpleInt(std::string_view s, int64_t &out) {
-  std::string t;
-  for (char c : s) {
-    if (!std::isspace(static_cast<unsigned char>(c))) t.push_back(c);
-  }
-  if (t.empty()) return false;
-  size_t idx = 0;
-  bool neg = false;
-  if (t[0] == '-') {
-    neg = true;
-    idx = 1;
-  }
-  if (idx >= t.size()) return false;
-  for (size_t i = idx; i < t.size(); ++i) {
-    if (!std::isdigit(static_cast<unsigned char>(t[i]))) return false;
-  }
-  try {
-    long long v = std::stoll(t);
-    out = static_cast<int64_t>(v);
-    return true;
-  } catch (...) { return false; }
+  // Skip leading whitespace
+  size_t start = 0;
+  while (start < s.size() && std::isspace(static_cast<unsigned char>(s[start])))
+    ++start;
+  // Skip trailing whitespace
+  size_t end = s.size();
+  while (end > start && std::isspace(static_cast<unsigned char>(s[end - 1])))
+    --end;
+  if (start >= end) return false;
+  auto [ptr, ec] = std::from_chars(s.data() + start, s.data() + end, out);
+  return ec == std::errc() && ptr == s.data() + end;
 }
 
 std::pair<std::string, bool> DescribeBitSelectors(
@@ -1115,12 +1140,16 @@ EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManag
               }
             }
           }
-          std::sort(rec.lhs_signals.begin(), rec.lhs_signals.end());
-          rec.lhs_signals.erase(std::unique(rec.lhs_signals.begin(), rec.lhs_signals.end()),
-                                rec.lhs_signals.end());
-          std::sort(rec.rhs_signals.begin(), rec.rhs_signals.end());
-          rec.rhs_signals.erase(std::unique(rec.rhs_signals.begin(), rec.rhs_signals.end()),
-                                rec.rhs_signals.end());
+          if (rec.lhs_signals.size() > 1) {
+            std::sort(rec.lhs_signals.begin(), rec.lhs_signals.end());
+            rec.lhs_signals.erase(std::unique(rec.lhs_signals.begin(), rec.lhs_signals.end()),
+                                  rec.lhs_signals.end());
+          }
+          if (rec.rhs_signals.size() > 1) {
+            std::sort(rec.rhs_signals.begin(), rec.rhs_signals.end());
+            rec.rhs_signals.erase(std::unique(rec.rhs_signals.begin(), rec.rhs_signals.end()),
+                                  rec.rhs_signals.end());
+          }
         }
       },
       r);
