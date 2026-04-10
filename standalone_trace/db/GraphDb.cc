@@ -777,6 +777,7 @@ EndpointKeyView MakeEndpointKeyView(const EndpointRecord &e) {
 using EndpointMergeGroups = slang::flat_hash_map<EndpointKeyView, std::vector<std::pair<std::pair<int32_t, int32_t>, EndpointRecord>>, EndpointKeyHash>;
 
 void MergeEndpointBitRangesInPlace(std::vector<EndpointRecord>& endpoints, EndpointMergeGroups& groups) {
+  groups.clear();
   // Fast path: skip entirely when no endpoints have mergeable bit maps
   bool has_mergeable = false;
   for (const EndpointRecord &e : endpoints) {
@@ -786,8 +787,6 @@ void MergeEndpointBitRangesInPlace(std::vector<EndpointRecord>& endpoints, Endpo
     }
   }
   if (!has_mergeable) return;
-
-  groups.clear();
   std::vector<EndpointRecord> out;
   out.reserve(endpoints.size());
   for (EndpointRecord &e : endpoints) {
