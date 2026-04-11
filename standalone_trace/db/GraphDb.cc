@@ -29,10 +29,12 @@
 #include "slang/text/SourceManager.h"
 
 #include <algorithm>
+#include <cassert>
 #include <charconv>
 #include <chrono>
 #include <cctype>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <filesystem>
@@ -603,7 +605,7 @@ std::vector<TraceResult> ComputeIndexedTraceResults(
   if (it == entries.end()) return {};
 
   std::vector<TraceResult> out;
-  out.reserve(it->second.size());
+  out.reserve(out.size() + it->second.size());
   for (const TraceResult &entry : it->second) {
     if (const auto *port = std::get_if<const slang::ast::PortSymbol *>(&entry)) {
       bool followed = false;
@@ -1174,6 +1176,23 @@ void InsertSortedUniqueString(std::vector<std::string> &paths, std::string value
   paths.insert(it, std::move(value));
 }
 
+#ifndef NDEBUG
+bool AreSortedUniqueSignalIdsByPath(const std::vector<uint32_t> &signal_ids, const GraphDb &graph) {
+  for (size_t i = 1; i < signal_ids.size(); ++i) {
+    const std::string &prev = GraphString(graph, signal_ids[i - 1]);
+    const std::string &cur = GraphString(graph, signal_ids[i]);
+    if (!(prev < cur)) return false;
+  }
+  return true;
+}
+
+template <typename T>
+bool AreSortedUniqueValues(const std::vector<T> &values) {
+  return std::adjacent_find(values.begin(), values.end(),
+                            [](const T &lhs, const T &rhs) { return !(lhs < rhs); }) == values.end();
+}
+#endif
+
 EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManager &sm, bool drivers_mode,
                                   TraceCompileCache *cache,
                                   const slang::flat_hash_map<const slang::ast::Symbol *, uint32_t> *symbol_path_ids) {
@@ -1227,6 +1246,9 @@ EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManag
               MaterializeSignalRefs(CollectRhsSignals(item.assignment), symbol_path_ids,
                                     rec.rhs_signal_ids, rec.rhs_signals);
             }
+            // The graph DB stores source offsets, not raw assignment text. When exact
+            // LHS refs are already available, keep only the offsets here and let query
+            // paths reconstruct the text on demand via MaterializeAssignmentTexts().
             if (!rec.has_assignment_range ||
                 (rec.lhs_signal_ids.empty() && rec.lhs_signals.empty())) {
               rec.assignment_text = GetSourceText(item.assignment->sourceRange, sm);
@@ -1531,6 +1553,15 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
        << std::chrono::duration<double>(end - start).count();
     return os.str();
   };
+  auto fmt_duration = [](double seconds) {
+    std::ostringstream os;
+    os << std::fixed << std::setprecision(3) << seconds;
+    return os.str();
+  };
+  auto elapsed_seconds = [](const Clock::time_point &start, const Clock::time_point &end) {
+    return std::chrono::duration<double>(end - start).count();
+  };
+  const bool profile_save_graph = (std::getenv("RTL_TRACE_SAVE_GRAPH_PROFILE") != nullptr);
 
   const auto t_total_start = Clock::now();
   if (logger != nullptr) {
@@ -1565,6 +1596,12 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
                                 const std::vector<std::string> &signals,
                                 uint32_t &begin, uint32_t &count) {
     begin = static_cast<uint32_t>(graph.signal_refs.size());
+#ifndef NDEBUG
+    assert(AreSortedUniqueSignalIdsByPath(signal_ids, graph));
+    assert(AreSortedUniqueValues(signals));
+#endif
+    // Precondition: both inputs are individually sorted and deduplicated by
+    // signal path text so this can do a linear merge without extra copies.
     if (signals.empty()) {
       graph.signal_refs.insert(graph.signal_refs.end(), signal_ids.begin(), signal_ids.end());
       count = static_cast<uint32_t>(signal_ids.size());
@@ -1658,6 +1695,15 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
   buckets = &processing_buckets;
 
   const auto t_build_start = Clock::now();
+  double t_build_signal_record_s = 0.0;
+  double t_compact_global_s = 0.0;
+  double t_merge_s = 0.0;
+  double t_emit_driver_s = 0.0;
+  double t_emit_load_s = 0.0;
+  double t_cache_clear_s = 0.0;
+  size_t build_driver_endpoint_count = 0;
+  size_t build_load_endpoint_count = 0;
+  size_t inferred_assignment_lhs_count = 0;
   signal_count = 0;
   for (size_t bucket_index = 0; bucket_index < buckets->size(); ++bucket_index) {
     const std::vector<size_t> &bucket = (*buckets)[bucket_index];
@@ -1669,7 +1715,10 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
       const SignalCompileItem &item = signals[sig_id];
       if (item.sym == nullptr || !IsTraceable(item.sym)) continue;
 
+      const auto t_signal_record_start = profile_save_graph ? Clock::now() : Clock::time_point{};
       SignalRecord rec = build_signal_record(item.sym);
+      if (profile_save_graph) t_build_signal_record_s += elapsed_seconds(t_signal_record_start, Clock::now());
+      const auto t_compact_global_start = profile_save_graph ? Clock::now() : Clock::time_point{};
       if (ShouldCompactGlobalNet(item.path, rec.loads.size())) {
         GlobalNetRecord g;
         g.category = ClassifyGlobalNetCategory(item.path);
@@ -1679,12 +1728,17 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
           rec.loads.clear();
         }
       }
+      if (profile_save_graph) t_compact_global_s += elapsed_seconds(t_compact_global_start, Clock::now());
+      const auto t_merge_start = profile_save_graph ? Clock::now() : Clock::time_point{};
       MergeEndpointBitRangesInPlace(rec.drivers, merge_groups);
       MergeEndpointBitRangesInPlace(rec.loads, merge_groups);
+      if (profile_save_graph) t_merge_s += elapsed_seconds(t_merge_start, Clock::now());
 
       GraphSignalRecord &gs = graph.signals[sig_id];
       gs.driver_begin = static_cast<uint32_t>(graph.endpoints.size());
       gs.driver_count = static_cast<uint32_t>(rec.drivers.size());
+      build_driver_endpoint_count += rec.drivers.size();
+      const auto t_emit_driver_start = profile_save_graph ? Clock::now() : Clock::time_point{};
       for (const EndpointRecord &e : rec.drivers) {
         append_endpoint(e);
         const uint32_t driver_path_id =
@@ -1693,8 +1747,11 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
           driver_refs_flat.push_back({driver_path_id, static_cast<uint32_t>(sig_id)});
         }
       }
+      if (profile_save_graph) t_emit_driver_s += elapsed_seconds(t_emit_driver_start, Clock::now());
       gs.load_begin = static_cast<uint32_t>(graph.endpoints.size());
       gs.load_count = static_cast<uint32_t>(rec.loads.size());
+      build_load_endpoint_count += rec.loads.size();
+      const auto t_emit_load_start = profile_save_graph ? Clock::now() : Clock::time_point{};
       for (const EndpointRecord &e : rec.loads) {
         append_endpoint(e);
         const uint32_t load_path_id =
@@ -1705,6 +1762,7 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
         std::vector<std::string> inferred_lhs_paths;
         if (e.lhs_signal_ids.empty() && e.lhs_signals.empty() && !e.assignment_text.empty()) {
           inferred_lhs_paths = InferAssignmentLhsPathsFromText(e.path, e.assignment_text);
+          ++inferred_assignment_lhs_count;
           for (const std::string &lhs : inferred_lhs_paths) {
             if (!lhs.empty()) {
               assignment_lhs_refs_flat.push_back({intern(lhs), static_cast<uint32_t>(sig_id)});
@@ -1721,20 +1779,39 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
           }
         }
       }
+      if (profile_save_graph) t_emit_load_s += elapsed_seconds(t_emit_load_start, Clock::now());
       ++signal_count;
       TrimTraceCompileCache(trace_cache);
     }
     if (buckets->size() > 1) {
+      const auto t_cache_clear_start = profile_save_graph ? Clock::now() : Clock::time_point{};
       ClearTraceCompileCache(trace_cache);
+      if (profile_save_graph) t_cache_clear_s += elapsed_seconds(t_cache_clear_start, Clock::now());
     }
   }
+  const auto t_cache_clear_start = profile_save_graph ? Clock::now() : Clock::time_point{};
   ClearTraceCompileCache(trace_cache);
+  if (profile_save_graph) t_cache_clear_s += elapsed_seconds(t_cache_clear_start, Clock::now());
   const auto t_build_end = Clock::now();
   if (logger != nullptr) {
     logger->Log("save_graph_db: build_graph done elapsed_s=" +
                 fmt_seconds(t_build_start, t_build_end) +
                 " strings=" + std::to_string(graph.strings.size()) +
                 " endpoints=" + std::to_string(graph.endpoints.size()));
+    if (profile_save_graph) {
+      logger->Log("save_graph_db: build_graph phases signal_record_s=" +
+                  fmt_duration(t_build_signal_record_s) +
+                  " compact_global_s=" + fmt_duration(t_compact_global_s) +
+                  " merge_s=" + fmt_duration(t_merge_s) +
+                  " emit_drivers_s=" + fmt_duration(t_emit_driver_s) +
+                  " emit_loads_s=" + fmt_duration(t_emit_load_s) +
+                  " cache_clear_s=" + fmt_duration(t_cache_clear_s));
+      logger->Log("save_graph_db: build_graph counts driver_endpoints=" +
+                  std::to_string(build_driver_endpoint_count) +
+                  " load_endpoints=" + std::to_string(build_load_endpoint_count) +
+                  " signal_refs=" + std::to_string(graph.signal_refs.size()) +
+                  " inferred_assignment_lhs=" + std::to_string(inferred_assignment_lhs_count));
+    }
   }
 
   auto finalize_path_refs =
@@ -1766,14 +1843,18 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
         range.count = static_cast<uint32_t>(flat.size() - current_begin);
         ranges.push_back(range);
       };
+  const auto t_finalize_refs_start = profile_save_graph ? Clock::now() : Clock::time_point{};
   finalize_path_refs(load_refs_flat, graph.load_ref_ranges, graph.load_ref_signal_ids);
   finalize_path_refs(driver_refs_flat, graph.driver_ref_ranges, graph.driver_ref_signal_ids);
   finalize_path_refs(assignment_lhs_refs_flat, graph.assignment_lhs_ref_ranges,
                      graph.assignment_lhs_ref_signal_ids);
+  const double t_finalize_refs_s =
+      profile_save_graph ? elapsed_seconds(t_finalize_refs_start, Clock::now()) : 0.0;
   std::vector<std::pair<uint32_t, uint32_t>>().swap(load_refs_flat);
   std::vector<std::pair<uint32_t, uint32_t>>().swap(driver_refs_flat);
   std::vector<std::pair<uint32_t, uint32_t>>().swap(assignment_lhs_refs_flat);
 
+  const auto t_build_hierarchy_start = profile_save_graph ? Clock::now() : Clock::time_point{};
   std::vector<std::string> hier_paths;
   hier_paths.reserve(hier_db.hierarchy.size());
   for (const auto &[path, _] : hier_db.hierarchy)
@@ -1814,7 +1895,10 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
       }
     }
   }
+  const double t_build_hierarchy_s =
+      profile_save_graph ? elapsed_seconds(t_build_hierarchy_start, Clock::now()) : 0.0;
 
+  const auto t_build_global_nets_start = profile_save_graph ? Clock::now() : Clock::time_point{};
   std::vector<std::string> global_sources;
   global_sources.reserve(compact_global_nets.size());
   for (const auto &[path, _] : compact_global_nets)
@@ -1832,9 +1916,12 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
     gg.sink_count = static_cast<uint32_t>(it->second.sinks.size());
     for (const std::string &sink : it->second.sinks)
       graph.global_sinks.push_back(intern(sink));
-    graph.global_nets.push_back(gg);
+      graph.global_nets.push_back(gg);
   }
+  const double t_build_global_nets_s =
+      profile_save_graph ? elapsed_seconds(t_build_global_nets_start, Clock::now()) : 0.0;
 
+  const auto t_string_offsets_start = profile_save_graph ? Clock::now() : Clock::time_point{};
   std::vector<uint32_t> string_offsets;
   string_offsets.reserve(graph.strings.size() + 1);
   uint64_t total_str_bytes = 0;
@@ -1846,6 +1933,15 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
   if (total_str_bytes > std::numeric_limits<uint32_t>::max()) return false;
   string_offsets.push_back(static_cast<uint32_t>(total_str_bytes));
   string_index.clear();
+  const double t_string_offsets_s =
+      profile_save_graph ? elapsed_seconds(t_string_offsets_start, Clock::now()) : 0.0;
+
+  if (logger != nullptr && profile_save_graph) {
+    logger->Log("save_graph_db: finalize phases refs_s=" + fmt_duration(t_finalize_refs_s) +
+                " hierarchy_s=" + fmt_duration(t_build_hierarchy_s) +
+                " global_nets_s=" + fmt_duration(t_build_global_nets_s) +
+                " string_offsets_s=" + fmt_duration(t_string_offsets_s));
+  }
 
   GraphDbFileHeader header;
   std::memcpy(header.magic, kGraphDbMagic, sizeof(header.magic));

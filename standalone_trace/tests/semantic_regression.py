@@ -160,6 +160,16 @@ def main():
             lambda e: e.get("assignment") == "flag <= hit" and "semantic_top.flag" in e.get("lhs", []),
             "missing nonblocking assignment LHS for semantic_top.hit loads",
         )
+        # This endpoint carries exact LHS refs, so compile is allowed to keep only
+        # source offsets in the DB and let query-side materialization recover the
+        # assignment text after reload.
+        assert_any(
+            hit_loads.get("endpoints", []),
+            lambda e: e.get("path") == "semantic_top.hit"
+            and e.get("assignment") == "flag <= hit"
+            and e.get("lhs") == ["semantic_top.flag"],
+            "lazy assignment-text materialization failed for semantic_top.hit loads",
+        )
         part_hit_loads = run_trace_json(rtl_trace, part_db, "loads", "semantic_top.hit")
         if part_hit_loads != hit_loads:
             raise AssertionError(
