@@ -51,8 +51,8 @@ Notes:
 - `compile --incremental` reuses an existing DB based on input fingerprints and skips recompilation on a cache hit.
 - `compile --relax-defparam` relaxes defparam-related errors (for example, unresolved cross-hierarchy defparams) so a usable DB can still be generated.
 - `compile --mfcu` uses grouped MFCU mode: source files from each `-f` filelist are merged into one compilation unit, and source files passed directly on the command line are merged into another compilation unit, instead of merging all inputs into one unit.
-- `compile --low-mem` enables low-memory mode: during `SaveGraphDb`, `TraceCompileCache` is actively pruned once every 200 module bodies. On large designs such as NVDLA this can save about **1.1 GB** of peak memory, at the cost of about **10-15s** of additional wall time due to cache-miss re-parsing.
-- `compile --partition-budget N` partitions the DB build by instance-tree budget. The log prints the partitioning result and per-partition progress.
+- `compile --low-mem` enables a tighter compile-cache budget during `SaveGraphDb`: per-body trace caches are kept in a much smaller LRU window and are dropped more aggressively between partitions. This reduces peak memory at the cost of extra cache rebuilds on some designs.
+- `compile --partition-budget N` partitions the DB build by instance-tree budget and actually processes the resulting buckets sequentially during graph generation. The log prints the partitioning result and per-partition progress.
 - `compile --compile-log <file>` writes key compile-stage steps and partition information into a log file while still printing to the console. During DB generation it also records `save_graph_db` sub-step timings such as `build_graph` and `write_file`.
 - The `trace` phase only queries the DB and does not parse RTL again.
 - The current DB format is a binary graph DB.
@@ -63,7 +63,7 @@ Notes:
 - `serve` is intended for interactive debugging on large designs: the DB is loaded once, and later `find` / `trace` / `hier` commands reuse the resident session.
 - For high-fanout clock / reset networks, `compile` compresses fanout into a dedicated compact table to reduce normal `loads` detail storage. `trace` queries on those networks consult the compact table first.
 - For interface members / bind assignments, `compile` also persists a reverse-reference table from assignment LHS to source signals, so `drivers` queries such as `mon_if.master_if[0].rlast` work directly even in a fresh standalone CLI process, without a query-time full scan.
-- While generating the DB, `compile` caches each signal's resolved result and reuses it across both the string-collection and final-write stages, avoiding repeated resolution of the same signal.
+- While generating the DB, `compile` keeps a bounded per-body trace cache and pre-interns signal paths once, which reduces duplicate compile-side state without changing query-visible results.
 - If you do not pass `--timescale` during `compile`, the tool automatically uses `1ns/1ps` to avoid mixed / missing timescale errors.
 - If `--timescale` is explicitly provided, the user-supplied value is used.
 - If you want the latest cross-port recursive results and `loads` `lhs` information, re-run `compile` to generate a new DB.

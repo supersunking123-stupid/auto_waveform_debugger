@@ -40,6 +40,8 @@ struct EndpointRecord {
   uint32_t assignment_end = 0;
   std::string bit_map;
   bool bit_map_approximate = false;
+  std::vector<uint32_t> lhs_signal_ids;
+  std::vector<uint32_t> rhs_signal_ids;
   std::vector<std::string> lhs_signals;
   std::vector<std::string> rhs_signals;
 };

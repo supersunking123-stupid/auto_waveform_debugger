@@ -86,6 +86,7 @@ def main():
     tmpdir = Path(tempfile.mkdtemp(prefix="rtl_trace_semreg_"))
     try:
         db = tmpdir / "semantic.db"
+        part_db = tmpdir / "semantic_part.db"
         inc_db = tmpdir / "semantic_inc.db"
 
         # 1) compile smoke
@@ -104,7 +105,25 @@ def main():
         if "signals:" not in c.stdout:
             raise AssertionError(f"compile output missing signals summary: {c.stdout}")
 
-        # 2) drivers can cross submodule input port and reach producer assignments
+        # 2) partitioned compile should preserve query-visible behavior
+        c_part = run_cmd(
+            [
+                str(rtl_trace),
+                "compile",
+                "--db",
+                str(part_db),
+                "--partition-budget",
+                "1",
+                "--single-unit",
+                str(fixture),
+                "--top",
+                "semantic_top",
+            ]
+        )
+        if "signals:" not in c_part.stdout:
+            raise AssertionError(f"partition compile output missing signals summary: {c_part.stdout}")
+
+        # 3) drivers can cross submodule input port and reach producer assignments
         drivers = run_trace_json(rtl_trace, db, "drivers", "semantic_top.u_cons.in_bus")
         if drivers.get("summary", {}).get("count") != 2:
             raise AssertionError(f"unexpected drivers count: {drivers}")
@@ -119,8 +138,15 @@ def main():
             lambda e: e.get("assignment") == "data <= data + 8'h01" and e.get("path") == "semantic_top.u_prod.data",
             "missing increment driver assignment after cross-port traversal",
         )
+        part_drivers = run_trace_json(rtl_trace, part_db, "drivers", "semantic_top.u_cons.in_bus")
+        if part_drivers != drivers:
+            raise AssertionError(
+                "partitioned compile changed drivers query output:\n"
+                f"default={json.dumps(drivers, sort_keys=True)}\n"
+                f"partitioned={json.dumps(part_drivers, sort_keys=True)}"
+            )
 
-        # 3) better loads assignment context: condition expression should carry LHS path
+        # 4) better loads assignment context: condition expression should carry LHS path
         loads = run_trace_json(rtl_trace, db, "loads", "semantic_top.data")
         l_endpoints = loads.get("endpoints", [])
         assert_any(
@@ -134,8 +160,15 @@ def main():
             lambda e: e.get("assignment") == "flag <= hit" and "semantic_top.flag" in e.get("lhs", []),
             "missing nonblocking assignment LHS for semantic_top.hit loads",
         )
+        part_hit_loads = run_trace_json(rtl_trace, part_db, "loads", "semantic_top.hit")
+        if part_hit_loads != hit_loads:
+            raise AssertionError(
+                "partitioned compile changed loads query output:\n"
+                f"default={json.dumps(hit_loads, sort_keys=True)}\n"
+                f"partitioned={json.dumps(part_hit_loads, sort_keys=True)}"
+            )
 
-        # 4) bit-level precision and bit-select query filtering
+        # 5) bit-level precision and bit-select query filtering
         bit_q = run_trace_json(rtl_trace, db, "loads", "semantic_top.u_cons.in_bus[3]")
         if bit_q.get("summary", {}).get("count") != 1:
             raise AssertionError(f"unexpected bit-query count: {bit_q}")
@@ -152,7 +185,7 @@ def main():
         if r0.get("bit_map") != "[7:4]" or r0.get("bit_map_approximate"):
             raise AssertionError(f"unexpected bit_map for [7:4] query: {r0}")
 
-        # 5) traversal controls: depth / node limits should emit stops
+        # 6) traversal controls: depth / node limits should emit stops
         depth_limit = run_trace_json(
             rtl_trace,
             db,
@@ -173,7 +206,7 @@ def main():
         if not any(s.get("reason") == "node_limit" for s in node_limit.get("stops", [])):
             raise AssertionError(f"expected node_limit stop: {node_limit}")
 
-        # 6) find typo suggestions
+        # 7) find typo suggestions
         find_proc = run_cmd(
             [
                 str(rtl_trace),
@@ -190,7 +223,7 @@ def main():
         if "suggestions:" not in find_proc.stdout or "semantic_top.u_cons.in_bus" not in find_proc.stdout:
             raise AssertionError(f"find typo suggestions missing expected candidate:\n{find_proc.stdout}")
 
-        # 7) incremental compile cache hit
+        # 8) incremental compile cache hit
         run_cmd(
             [
                 str(rtl_trace),
@@ -220,7 +253,7 @@ def main():
         if "signals: incremental-cache-hit" not in inc2.stdout:
             raise AssertionError(f"incremental cache hit missing:\n{inc2.stdout}")
 
-        # 8) invalid numeric args should return a parse error instead of terminating
+        # 9) invalid numeric args should return a parse error instead of terminating
         assert_invalid_arg(
             rtl_trace,
             ["trace", "--db", str(db), "--mode", "drivers", "--signal", "semantic_top.hit", "--depth", "abc"],
@@ -237,7 +270,7 @@ def main():
             "Invalid --limit: bad",
         )
 
-        # 9) hierarchy query can optionally expose definition source locations
+        # 10) hierarchy query can optionally expose definition source locations
         hier_with_source = run_json_cmd(
             [
                 str(rtl_trace),

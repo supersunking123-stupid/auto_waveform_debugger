@@ -1,4 +1,5 @@
 #include "compile/Compiler.h"
+#include "compile/CompileData.h"
 #include "db/EntryPoints.h"
 #include "db/GraphDbTypes.h"
 #include "db/GraphDbInternals.h"
@@ -44,24 +45,24 @@ using TraceResult = std::variant<const slang::ast::PortSymbol *, ExprTraceResult
 struct TraceCompileCache;
 
 void CollectTraceableSymbols(const slang::ast::RootSymbol &root,
-                             slang::flat_hash_map<std::string, const slang::ast::Symbol *> &out);
+                             std::vector<SignalCompileItem> &out);
 void CollectInstanceHierarchy(const slang::ast::RootSymbol &root,
                               const slang::SourceManager &sm,
                               TraceDb &db);
 void BuildHierarchyFromSignals(TraceDb &db);
 slang::flat_hash_map<std::string_view, size_t> BuildSubtreeSignalCounts(
-    const std::vector<std::string> &keys);
+    const std::vector<SignalCompileItem> &signals);
 std::vector<PartitionRecord> PlanHierarchyPartitions(
     const TraceDb &hier_db, const slang::flat_hash_map<std::string_view, size_t> &subtree_counts,
     size_t budget, CompileLogger *logger);
 std::vector<std::vector<size_t>> BucketSignalsByPartitions(
-    const std::vector<std::string> &keys,
+    const std::vector<SignalCompileItem> &signals,
     const std::vector<PartitionRecord> &parts);
 bool SaveGraphDb(const std::string &db_path,
-                 const std::vector<std::string> &keys,
-                 const slang::flat_hash_map<std::string, const slang::ast::Symbol *> &symbols,
+                 const std::vector<SignalCompileItem> &signals,
                  const slang::SourceManager &sm,
                  const TraceDb &hier_db,
+                 const std::vector<std::vector<size_t>> *buckets,
                  size_t &signal_count,
                  bool low_mem,
                  CompileLogger *logger);
@@ -399,19 +400,13 @@ int RunCompile(int argc, char *argv[]) {
   const slang::ast::RootSymbol &root = compilation->getRoot();
   const slang::SourceManager &sm = *compilation->getSourceManager();
 
-  slang::flat_hash_map<std::string, const slang::ast::Symbol *> symbols;
-  symbols.reserve(2000000); // Pre-allocate to prevent massive rehash spikes
+  std::vector<SignalCompileItem> signals;
+  signals.reserve(2000000);
   logger.Log("step: collect traceable symbols");
   LogMem("MemBeforeCollectSymbols");
-  CollectTraceableSymbols(root, symbols);
+  CollectTraceableSymbols(root, signals);
   LogMem("MemAfterCollectSymbols");
-
-  std::vector<std::string> keys;
-  keys.reserve(symbols.size());
-  for (const auto &[k, _] : symbols)
-    keys.push_back(k);
-  std::sort(keys.begin(), keys.end());
-  logger.Log("collected symbols: " + std::to_string(keys.size()));
+  logger.Log("collected symbols: " + std::to_string(signals.size()));
 
   TraceDb hier_db;
   logger.Log("step: collect instance hierarchy");
@@ -423,7 +418,7 @@ int RunCompile(int argc, char *argv[]) {
   std::vector<std::vector<size_t>> buckets;
   if (partition_budget > 0) {
     logger.Log("step: plan partitions");
-    const auto subtree_counts = BuildSubtreeSignalCounts(keys);
+    const auto subtree_counts = BuildSubtreeSignalCounts(signals);
     parts = PlanHierarchyPartitions(hier_db, subtree_counts, partition_budget, &logger);
     logger.Log("planned partitions: " + std::to_string(parts.size()));
     for (size_t i = 0; i < parts.size(); ++i) {
@@ -431,17 +426,18 @@ int RunCompile(int argc, char *argv[]) {
                  " depth=" + std::to_string(parts[i].depth) +
                  " subtree_signals=" + std::to_string(parts[i].signal_count));
     }
-    buckets = BucketSignalsByPartitions(keys, parts);
+    buckets = BucketSignalsByPartitions(signals, parts);
   } else {
     buckets.resize(1);
-    for (size_t i = 0; i < keys.size(); ++i)
+    for (size_t i = 0; i < signals.size(); ++i)
       buckets[0].push_back(i);
   }
 
   logger.Log("step: emit db");
   size_t written_signal_count = 0;
   LogMem("MemBeforeSaveGraphDb");
-  if (!SaveGraphDb(db_path, keys, symbols, sm, hier_db, written_signal_count, low_mem, &logger)) {
+  if (!SaveGraphDb(db_path, signals, sm, hier_db, &buckets, written_signal_count, low_mem,
+                   &logger)) {
     std::cerr << "Failed to write DB: " << db_path << "\n";
     return 1;
   }

@@ -5,6 +5,7 @@
 #include "db/EntryPoints.h"
 #include "db/GraphDbTypes.h"
 #include "db/GraphDbInternals.h"
+#include "compile/CompileData.h"
 #include "AssignmentUtils.h"
 
 // Slang AST headers needed for compile-time trace building
@@ -92,6 +93,7 @@ struct ExprTraceResult {
   const slang::ast::Expression *expr = nullptr;
   const slang::ast::Symbol *symbol = nullptr;
   const slang::ast::AssignmentExpression *assignment = nullptr;
+  const slang::ast::InstanceBodySymbol *trace_body = nullptr;
   std::vector<const slang::ast::Expression *> selectors;
   SymbolRefList context_lhs_signals;
   bool context_from_instance_port = false;
@@ -106,11 +108,21 @@ struct BodyTraceIndex {
   slang::flat_hash_map<const slang::ast::Symbol *, std::vector<TraceResult>> loads;
 };
 
-struct TraceCompileCache {
-  slang::flat_hash_map<const slang::ast::AssignmentExpression *, SymbolRefList> assignment_lhs_signals;
-  slang::flat_hash_map<const slang::ast::AssignmentExpression *, SymbolRefList> assignment_rhs_signals;
+struct PerBodyTraceCache {
+  slang::flat_hash_map<const slang::ast::AssignmentExpression *, SymbolRefList>
+      assignment_lhs_signals;
+  slang::flat_hash_map<const slang::ast::AssignmentExpression *, SymbolRefList>
+      assignment_rhs_signals;
   slang::flat_hash_map<const slang::ast::Statement *, SymbolRefList> statement_lhs_signals;
-  slang::flat_hash_map<const slang::ast::InstanceBodySymbol *, BodyTraceIndex> body_trace_indexes;
+  BodyTraceIndex body_trace_index;
+  bool body_trace_index_ready = false;
+};
+
+struct TraceCompileCache {
+  slang::flat_hash_map<const slang::ast::InstanceBodySymbol *, std::unique_ptr<PerBodyTraceCache>>
+      body_caches;
+  std::vector<const slang::ast::InstanceBodySymbol *> lru_order;
+  size_t body_cache_limit = 16;
 };
 
 // ScopedFileLock — local utility for SaveGraphDb file locking
@@ -149,11 +161,11 @@ class ScopedFileLock {
 
 SymbolRefList CollectLhsSignalsFromStatement(const slang::ast::Statement &stmt);
 const SymbolRefList &GetCachedLhsSignals(
-    const slang::ast::AssignmentExpression *assignment, TraceCompileCache &cache);
+    const slang::ast::AssignmentExpression *assignment, PerBodyTraceCache &cache);
 const SymbolRefList &GetCachedRhsSignals(
-    const slang::ast::AssignmentExpression *assignment, TraceCompileCache &cache);
+    const slang::ast::AssignmentExpression *assignment, PerBodyTraceCache &cache);
 const SymbolRefList &GetCachedStatementLhsSignals(
-    const slang::ast::Statement &stmt, TraceCompileCache &cache);
+    const slang::ast::Statement &stmt, PerBodyTraceCache &cache);
 EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManager &sm,
                                   bool drivers_mode, TraceCompileCache *cache,
                                   const slang::flat_hash_map<const slang::ast::Symbol *, uint32_t> *symbol_path_ids = nullptr);
@@ -202,8 +214,9 @@ std::string MakeInstancePortPath(const slang::ast::InstanceSymbol *instance,
 template <bool DRIVERS>
 class BodyTraceIndexBuilder : public slang::ast::ASTVisitor<BodyTraceIndexBuilder<DRIVERS>, slang::ast::VisitFlags::AllGood> {
  public:
-  BodyTraceIndexBuilder(BodyTraceIndex &index, TraceCompileCache &cache)
-      : index_(index), cache_(cache) {}
+  BodyTraceIndexBuilder(BodyTraceIndex &index, PerBodyTraceCache &body_cache,
+                        const slang::ast::InstanceBodySymbol &body)
+      : index_(index), body_cache_(body_cache), body_(body) {}
 
   void handle(const slang::ast::InstanceSymbol &inst) {
     for (const slang::ast::PortConnection *conn : inst.getPortConnections()) {
@@ -251,9 +264,9 @@ class BodyTraceIndexBuilder : public slang::ast::ASTVisitor<BodyTraceIndexBuilde
       this->visitDefault(stmt);
       return;
     }
-    SymbolRefList context_lhs = GetCachedStatementLhsSignals(stmt.ifTrue, cache_);
+    SymbolRefList context_lhs = GetCachedStatementLhsSignals(stmt.ifTrue, body_cache_);
     if (stmt.ifFalse != nullptr) {
-      const auto &else_lhs = GetCachedStatementLhsSignals(*stmt.ifFalse, cache_);
+      const auto &else_lhs = GetCachedStatementLhsSignals(*stmt.ifFalse, body_cache_);
       context_lhs.insert(context_lhs.end(), else_lhs.begin(), else_lhs.end());
       std::sort(context_lhs.begin(), context_lhs.end(), SymbolPathLess);
       context_lhs.erase(std::unique(context_lhs.begin(), context_lhs.end()), context_lhs.end());
@@ -279,11 +292,11 @@ class BodyTraceIndexBuilder : public slang::ast::ASTVisitor<BodyTraceIndexBuilde
     }
     SymbolRefList context_lhs;
     for (const auto &item : stmt.items) {
-      const auto &item_lhs = GetCachedStatementLhsSignals(*item.stmt, cache_);
+      const auto &item_lhs = GetCachedStatementLhsSignals(*item.stmt, body_cache_);
       context_lhs.insert(context_lhs.end(), item_lhs.begin(), item_lhs.end());
     }
     if (stmt.defaultCase != nullptr) {
-      const auto &default_lhs = GetCachedStatementLhsSignals(*stmt.defaultCase, cache_);
+      const auto &default_lhs = GetCachedStatementLhsSignals(*stmt.defaultCase, body_cache_);
       context_lhs.insert(context_lhs.end(), default_lhs.begin(), default_lhs.end());
     }
     std::sort(context_lhs.begin(), context_lhs.end(), SymbolPathLess);
@@ -307,7 +320,7 @@ class BodyTraceIndexBuilder : public slang::ast::ASTVisitor<BodyTraceIndexBuilde
       return;
     }
 
-    timed_lhs_stack_.push_back(GetCachedStatementLhsSignals(stmt.stmt, cache_));
+    timed_lhs_stack_.push_back(GetCachedStatementLhsSignals(stmt.stmt, body_cache_));
     stmt.timing.visit(*this);
     timed_lhs_stack_.pop_back();
     stmt.stmt.visit(*this);
@@ -343,6 +356,7 @@ class BodyTraceIndexBuilder : public slang::ast::ASTVisitor<BodyTraceIndexBuilde
         ExprTraceResult result;
         result.expr = &nve;
         result.symbol = &nve.symbol;
+        result.trace_body = &body_;
         if (checking_lhs_) result.assignment = current_assignment_;
         result.selectors = selector_stack_;
         if (checking_instance_port_expression_ && active_instance_ != nullptr && active_port_ != nullptr) {
@@ -358,6 +372,7 @@ class BodyTraceIndexBuilder : public slang::ast::ASTVisitor<BodyTraceIndexBuilde
         result.expr = &nve;
         result.symbol = &nve.symbol;
         result.assignment = current_assignment_;
+        result.trace_body = &body_;
         result.selectors = selector_stack_;
         if (checking_instance_port_expression_ && active_instance_ != nullptr && active_port_ != nullptr) {
           result.context_from_instance_port = true;
@@ -383,6 +398,7 @@ class BodyTraceIndexBuilder : public slang::ast::ASTVisitor<BodyTraceIndexBuilde
         ExprTraceResult result;
         result.expr = &expr;
         result.symbol = sym;
+        result.trace_body = &body_;
         if (checking_lhs_) result.assignment = current_assignment_;
         result.selectors = selector_stack_;
         if (checking_instance_port_expression_ && active_instance_ != nullptr && active_port_ != nullptr) {
@@ -398,6 +414,7 @@ class BodyTraceIndexBuilder : public slang::ast::ASTVisitor<BodyTraceIndexBuilde
         result.expr = &expr;
         result.symbol = sym;
         result.assignment = current_assignment_;
+        result.trace_body = &body_;
         result.selectors = selector_stack_;
         if (checking_instance_port_expression_ && active_instance_ != nullptr && active_port_ != nullptr) {
           result.context_from_instance_port = true;
@@ -427,7 +444,8 @@ class BodyTraceIndexBuilder : public slang::ast::ASTVisitor<BodyTraceIndexBuilde
   }
 
   BodyTraceIndex &index_;
-  TraceCompileCache &cache_;
+  PerBodyTraceCache &body_cache_;
+  const slang::ast::InstanceBodySymbol &body_;
   const slang::ast::InstanceSymbol *active_instance_ = nullptr;
   const slang::ast::PortSymbol *active_port_ = nullptr;
   bool checking_instance_port_expression_ = false;
@@ -441,16 +459,58 @@ class BodyTraceIndexBuilder : public slang::ast::ASTVisitor<BodyTraceIndexBuilde
   std::vector<SymbolRefList> timed_lhs_stack_;
 };
 
+void TouchBodyTraceCache(TraceCompileCache &cache, const slang::ast::InstanceBodySymbol *body) {
+  if (body == nullptr) return;
+  auto it = std::find(cache.lru_order.begin(), cache.lru_order.end(), body);
+  if (it != cache.lru_order.end()) cache.lru_order.erase(it);
+  cache.lru_order.push_back(body);
+}
+
+PerBodyTraceCache &GetOrCreateBodyTraceCache(const slang::ast::InstanceBodySymbol &body,
+                                             TraceCompileCache &cache) {
+  auto it = cache.body_caches.find(&body);
+  if (it == cache.body_caches.end()) {
+    auto [inserted_it, _] =
+        cache.body_caches.emplace(&body, std::make_unique<PerBodyTraceCache>());
+    it = inserted_it;
+  }
+  TouchBodyTraceCache(cache, &body);
+  return *it->second;
+}
+
+PerBodyTraceCache *FindBodyTraceCache(TraceCompileCache &cache,
+                                      const slang::ast::InstanceBodySymbol *body) {
+  if (body == nullptr) return nullptr;
+  auto it = cache.body_caches.find(body);
+  if (it == cache.body_caches.end()) return nullptr;
+  return it->second.get();
+}
+
+void TrimTraceCompileCache(TraceCompileCache &cache) {
+  while (cache.body_caches.size() > cache.body_cache_limit && !cache.lru_order.empty()) {
+    const slang::ast::InstanceBodySymbol *victim = cache.lru_order.front();
+    cache.lru_order.erase(cache.lru_order.begin());
+    cache.body_caches.erase(victim);
+  }
+}
+
+void ClearTraceCompileCache(TraceCompileCache &cache) {
+  cache.body_caches.clear();
+  cache.lru_order.clear();
+}
+
 const BodyTraceIndex &GetOrBuildBodyTraceIndex(const slang::ast::InstanceBodySymbol &body,
                                                TraceCompileCache &cache) {
-  auto it = cache.body_trace_indexes.find(&body);
-  if (it != cache.body_trace_indexes.end()) return it->second;
-  auto [inserted_it, _] = cache.body_trace_indexes.emplace(&body, BodyTraceIndex{});
-  BodyTraceIndexBuilder</*DRIVERS*/ true> driver_builder(inserted_it->second, cache);
+  PerBodyTraceCache &body_cache = GetOrCreateBodyTraceCache(body, cache);
+  if (body_cache.body_trace_index_ready) return body_cache.body_trace_index;
+  BodyTraceIndexBuilder</*DRIVERS*/ true> driver_builder(body_cache.body_trace_index, body_cache,
+                                                         body);
   body.visit(driver_builder);
-  BodyTraceIndexBuilder</*DRIVERS*/ false> load_builder(inserted_it->second, cache);
+  BodyTraceIndexBuilder</*DRIVERS*/ false> load_builder(body_cache.body_trace_index, body_cache,
+                                                        body);
   body.visit(load_builder);
-  return inserted_it->second;
+  body_cache.body_trace_index_ready = true;
+  return body_cache.body_trace_index;
 }
 
 class PortConnectionResultCollector
@@ -747,13 +807,16 @@ struct EndpointKeyView {
   int32_t a_start;
   int32_t a_end;
   std::string_view a_text;
+  const std::vector<uint32_t>* lhs_ids;
+  const std::vector<uint32_t>* rhs_ids;
   const std::vector<std::string>* lhs;
   const std::vector<std::string>* rhs;
 
   bool operator==(const EndpointKeyView& o) const {
     return kind == o.kind && path == o.path && file == o.file && line == o.line &&
            direction == o.direction && range == o.range && a_start == o.a_start &&
-           a_end == o.a_end && a_text == o.a_text && *lhs == *o.lhs && *rhs == *o.rhs;
+           a_end == o.a_end && a_text == o.a_text && *lhs_ids == *o.lhs_ids &&
+           *rhs_ids == *o.rhs_ids && *lhs == *o.lhs && *rhs == *o.rhs;
   }
 };
 
@@ -771,7 +834,7 @@ EndpointKeyView MakeEndpointKeyView(const EndpointRecord &e) {
       static_cast<int>(e.kind),
       e.path, e.file, e.line, e.direction,
       e.has_assignment_range, e.assignment_start, e.assignment_end, e.assignment_text,
-      &e.lhs_signals, &e.rhs_signals};
+      &e.lhs_signal_ids, &e.rhs_signal_ids, &e.lhs_signals, &e.rhs_signals};
 }
 
 using EndpointMergeGroups = slang::flat_hash_map<EndpointKeyView, std::vector<std::pair<std::pair<int32_t, int32_t>, EndpointRecord>>, EndpointKeyHash>;
@@ -877,13 +940,24 @@ bool ShouldCompactGlobalNet(std::string_view path, size_t load_count) {
   return load_count >= kCompactGlobalNetThreshold && LooksLikeClockOrResetName(path);
 }
 
-std::vector<std::string> ExtractCompactSinkPaths(const std::string &source,
+std::vector<std::string> ExtractCompactSinkPaths(const std::string &source, const GraphDb &graph,
                                                  const std::vector<EndpointRecord> &loads) {
   std::vector<std::string> sinks;
   sinks.reserve(loads.size());
   for (const EndpointRecord &e : loads) {
+    bool has_lhs_refs = false;
+    if (!e.lhs_signal_ids.empty()) {
+      has_lhs_refs = true;
+      for (uint32_t path_id : e.lhs_signal_ids) {
+        const std::string &path = GraphString(graph, path_id);
+        if (!path.empty()) sinks.push_back(path);
+      }
+    }
     if (!e.lhs_signals.empty()) {
+      has_lhs_refs = true;
       sinks.insert(sinks.end(), e.lhs_signals.begin(), e.lhs_signals.end());
+    }
+    if (has_lhs_refs) {
       continue;
     }
     if (!e.path.empty() && e.path != source) sinks.push_back(e.path);
@@ -1050,7 +1124,7 @@ SymbolRefList CollectLhsSignalsFromStatement(const slang::ast::Statement &stmt) 
 }
 
 const SymbolRefList &GetCachedLhsSignals(
-    const slang::ast::AssignmentExpression *assignment, TraceCompileCache &cache) {
+    const slang::ast::AssignmentExpression *assignment, PerBodyTraceCache &cache) {
   static const SymbolRefList empty;
   if (assignment == nullptr) return empty;
   auto it = cache.assignment_lhs_signals.find(assignment);
@@ -1059,7 +1133,7 @@ const SymbolRefList &GetCachedLhsSignals(
 }
 
 const SymbolRefList &GetCachedRhsSignals(
-    const slang::ast::AssignmentExpression *assignment, TraceCompileCache &cache) {
+    const slang::ast::AssignmentExpression *assignment, PerBodyTraceCache &cache) {
   static const SymbolRefList empty;
   if (assignment == nullptr) return empty;
   auto it = cache.assignment_rhs_signals.find(assignment);
@@ -1068,10 +1142,36 @@ const SymbolRefList &GetCachedRhsSignals(
 }
 
 const SymbolRefList &GetCachedStatementLhsSignals(
-    const slang::ast::Statement &stmt, TraceCompileCache &cache) {
+    const slang::ast::Statement &stmt, PerBodyTraceCache &cache) {
   auto it = cache.statement_lhs_signals.find(&stmt);
   if (it != cache.statement_lhs_signals.end()) return it->second;
   return cache.statement_lhs_signals.emplace(&stmt, CollectLhsSignalsFromStatement(stmt)).first->second;
+}
+
+void MaterializeSignalRefs(
+    const SymbolRefList &signals,
+    const slang::flat_hash_map<const slang::ast::Symbol *, uint32_t> *symbol_path_ids,
+    std::vector<uint32_t> &id_out, std::vector<std::string> &path_out) {
+  id_out.clear();
+  path_out.clear();
+  id_out.reserve(signals.size());
+  for (const slang::ast::Symbol *sym : signals) {
+    if (sym == nullptr) continue;
+    if (symbol_path_ids != nullptr) {
+      auto it = symbol_path_ids->find(sym);
+      if (it != symbol_path_ids->end()) {
+        id_out.push_back(it->second);
+        continue;
+      }
+    }
+    path_out.push_back(std::string(sym->getHierarchicalPath()));
+  }
+}
+
+void InsertSortedUniqueString(std::vector<std::string> &paths, std::string value) {
+  auto it = std::lower_bound(paths.begin(), paths.end(), value);
+  if (it != paths.end() && *it == value) return;
+  paths.insert(it, std::move(value));
 }
 
 EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManager &sm, bool drivers_mode,
@@ -1091,6 +1191,8 @@ EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManag
           rec.line = sm.getLineNumber(loc);
         } else {
           rec.kind = EndpointKind::kExpr;
+          PerBodyTraceCache *body_cache =
+              (cache != nullptr) ? FindBodyTraceCache(*cache, item.trace_body) : nullptr;
           if (item.symbol != nullptr && symbol_path_ids != nullptr) {
             auto it = symbol_path_ids->find(item.symbol);
             if (it != symbol_path_ids->end()) {
@@ -1114,40 +1216,32 @@ EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManag
               rec.assignment_start = off->first;
               rec.assignment_end = off->second;
             }
-            rec.assignment_text = GetSourceText(item.assignment->sourceRange, sm);
-            if (cache != nullptr) {
-              rec.lhs_signals = MaterializeSignalPaths(GetCachedLhsSignals(item.assignment, *cache));
-              rec.rhs_signals = MaterializeSignalPaths(GetCachedRhsSignals(item.assignment, *cache));
+            if (body_cache != nullptr) {
+              MaterializeSignalRefs(GetCachedLhsSignals(item.assignment, *body_cache), symbol_path_ids,
+                                    rec.lhs_signal_ids, rec.lhs_signals);
+              MaterializeSignalRefs(GetCachedRhsSignals(item.assignment, *body_cache), symbol_path_ids,
+                                    rec.rhs_signal_ids, rec.rhs_signals);
             } else {
-              rec.lhs_signals = MaterializeSignalPaths(CollectLhsSignals(item.assignment));
-              rec.rhs_signals = MaterializeSignalPaths(CollectRhsSignals(item.assignment));
+              MaterializeSignalRefs(CollectLhsSignals(item.assignment), symbol_path_ids,
+                                    rec.lhs_signal_ids, rec.lhs_signals);
+              MaterializeSignalRefs(CollectRhsSignals(item.assignment), symbol_path_ids,
+                                    rec.rhs_signal_ids, rec.rhs_signals);
+            }
+            if (!rec.has_assignment_range ||
+                (rec.lhs_signal_ids.empty() && rec.lhs_signals.empty())) {
+              rec.assignment_text = GetSourceText(item.assignment->sourceRange, sm);
             }
           } else if (!item.context_lhs_signals.empty()) {
-            rec.lhs_signals = MaterializeSignalPaths(item.context_lhs_signals);
+            MaterializeSignalRefs(item.context_lhs_signals, symbol_path_ids,
+                                  rec.lhs_signal_ids, rec.lhs_signals);
           }
           if (item.context_from_instance_port && item.context_instance != nullptr && item.context_port != nullptr) {
             const std::string port_signal = MakeInstancePortPath(item.context_instance, item.context_port);
             if (drivers_mode) {
-              if (std::find(rec.rhs_signals.begin(), rec.rhs_signals.end(),
-                            port_signal) == rec.rhs_signals.end()) {
-                rec.rhs_signals.push_back(port_signal);
-              }
+              InsertSortedUniqueString(rec.rhs_signals, port_signal);
             } else {
-              if (std::find(rec.lhs_signals.begin(), rec.lhs_signals.end(),
-                            port_signal) == rec.lhs_signals.end()) {
-                rec.lhs_signals.push_back(port_signal);
-              }
+              InsertSortedUniqueString(rec.lhs_signals, port_signal);
             }
-          }
-          if (rec.lhs_signals.size() > 1) {
-            std::sort(rec.lhs_signals.begin(), rec.lhs_signals.end());
-            rec.lhs_signals.erase(std::unique(rec.lhs_signals.begin(), rec.lhs_signals.end()),
-                                  rec.lhs_signals.end());
-          }
-          if (rec.rhs_signals.size() > 1) {
-            std::sort(rec.rhs_signals.begin(), rec.rhs_signals.end());
-            rec.rhs_signals.erase(std::unique(rec.rhs_signals.begin(), rec.rhs_signals.end()),
-                                  rec.rhs_signals.end());
           }
         }
       },
@@ -1156,13 +1250,15 @@ EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManag
 }
 
 void CollectTraceableSymbols(const slang::ast::RootSymbol &root,
-                             slang::flat_hash_map<std::string, const slang::ast::Symbol *> &out) {
+                             std::vector<SignalCompileItem> &out) {
   auto collect_from_scope = [&](const slang::ast::Scope &scope) {
     for (const auto &net : scope.membersOfType<slang::ast::NetSymbol>()) {
-      out.try_emplace(std::string(net.getHierarchicalPath()), &net);
+      out.push_back(SignalCompileItem{std::string(net.getHierarchicalPath()), &net,
+                                      GetContainingInstance(&net)});
     }
     for (const auto &var : scope.membersOfType<slang::ast::VariableSymbol>()) {
-      out.try_emplace(std::string(var.getHierarchicalPath()), &var);
+      out.push_back(SignalCompileItem{std::string(var.getHierarchicalPath()), &var,
+                                      GetContainingInstance(&var)});
     }
   };
 
@@ -1200,29 +1296,30 @@ void CollectTraceableSymbols(const slang::ast::RootSymbol &root,
     collect_from_scope(top->body);
     visit_structural(visit_structural, top->body);
   }
+  std::sort(out.begin(), out.end(), [](const SignalCompileItem &lhs, const SignalCompileItem &rhs) {
+    return lhs.path < rhs.path;
+  });
+  out.erase(std::unique(out.begin(), out.end(),
+                        [](const SignalCompileItem &lhs, const SignalCompileItem &rhs) {
+                          return lhs.path == rhs.path;
+                        }),
+            out.end());
 }
 
 void CollectInstanceHierarchy(const slang::ast::RootSymbol &root, const slang::SourceManager &sm,
                               TraceDb &db) {
-  struct HierInstanceInfo {
-    std::string module;
-    std::string source_file;
-    uint32_t source_line = 0;
-    std::vector<InstanceParameterRecord> parameters;
-  };
-
-  slang::flat_hash_map<std::string, HierInstanceInfo> modules;
-  modules.reserve(2000000); // Pre-allocate to prevent rehash fragmentation
+  db.hierarchy.reserve(2000000);
   auto note_instance = [&](const slang::ast::InstanceSymbol &inst) {
-    HierInstanceInfo info;
-    info.module = std::string(inst.getDefinition().name);
+    auto &node = db.hierarchy[std::string(inst.getHierarchicalPath())];
+    node.module = std::string(inst.getDefinition().name);
     const auto loc = inst.getDefinition().location;
     if (loc.valid()) {
-      info.source_file = std::string(sm.getFileName(loc));
-      info.source_line = sm.getLineNumber(loc);
+      node.source_file = std::string(sm.getFileName(loc));
+      node.source_line = sm.getLineNumber(loc);
     }
     const auto params = inst.body.getParameters();
-    info.parameters.reserve(params.size());
+    node.parameters.clear();
+    node.parameters.reserve(params.size());
     for (const slang::ast::ParameterSymbolBase *param_base : params) {
       InstanceParameterRecord param;
       param.name = std::string(param_base->symbol.name);
@@ -1241,9 +1338,8 @@ void CollectInstanceHierarchy(const slang::ast::RootSymbol &root, const slang::S
       } else {
         continue;
       }
-      info.parameters.push_back(std::move(param));
+      node.parameters.push_back(std::move(param));
     }
-    modules.try_emplace(std::string(inst.getHierarchicalPath()), std::move(info));
   };
 
   auto visit_structural = [&](auto &self, const slang::ast::Scope &scope) -> void {
@@ -1273,14 +1369,6 @@ void CollectInstanceHierarchy(const slang::ast::RootSymbol &root, const slang::S
   for (const slang::ast::InstanceSymbol *top : root.topInstances) {
     note_instance(*top);
     visit_structural(visit_structural, top->body);
-  }
-
-  for (const auto &[path, info] : modules) {
-    auto &node = db.hierarchy[path];
-    node.module = info.module;
-    node.source_file = info.source_file;
-    node.source_line = info.source_line;
-    node.parameters = info.parameters;
   }
   for (const auto &[path, _] : db.hierarchy) {
     std::string_view parent = ParentPath(path);
@@ -1329,10 +1417,10 @@ bool IsUnderHierarchyRoot(const std::string &signal, const std::string &root) {
 }
 
 slang::flat_hash_map<std::string_view, size_t> BuildSubtreeSignalCounts(
-    const std::vector<std::string> &keys) {
+    const std::vector<SignalCompileItem> &signals) {
   slang::flat_hash_map<std::string_view, size_t> counts;
-  for (const std::string &sig : keys) {
-    std::string_view inst = ParentPath(sig);
+  for (const SignalCompileItem &signal : signals) {
+    std::string_view inst = ParentPath(signal.path);
     while (!inst.empty()) {
       counts[inst] += 1;
       inst = ParentPath(inst);
@@ -1396,11 +1484,11 @@ std::vector<PartitionRecord> PlanHierarchyPartitions(
 }
 
 std::vector<std::vector<size_t>> BucketSignalsByPartitions(
-    const std::vector<std::string> &keys, const std::vector<PartitionRecord> &parts) {
+    const std::vector<SignalCompileItem> &signals, const std::vector<PartitionRecord> &parts) {
   std::vector<std::vector<size_t>> buckets(parts.size());
   if (parts.empty()) {
     buckets.resize(1);
-    for (size_t i = 0; i < keys.size(); ++i)
+    for (size_t i = 0; i < signals.size(); ++i)
       buckets[0].push_back(i);
     return buckets;
   }
@@ -1413,8 +1501,8 @@ std::vector<std::vector<size_t>> BucketSignalsByPartitions(
     return parts[a].root < parts[b].root;
   });
 
-  for (size_t i = 0; i < keys.size(); ++i) {
-    const std::string &sig = keys[i];
+  for (size_t i = 0; i < signals.size(); ++i) {
+    const std::string &sig = signals[i].path;
     size_t chosen = parts.size();
     for (size_t idx : order) {
       if (IsUnderHierarchyRoot(sig, parts[idx].root)) {
@@ -1432,9 +1520,9 @@ std::vector<std::vector<size_t>> BucketSignalsByPartitions(
   return buckets;
 }
 
-bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &keys,
-                 const slang::flat_hash_map<std::string, const slang::ast::Symbol *> &symbols,
-                 const slang::SourceManager &sm, const TraceDb &hier_db, size_t &signal_count,
+bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem> &signals,
+                 const slang::SourceManager &sm, const TraceDb &hier_db,
+                 const std::vector<std::vector<size_t>> *buckets, size_t &signal_count,
                  bool low_mem, CompileLogger *logger) {
   using Clock = std::chrono::steady_clock;
   auto fmt_seconds = [](const Clock::time_point &start, const Clock::time_point &end) {
@@ -1446,7 +1534,7 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &key
 
   const auto t_total_start = Clock::now();
   if (logger != nullptr) {
-    logger->Log("save_graph_db: begin keys=" + std::to_string(keys.size()) +
+    logger->Log("save_graph_db: begin keys=" + std::to_string(signals.size()) +
                 " hier_nodes=" + std::to_string(hier_db.hierarchy.size()));
   }
 
@@ -1455,15 +1543,16 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &key
   std::vector<std::pair<uint32_t, uint32_t>> load_refs_flat;
   std::vector<std::pair<uint32_t, uint32_t>> driver_refs_flat;
   std::vector<std::pair<uint32_t, uint32_t>> assignment_lhs_refs_flat;
-  TraceDb compact_db;
+  slang::flat_hash_map<std::string, GlobalNetRecord> compact_global_nets;
   TraceCompileCache trace_cache;
+  trace_cache.body_cache_limit = low_mem ? 4u : 256u;
   EndpointMergeGroups merge_groups;
 
   // Reserve pool to guarantee stable string_view keys — must not reallocate.
   // Heuristic: ~1 unique string per signal + ~0.5 per endpoint for file/path/direction.
-  const size_t estimated_strings = keys.size() * 2 + hier_db.hierarchy.size();
+  const size_t estimated_strings = signals.size() * 2 + hier_db.hierarchy.size();
   graph.strings.reserve(estimated_strings);
-  graph.endpoints.reserve(keys.size() * 5);
+  graph.endpoints.reserve(signals.size() * 5);
   string_index.reserve(estimated_strings);
   load_refs_flat.reserve(5000000);
   driver_refs_flat.reserve(5000000);
@@ -1472,11 +1561,42 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &key
   auto intern = [&](std::string_view sv) -> uint32_t {
     return InternString(sv, graph.strings, string_index);
   };
-  auto append_signal_refs = [&](const std::vector<std::string> &signals, uint32_t &begin, uint32_t &count) {
+  auto append_signal_refs = [&](const std::vector<uint32_t> &signal_ids,
+                                const std::vector<std::string> &signals,
+                                uint32_t &begin, uint32_t &count) {
     begin = static_cast<uint32_t>(graph.signal_refs.size());
-    count = static_cast<uint32_t>(signals.size());
-    for (const std::string &sig : signals)
-      graph.signal_refs.push_back(intern(sig));
+    if (signals.empty()) {
+      graph.signal_refs.insert(graph.signal_refs.end(), signal_ids.begin(), signal_ids.end());
+      count = static_cast<uint32_t>(signal_ids.size());
+      return;
+    }
+    if (signal_ids.empty()) {
+      for (const std::string &sig : signals)
+        graph.signal_refs.push_back(intern(sig));
+      count = static_cast<uint32_t>(signals.size());
+      return;
+    }
+    size_t id_index = 0;
+    size_t path_index = 0;
+    while (id_index < signal_ids.size() || path_index < signals.size()) {
+      bool take_id = false;
+      if (id_index < signal_ids.size()) {
+        if (path_index == signals.size()) {
+          take_id = true;
+        } else {
+          const std::string &id_path = graph.strings[signal_ids[id_index]];
+          if (id_path <= signals[path_index]) take_id = true;
+        }
+      }
+      if (take_id) {
+        const uint32_t id = signal_ids[id_index++];
+        graph.signal_refs.push_back(id);
+        while (path_index < signals.size() && graph.strings[id] == signals[path_index]) ++path_index;
+      } else {
+        graph.signal_refs.push_back(intern(signals[path_index++]));
+      }
+    }
+    count = static_cast<uint32_t>(graph.signal_refs.size() - begin);
   };
   auto append_endpoint = [&](const EndpointRecord &e) {
     GraphEndpointRecord ge;
@@ -1489,8 +1609,8 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &key
     ge.line = static_cast<uint32_t>(std::max(e.line, 0));
     ge.assignment_start = e.assignment_start;
     ge.assignment_end = e.assignment_end;
-    append_signal_refs(e.lhs_signals, ge.lhs_begin, ge.lhs_count);
-    append_signal_refs(e.rhs_signals, ge.rhs_begin, ge.rhs_count);
+    append_signal_refs(e.lhs_signal_ids, e.lhs_signals, ge.lhs_begin, ge.lhs_count);
+    append_signal_refs(e.rhs_signal_ids, e.rhs_signals, ge.rhs_begin, ge.rhs_count);
     ge.kind = (e.kind == EndpointKind::kPort) ? 1u : 0u;
     ge.bit_map_approximate = e.bit_map_approximate ? 1u : 0u;
     ge.has_assignment_range = e.has_assignment_range ? 1u : 0u;
@@ -1499,80 +1619,116 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &key
 
   // Pre-intern signal path names and build Symbol* → path_id reverse index.
   // This lets ResolveTraceResult skip getHierarchicalPath() for known symbols.
-  graph.signals.resize(keys.size());
+  graph.signals.resize(signals.size());
   slang::flat_hash_map<const slang::ast::Symbol *, uint32_t> symbol_path_ids;
-  symbol_path_ids.reserve(symbols.size());
-  for (size_t i = 0; i < keys.size(); ++i) {
-    graph.signals[i].name_str_id = intern(keys[i]);
-    auto it = symbols.find(keys[i]);
-    if (it != symbols.end())
-      symbol_path_ids[it->second] = graph.signals[i].name_str_id;
+  symbol_path_ids.reserve(signals.size());
+  for (size_t i = 0; i < signals.size(); ++i) {
+    graph.signals[i].name_str_id = intern(signals[i].path);
+    if (signals[i].sym != nullptr) {
+      symbol_path_ids[signals[i].sym] = graph.signals[i].name_str_id;
+    }
   }
 
   auto build_signal_record = [&](const slang::ast::Symbol *sym) -> SignalRecord {
     return BuildSignalRecord(sym, sm, trace_cache, &symbol_path_ids);
   };
 
+  auto sort_bucket_for_locality = [&](std::vector<size_t> &bucket) {
+    std::sort(bucket.begin(), bucket.end(), [&](size_t lhs, size_t rhs) {
+      const std::string_view lhs_parent = ParentPath(signals[lhs].path);
+      const std::string_view rhs_parent = ParentPath(signals[rhs].path);
+      if (lhs_parent != rhs_parent) return lhs_parent < rhs_parent;
+      return signals[lhs].path < signals[rhs].path;
+    });
+  };
+
+  std::vector<std::vector<size_t>> processing_buckets;
+  if (buckets == nullptr || buckets->empty()) {
+    processing_buckets.resize(1);
+    std::vector<size_t> &default_bucket = processing_buckets[0];
+    default_bucket.reserve(signals.size());
+    for (size_t i = 0; i < signals.size(); ++i)
+      default_bucket.push_back(i);
+  } else {
+    processing_buckets = *buckets;
+  }
+  for (std::vector<size_t> &bucket : processing_buckets) {
+    sort_bucket_for_locality(bucket);
+  }
+  buckets = &processing_buckets;
+
   const auto t_build_start = Clock::now();
   signal_count = 0;
-  const slang::ast::InstanceBodySymbol* current_cache_body = nullptr;
-  for (size_t sig_id = 0; sig_id < keys.size(); ++sig_id) {
-    const std::string &path = keys[sig_id];
-    auto it = symbols.find(path);
-    if (it == symbols.end() || !IsTraceable(it->second)) continue;
+  for (size_t bucket_index = 0; bucket_index < buckets->size(); ++bucket_index) {
+    const std::vector<size_t> &bucket = (*buckets)[bucket_index];
+    if (logger != nullptr && buckets->size() > 1) {
+      logger->Log("save_graph_db: partition_begin index=" + std::to_string(bucket_index) +
+                  " signals=" + std::to_string(bucket.size()));
+    }
+    for (size_t sig_id : bucket) {
+      const SignalCompileItem &item = signals[sig_id];
+      if (item.sym == nullptr || !IsTraceable(item.sym)) continue;
 
-    const slang::ast::InstanceBodySymbol *body = GetContainingInstance(it->second);
-    if (body != current_cache_body) {
-      if (low_mem && trace_cache.body_trace_indexes.size() > 200) {
-        trace_cache.body_trace_indexes.clear();
-        trace_cache.assignment_lhs_signals.clear();
-        trace_cache.assignment_rhs_signals.clear();
-        trace_cache.statement_lhs_signals.clear();
+      SignalRecord rec = build_signal_record(item.sym);
+      if (ShouldCompactGlobalNet(item.path, rec.loads.size())) {
+        GlobalNetRecord g;
+        g.category = ClassifyGlobalNetCategory(item.path);
+        g.sinks = ExtractCompactSinkPaths(item.path, graph, rec.loads);
+        if (!g.sinks.empty()) {
+          compact_global_nets.emplace(item.path, std::move(g));
+          rec.loads.clear();
+        }
       }
-      current_cache_body = body;
-    }
+      MergeEndpointBitRangesInPlace(rec.drivers, merge_groups);
+      MergeEndpointBitRangesInPlace(rec.loads, merge_groups);
 
-    SignalRecord rec = build_signal_record(it->second);
-    if (ShouldCompactGlobalNet(path, rec.loads.size())) {
-      GlobalNetRecord g;
-      g.category = ClassifyGlobalNetCategory(path);
-      g.sinks = ExtractCompactSinkPaths(path, rec.loads);
-      if (!g.sinks.empty()) {
-        for (const std::string &sink : g.sinks)
-          compact_db.global_sink_to_source[sink] = path;
-        compact_db.global_nets.emplace(path, std::move(g));
-        rec.loads.clear();
+      GraphSignalRecord &gs = graph.signals[sig_id];
+      gs.driver_begin = static_cast<uint32_t>(graph.endpoints.size());
+      gs.driver_count = static_cast<uint32_t>(rec.drivers.size());
+      for (const EndpointRecord &e : rec.drivers) {
+        append_endpoint(e);
+        const uint32_t driver_path_id =
+            (e.path_id != std::numeric_limits<uint32_t>::max()) ? e.path_id : intern(e.path);
+        if (driver_path_id != std::numeric_limits<uint32_t>::max()) {
+          driver_refs_flat.push_back({driver_path_id, static_cast<uint32_t>(sig_id)});
+        }
       }
-    }
-    MergeEndpointBitRangesInPlace(rec.drivers, merge_groups);
-    MergeEndpointBitRangesInPlace(rec.loads, merge_groups);
-
-    GraphSignalRecord &gs = graph.signals[sig_id];
-    gs.driver_begin = static_cast<uint32_t>(graph.endpoints.size());
-    gs.driver_count = static_cast<uint32_t>(rec.drivers.size());
-    for (const EndpointRecord &e : rec.drivers) {
-      append_endpoint(e);
-      const uint32_t driver_path_id =
-          (e.path_id != std::numeric_limits<uint32_t>::max()) ? e.path_id : intern(e.path);
-      if (driver_path_id != std::numeric_limits<uint32_t>::max())
-        driver_refs_flat.push_back({driver_path_id, static_cast<uint32_t>(sig_id)});
-    }
-    gs.load_begin = static_cast<uint32_t>(graph.endpoints.size());
-    gs.load_count = static_cast<uint32_t>(rec.loads.size());
-    for (const EndpointRecord &e : rec.loads) {
-      append_endpoint(e);
-      const uint32_t load_path_id =
-          (e.path_id != std::numeric_limits<uint32_t>::max()) ? e.path_id : intern(e.path);
-      if (load_path_id != std::numeric_limits<uint32_t>::max())
-        load_refs_flat.push_back({load_path_id, static_cast<uint32_t>(sig_id)});
-      const std::vector<std::string> lhs_paths =
-          e.lhs_signals.empty() ? InferAssignmentLhsPathsFromText(e.path, e.assignment_text) : e.lhs_signals;
-      for (const std::string &lhs : lhs_paths) {
-        if (!lhs.empty()) assignment_lhs_refs_flat.push_back({intern(lhs), static_cast<uint32_t>(sig_id)});
+      gs.load_begin = static_cast<uint32_t>(graph.endpoints.size());
+      gs.load_count = static_cast<uint32_t>(rec.loads.size());
+      for (const EndpointRecord &e : rec.loads) {
+        append_endpoint(e);
+        const uint32_t load_path_id =
+            (e.path_id != std::numeric_limits<uint32_t>::max()) ? e.path_id : intern(e.path);
+        if (load_path_id != std::numeric_limits<uint32_t>::max()) {
+          load_refs_flat.push_back({load_path_id, static_cast<uint32_t>(sig_id)});
+        }
+        std::vector<std::string> inferred_lhs_paths;
+        if (e.lhs_signal_ids.empty() && e.lhs_signals.empty() && !e.assignment_text.empty()) {
+          inferred_lhs_paths = InferAssignmentLhsPathsFromText(e.path, e.assignment_text);
+          for (const std::string &lhs : inferred_lhs_paths) {
+            if (!lhs.empty()) {
+              assignment_lhs_refs_flat.push_back({intern(lhs), static_cast<uint32_t>(sig_id)});
+            }
+          }
+        } else {
+          for (uint32_t lhs_id : e.lhs_signal_ids) {
+            assignment_lhs_refs_flat.push_back({lhs_id, static_cast<uint32_t>(sig_id)});
+          }
+          for (const std::string &lhs : e.lhs_signals) {
+            if (!lhs.empty()) {
+              assignment_lhs_refs_flat.push_back({intern(lhs), static_cast<uint32_t>(sig_id)});
+            }
+          }
+        }
       }
+      ++signal_count;
+      TrimTraceCompileCache(trace_cache);
     }
-    ++signal_count;
+    if (buckets->size() > 1) {
+      ClearTraceCompileCache(trace_cache);
+    }
   }
+  ClearTraceCompileCache(trace_cache);
   const auto t_build_end = Clock::now();
   if (logger != nullptr) {
     logger->Log("save_graph_db: build_graph done elapsed_s=" +
@@ -1614,6 +1770,9 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &key
   finalize_path_refs(driver_refs_flat, graph.driver_ref_ranges, graph.driver_ref_signal_ids);
   finalize_path_refs(assignment_lhs_refs_flat, graph.assignment_lhs_ref_ranges,
                      graph.assignment_lhs_ref_signal_ids);
+  std::vector<std::pair<uint32_t, uint32_t>>().swap(load_refs_flat);
+  std::vector<std::pair<uint32_t, uint32_t>>().swap(driver_refs_flat);
+  std::vector<std::pair<uint32_t, uint32_t>>().swap(assignment_lhs_refs_flat);
 
   std::vector<std::string> hier_paths;
   hier_paths.reserve(hier_db.hierarchy.size());
@@ -1657,14 +1816,14 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &key
   }
 
   std::vector<std::string> global_sources;
-  global_sources.reserve(compact_db.global_nets.size());
-  for (const auto &[path, _] : compact_db.global_nets)
+  global_sources.reserve(compact_global_nets.size());
+  for (const auto &[path, _] : compact_global_nets)
     global_sources.push_back(path);
   std::sort(global_sources.begin(), global_sources.end());
   graph.global_nets.reserve(global_sources.size());
   for (const std::string &source : global_sources) {
-    const auto it = compact_db.global_nets.find(source);
-    if (it == compact_db.global_nets.end()) continue;
+    const auto it = compact_global_nets.find(source);
+    if (it == compact_global_nets.end()) continue;
     GraphGlobalNetRecord gg;
     gg.source_path_str_id = intern(source);
     gg.category_str_id = it->second.category.empty() ? std::numeric_limits<uint32_t>::max()
@@ -1678,20 +1837,20 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &key
 
   std::vector<uint32_t> string_offsets;
   string_offsets.reserve(graph.strings.size() + 1);
-  size_t total_str_bytes = 0;
-  for (const std::string &s : graph.strings) total_str_bytes += s.size();
-  std::string string_blob;
-  string_blob.reserve(total_str_bytes);
+  uint64_t total_str_bytes = 0;
   for (const std::string &s : graph.strings) {
-    string_offsets.push_back(static_cast<uint32_t>(string_blob.size()));
-    string_blob += s;
+    if (total_str_bytes > std::numeric_limits<uint32_t>::max()) return false;
+    string_offsets.push_back(static_cast<uint32_t>(total_str_bytes));
+    total_str_bytes += s.size();
   }
-  string_offsets.push_back(static_cast<uint32_t>(string_blob.size()));
+  if (total_str_bytes > std::numeric_limits<uint32_t>::max()) return false;
+  string_offsets.push_back(static_cast<uint32_t>(total_str_bytes));
+  string_index.clear();
 
   GraphDbFileHeader header;
   std::memcpy(header.magic, kGraphDbMagic, sizeof(header.magic));
   header.string_count = graph.strings.size();
-  header.string_blob_size = string_blob.size();
+  header.string_blob_size = total_str_bytes;
   header.signal_count = graph.signals.size();
   header.endpoint_count = graph.endpoints.size();
   header.signal_ref_count = graph.signal_refs.size();
@@ -1712,8 +1871,10 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<std::string> &key
   std::ofstream out(db_path, std::ios::binary | std::ios::trunc);
   if (!out.is_open()) return false;
   if (!WriteBinaryValue(out, header) || !WriteBinaryVector(out, string_offsets)) return false;
-  out.write(string_blob.data(), static_cast<std::streamsize>(string_blob.size()));
-  if (!out.good()) return false;
+  for (const std::string &s : graph.strings) {
+    out.write(s.data(), static_cast<std::streamsize>(s.size()));
+    if (!out.good()) return false;
+  }
   if (!WriteBinaryVector(out, graph.signals) || !WriteBinaryVector(out, graph.endpoints) ||
       !WriteBinaryVector(out, graph.signal_refs) || !WriteBinaryVector(out, graph.load_ref_ranges) ||
       !WriteBinaryVector(out, graph.load_ref_signal_ids) || !WriteBinaryVector(out, graph.driver_ref_ranges) ||
