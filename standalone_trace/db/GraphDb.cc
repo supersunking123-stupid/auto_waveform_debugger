@@ -1914,9 +1914,10 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
                                                      : intern(it->second.category);
     gg.sink_begin = static_cast<uint32_t>(graph.global_sinks.size());
     gg.sink_count = static_cast<uint32_t>(it->second.sinks.size());
-    for (const std::string &sink : it->second.sinks)
+    for (const std::string &sink : it->second.sinks) {
       graph.global_sinks.push_back(intern(sink));
-      graph.global_nets.push_back(gg);
+    }
+    graph.global_nets.push_back(gg);
   }
   const double t_build_global_nets_s =
       profile_save_graph ? elapsed_seconds(t_build_global_nets_start, Clock::now()) : 0.0;

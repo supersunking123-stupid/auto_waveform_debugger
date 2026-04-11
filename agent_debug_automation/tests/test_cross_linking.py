@@ -1114,6 +1114,16 @@ class CrossLinkingTests(unittest.TestCase):
         self.assertEqual(listed_by_name["ab"]["kind"], "bus_op")
         self.assertEqual(listed_by_name["bus_rev"]["operation"]["type"], "reverse")
 
+    def test_create_bus_slices_rejects_non_divisible_width(self):
+        result = mcp_mod.create_bus_slices(
+            "parts_bad",
+            "bus",
+            3,
+            waveform_path=self.virtual_waveform_path,
+        )
+        self.assertEqual(result["status"], "error")
+        self.assertIn("not divisible", result.get("message", ""))
+
     def test_update_signal_expression_rejects_bus_created_signal(self):
         create = mcp_mod.create_reversed_bus(
             "bus_rev_update",

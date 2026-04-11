@@ -11,7 +11,11 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from .expression_evaluator import LogicValue, evaluate_expression, iter_virtual_transitions
 from .expression_parser import ParseError, collect_signal_refs, parse_expression
-from .models import DEFAULT_VIRTUAL_LEAF_MAX_LIMIT, MAX_VIRTUAL_SIGNAL_DEPTH
+from .models import (
+    DEFAULT_VIRTUAL_LEAF_MAX_LIMIT,
+    MAX_VIRTUAL_SIGNAL_DEPTH,
+    normalize_virtual_leaf_max_limit,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -118,18 +122,6 @@ def _cache_invalidate_all(signal_name: str, session: Dict[str, Any]) -> None:
     for name in to_invalidate:
         if name in created:
             _cache_invalidate(waveform, session_name, name)
-
-
-def _normalize_leaf_max_limit(max_limit: Optional[int]) -> int:
-    if max_limit is None:
-        return DEFAULT_VIRTUAL_LEAF_MAX_LIMIT
-    try:
-        limit = int(max_limit)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("virtual_leaf_max_limit must be an integer > 0") from exc
-    if limit <= 0:
-        raise ValueError("virtual_leaf_max_limit must be > 0")
-    return limit
 
 
 def _dependent_signals(
@@ -287,13 +279,17 @@ class VirtualSignalService:
 
         created = session.setdefault("created_signals", {})
         temp_created = dict(created)
+        pending_entries: Dict[str, Dict[str, Any]] = {}
         for signal_name, entry in entries:
-            if signal_name in temp_created:
+            if signal_name in temp_created or signal_name in pending_entries:
                 raise ValueError(f"virtual signal already exists: {signal_name}")
-            temp_created[signal_name] = entry
+            pending_entries[signal_name] = entry
+
+        temp_created.update(pending_entries)
+        for signal_name in pending_entries:
             _topological_sort(signal_name, temp_created)
 
-        for signal_name, entry in entries:
+        for signal_name, entry in pending_entries.items():
             created[signal_name] = entry
         return _save_session_payload(session)
 
@@ -765,7 +761,7 @@ class VirtualSignalService:
         leaf_max_limit: Optional[int] = None,
     ) -> Iterator[Dict[str, Any]]:
         """Lazy transition generator for a virtual signal."""
-        leaf_max_limit = _normalize_leaf_max_limit(leaf_max_limit)
+        leaf_max_limit = normalize_virtual_leaf_max_limit(leaf_max_limit)
 
         # Check cache first
         created = session.get("created_signals", {})
@@ -902,7 +898,7 @@ class VirtualSignalService:
         """
         from .clients import _wave_query
 
-        leaf_max_limit = _normalize_leaf_max_limit(leaf_max_limit)
+        leaf_max_limit = normalize_virtual_leaf_max_limit(leaf_max_limit)
 
         # 1. Fetch exactly the state immediately before the window
         seed_time = max(0, int(start_time) - 1)

@@ -22,6 +22,7 @@ DEFAULT_TRANSITION_LIMIT = 256
 DEFAULT_VIRTUAL_LEAF_MAX_LIMIT = 10000
 DEFAULT_BACKEND_READ_TIMEOUT_SEC = 300
 MAX_VIRTUAL_SIGNAL_DEPTH = 16
+MIN_CLOCK_LIKE_TRANSITIONS = 5
 
 # ---------------------------------------------------------------------------
 # Session store paths
@@ -53,3 +54,16 @@ BoundaryPolicy = Literal["inclusive", "exclusive"]
 TraceMode = Literal["drivers", "loads"]
 TimeReference = int | str
 ResolutionReference = int | str
+
+
+def normalize_virtual_leaf_max_limit(max_limit: Optional[int]) -> int:
+    """Normalize optional virtual leaf limits and reject non-positive values."""
+    if max_limit is None:
+        return DEFAULT_VIRTUAL_LEAF_MAX_LIMIT
+    try:
+        limit = int(max_limit)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("virtual_leaf_max_limit must be an integer > 0") from exc
+    if limit <= 0:
+        raise ValueError("virtual_leaf_max_limit must be > 0")
+    return limit

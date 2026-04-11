@@ -87,7 +87,9 @@ def main():
     try:
         db = tmpdir / "semantic.db"
         part_db = tmpdir / "semantic_part.db"
+        low_mem_db = tmpdir / "semantic_low_mem.db"
         inc_db = tmpdir / "semantic_inc.db"
+        v3_db = tmpdir / "semantic_v3.db"
 
         # 1) compile smoke
         c = run_cmd(
@@ -123,6 +125,22 @@ def main():
         if "signals:" not in c_part.stdout:
             raise AssertionError(f"partition compile output missing signals summary: {c_part.stdout}")
 
+        c_low_mem = run_cmd(
+            [
+                str(rtl_trace),
+                "compile",
+                "--db",
+                str(low_mem_db),
+                "--low-mem",
+                "--single-unit",
+                str(fixture),
+                "--top",
+                "semantic_top",
+            ]
+        )
+        if "signals:" not in c_low_mem.stdout:
+            raise AssertionError(f"low-mem compile output missing signals summary: {c_low_mem.stdout}")
+
         # 3) drivers can cross submodule input port and reach producer assignments
         drivers = run_trace_json(rtl_trace, db, "drivers", "semantic_top.u_cons.in_bus")
         if drivers.get("summary", {}).get("count") != 2:
@@ -144,6 +162,13 @@ def main():
                 "partitioned compile changed drivers query output:\n"
                 f"default={json.dumps(drivers, sort_keys=True)}\n"
                 f"partitioned={json.dumps(part_drivers, sort_keys=True)}"
+            )
+        low_mem_drivers = run_trace_json(rtl_trace, low_mem_db, "drivers", "semantic_top.u_cons.in_bus")
+        if low_mem_drivers != drivers:
+            raise AssertionError(
+                "low-mem compile changed drivers query output:\n"
+                f"default={json.dumps(drivers, sort_keys=True)}\n"
+                f"low_mem={json.dumps(low_mem_drivers, sort_keys=True)}"
             )
 
         # 4) better loads assignment context: condition expression should carry LHS path
@@ -176,6 +201,13 @@ def main():
                 "partitioned compile changed loads query output:\n"
                 f"default={json.dumps(hit_loads, sort_keys=True)}\n"
                 f"partitioned={json.dumps(part_hit_loads, sort_keys=True)}"
+            )
+        low_mem_hit_loads = run_trace_json(rtl_trace, low_mem_db, "loads", "semantic_top.hit")
+        if low_mem_hit_loads != hit_loads:
+            raise AssertionError(
+                "low-mem compile changed loads query output:\n"
+                f"default={json.dumps(hit_loads, sort_keys=True)}\n"
+                f"low_mem={json.dumps(low_mem_hit_loads, sort_keys=True)}"
             )
 
         # 5) bit-level precision and bit-select query filtering
@@ -394,6 +426,30 @@ def main():
             or "12" not in double_width.get("value", "")
         ):
             raise AssertionError(f"unexpected DOUBLE_WIDTH parameter payload: {double_width}")
+
+        shutil.copyfile(db, v3_db)
+        with v3_db.open("r+b") as handle:
+            handle.seek(16)
+            handle.write((3).to_bytes(4, "little"))
+
+        whereis_params_v3 = run_json_cmd(
+            [
+                str(rtl_trace),
+                "whereis-instance",
+                "--db",
+                str(v3_db),
+                "--instance",
+                "semantic_top.u_param",
+                "--format",
+                "json",
+                "--show-params",
+            ]
+        )
+        if whereis_params_v3.get("parameters") is not None:
+            raise AssertionError(f"expected parameters to be unavailable for v3 DB: {whereis_params_v3}")
+        reason = whereis_params_v3.get("parameters_unavailable_reason", "")
+        if "db version 3 does not store instance parameter metadata" not in reason:
+            raise AssertionError(f"unexpected v3 parameter diagnostic: {whereis_params_v3}")
 
         # ---- Tests 9-20 (new test additions) ----
 

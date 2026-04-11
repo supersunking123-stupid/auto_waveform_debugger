@@ -1,5 +1,5 @@
 ---
-name: rtl-crawler
+name: rtl-crawler-multi-agent
 description: "Systematically explore an RTL design's structural hierarchy using rtl_trace tools, then generate per-subsystem markdown documentation describing the architecture. Use this skill whenever the user asks to 'crawl', 'explore', 'document', or 'map' an RTL design, or when they mention 'RTL Crawler'. Also trigger when the user wants to generate architecture docs from a compiled rtl_trace database, or asks you to understand the structure of a chip/SoC/ASIC/FPGA design before debugging. This skill produces markdown files that serve as a shared knowledge base so that other agents (or humans) can quickly orient themselves in the design without repeating the exploration."
 ---
 

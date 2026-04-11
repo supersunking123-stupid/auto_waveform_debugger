@@ -37,6 +37,7 @@ from .models import (
     DEFAULT_RTL_TRACE_BIN,
     DEFAULT_SESSION_NAME,
     DEFAULT_VIRTUAL_LEAF_MAX_LIMIT,
+    MIN_CLOCK_LIKE_TRANSITIONS,
     Direction,
     EdgeType,
     EdgeTypeAlias,
@@ -44,6 +45,7 @@ from .models import (
     TimeReference,
     TraceMode,
     TraceOptions,
+    normalize_virtual_leaf_max_limit,
 )
 from .ranking import (
     _build_explanations,
@@ -635,16 +637,6 @@ def _normalize_boundary_policy(boundary_policy: BoundaryPolicy | str) -> str:
     raise ValueError("boundary_policy must be 'inclusive' or 'exclusive'")
 
 
-def _normalize_virtual_leaf_max_limit(virtual_leaf_max_limit: int) -> int:
-    try:
-        limit = int(virtual_leaf_max_limit)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("virtual_leaf_max_limit must be an integer > 0") from exc
-    if limit <= 0:
-        raise ValueError("virtual_leaf_max_limit must be > 0")
-    return limit
-
-
 def _real_signal_matches_edge_at_time(
     path: str,
     session: Dict[str, Any],
@@ -1055,7 +1047,7 @@ def _virtual_analyze_pattern_summary(
     if num_transitions == 0:
         return "Static signal, no transitions in this window."
 
-    if num_transitions > 4:
+    if num_transitions >= MIN_CLOCK_LIKE_TRANSITIONS:
         intervals = [
             int(transitions[idx]["t"]) - int(transitions[idx - 1]["t"])
             for idx in range(1, len(transitions))
@@ -1116,7 +1108,7 @@ def find_edge(
     """Search for the next or previous signal edge from a time reference."""
     try:
         edge_type = _normalize_edge_type(edge_type)
-        virtual_leaf_max_limit = _normalize_virtual_leaf_max_limit(virtual_leaf_max_limit)
+        virtual_leaf_max_limit = normalize_virtual_leaf_max_limit(virtual_leaf_max_limit)
         resolved_time, time_info, session = _resolve_time_reference(start_time, waveform_path=vcd_path, session_name=session_name)
         if vs_service.is_virtual(path, session):
             CHUNK_SIZE = 1000000
@@ -1218,7 +1210,7 @@ def find_value_intervals(
 ):
     """Find all matching value intervals in a session-aware time range."""
     try:
-        virtual_leaf_max_limit = _normalize_virtual_leaf_max_limit(virtual_leaf_max_limit)
+        virtual_leaf_max_limit = normalize_virtual_leaf_max_limit(virtual_leaf_max_limit)
         resolved_start, resolved_end, start_info, end_info, session = _resolve_time_range_reference(
             start_time,
             end_time,
@@ -1317,7 +1309,7 @@ def get_transitions(
 ):
     """Get a compressed transition history in a session-aware time window."""
     try:
-        virtual_leaf_max_limit = _normalize_virtual_leaf_max_limit(virtual_leaf_max_limit)
+        virtual_leaf_max_limit = normalize_virtual_leaf_max_limit(virtual_leaf_max_limit)
         resolved_start, resolved_end, start_info, end_info, session = _resolve_time_range_reference(
             start_time,
             end_time,
@@ -1368,7 +1360,7 @@ def count_transitions(
     try:
         edge_type = _normalize_edge_type(edge_type)
         boundary_policy = _normalize_boundary_policy(boundary_policy)
-        virtual_leaf_max_limit = _normalize_virtual_leaf_max_limit(virtual_leaf_max_limit)
+        virtual_leaf_max_limit = normalize_virtual_leaf_max_limit(virtual_leaf_max_limit)
         resolved_start, resolved_end, start_info, end_info, session = _resolve_time_range_reference(
             start_time,
             end_time,
@@ -1509,7 +1501,7 @@ def get_signal_overview(
     - resolution may be an integer or "auto"
     """
     try:
-        virtual_leaf_max_limit = _normalize_virtual_leaf_max_limit(virtual_leaf_max_limit)
+        virtual_leaf_max_limit = normalize_virtual_leaf_max_limit(virtual_leaf_max_limit)
         resolved_start, resolved_end, start_info, end_info, session = _resolve_time_range_reference(
             start_time,
             end_time,
@@ -1582,7 +1574,7 @@ def analyze_pattern(
 ):
     """Analyze a signal's behavior (e.g., identify clocks, static signals)."""
     try:
-        virtual_leaf_max_limit = _normalize_virtual_leaf_max_limit(virtual_leaf_max_limit)
+        virtual_leaf_max_limit = normalize_virtual_leaf_max_limit(virtual_leaf_max_limit)
         resolved_start, resolved_end, start_info, end_info, session = _resolve_time_range_reference(
             start_time,
             end_time,
