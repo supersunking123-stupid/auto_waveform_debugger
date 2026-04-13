@@ -686,6 +686,41 @@ def main():
                 f"modified source should NOT produce incremental-cache-hit: {inc_miss2.stdout}"
             )
 
+        # 23) Test — severity remapping: --compat vcs downgrades IndexOOB from Error to Warning
+        compat_fixture = src_dir / "tests" / "fixtures" / "compat_severity.sv"
+        if not compat_fixture.exists():
+            raise SystemExit(f"fixture not found: {compat_fixture}")
+        compat_db = tmpdir / "compat_severity.db"
+        compat_db_nocompat = tmpdir / "compat_severity_nocompat.db"
+
+        # With --compat vcs: IndexOOB is Warning, compile should succeed
+        c_compat = run_cmd(
+            [
+                str(rtl_trace),
+                "compile",
+                "--db", str(compat_db),
+                "--single-unit",
+                str(compat_fixture),
+                "--top", "compat_severity_top",
+                "--compat", "vcs",
+            ]
+        )
+        if "signals:" not in c_compat.stdout:
+            raise AssertionError(f"--compat vcs compile should succeed: {c_compat.stdout}")
+
+        # Without --compat vcs: IndexOOB is Error, compile should fail
+        run_cmd(
+            [
+                str(rtl_trace),
+                "compile",
+                "--db", str(compat_db_nocompat),
+                "--single-unit",
+                str(compat_fixture),
+                "--top", "compat_severity_top",
+            ],
+            expect=1,
+        )
+
         print("semantic_regression: PASS")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

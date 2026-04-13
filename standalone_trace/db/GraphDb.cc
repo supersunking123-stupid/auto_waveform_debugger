@@ -2371,10 +2371,12 @@ bool IsIgnoredCompileDiag(const slang::Diagnostic &diag, const slang::SourceMana
   return name == "UnknownSystemName";
 }
 
-bool HasBlockingCompileDiagnostics(slang::ast::Compilation &compilation, bool relax_defparam) {
+bool HasBlockingCompileDiagnostics(slang::ast::Compilation &compilation,
+                                   const slang::DiagnosticEngine &diagEngine,
+                                   bool relax_defparam) {
   const slang::SourceManager &sm = *compilation.getSourceManager();
   for (const slang::Diagnostic &diag : compilation.getAllDiagnostics()) {
-    const auto severity = slang::getDefaultSeverity(diag.code);
+    const auto severity = diagEngine.getSeverity(diag.code, diag.location);
     if (severity != slang::DiagnosticSeverity::Error &&
         severity != slang::DiagnosticSeverity::Fatal) {
       continue;

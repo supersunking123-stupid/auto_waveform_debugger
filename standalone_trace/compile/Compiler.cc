@@ -72,7 +72,9 @@ bool IsDefparamRelaxDiag(slang::DiagCode code);
 bool IsDefparamContextDiagnostic(const slang::Diagnostic &diag, const slang::SourceManager &sm);
 bool IsIgnoredCompileDiag(const slang::Diagnostic &diag, const slang::SourceManager &sm,
                           bool relax_defparam);
-bool HasBlockingCompileDiagnostics(slang::ast::Compilation &compilation, bool relax_defparam);
+bool HasBlockingCompileDiagnostics(slang::ast::Compilation &compilation,
+                                   const slang::DiagnosticEngine &diagEngine,
+                                   bool relax_defparam);
 
 } // namespace rtl_trace
 
@@ -393,7 +395,7 @@ int RunCompile(int argc, char *argv[]) {
   std::unique_ptr<slang::ast::Compilation> compilation = driver.createCompilation();
   driver.reportCompilation(*compilation, /*quiet*/ true);
   LogMem("MemAfterElab");
-  if (HasBlockingCompileDiagnostics(*compilation, relax_defparam)) {
+  if (HasBlockingCompileDiagnostics(*compilation, driver.diagEngine, relax_defparam)) {
     if (!driver.reportDiagnostics(/*quiet*/ true)) return 1;
   }
 
