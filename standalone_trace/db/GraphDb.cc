@@ -657,7 +657,10 @@ class PortConnectionResultCollector
   void handle(const slang::ast::MemberAccessExpression &expr) {
     auto mai = ResolveStructMemberAccess(expr);
     if (mai.resolved) {
-      if (!visited_.insert(mai.parent_symbol).second) return;
+      // Dedup on (parent_symbol, member_path) so distinct fields of the same
+      // struct aren't collapsed (e.g. {pkt.valid, pkt.code[0]} on one port).
+      if (!visited_member_keys_.insert({mai.parent_symbol, mai.member_path}).second)
+        return;
       ExprTraceResult result;
       result.expr = &expr;
       result.symbol = mai.parent_symbol;
@@ -693,7 +696,9 @@ class PortConnectionResultCollector
  private:
   std::vector<TraceResult> &out_;
   std::unordered_set<const slang::ast::Symbol *> &visited_;
-  const slang::ast::InstanceSymbol *instance_ = nullptr;
+  // Separate dedup for struct member accesses keyed on (parent, member_path)
+  // so that distinct fields (e.g. pkt.valid vs pkt.code) aren't collapsed.
+  std::set<std::pair<const slang::ast::Symbol *, std::string>> visited_member_keys_;  const slang::ast::InstanceSymbol *instance_ = nullptr;
   const slang::ast::PortSymbol *port_ = nullptr;
 };
 
@@ -1370,16 +1375,51 @@ EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManag
           rec.file = std::string(sm.getFileName(loc));
           rec.line = sm.getLineNumber(loc);
           if (item.symbol != nullptr) {
-            auto bit_desc = DescribeBitSelectors(item.selectors, sm, *item.symbol);
-            rec.bit_map = std::move(bit_desc.first);
-            rec.bit_map_approximate = bit_desc.second;
-          }
-          // Struct member access: encode member bit offset into bit_map
-          if (item.member_bit_width > 0) {
-            uint64_t lo = item.member_bit_offset;
-            uint64_t hi = lo + item.member_bit_width - 1;
-            std::string member_range = "[" + std::to_string(hi) + ":" + std::to_string(lo) + "]";
-            rec.bit_map = std::move(member_range) + rec.bit_map;
+            if (item.member_bit_width > 0) {
+              // Struct member access: compute absolute bit ranges by adding
+              // member_bit_offset to each selector's evaluated range.
+              if (item.selectors.empty()) {
+                // No sub-select: full member range
+                uint64_t lo = item.member_bit_offset;
+                uint64_t hi = lo + item.member_bit_width - 1;
+                rec.bit_map = (hi == lo)
+                    ? "[" + std::to_string(hi) + "]"
+                    : "[" + std::to_string(hi) + ":" + std::to_string(lo) + "]";
+                rec.bit_map_approximate = false;
+              } else {
+                // Sub-select within member (e.g. pkt.data[1:0]):
+                // selectors are relative to the member field; add member offset
+                // to get absolute positions within the parent struct.
+                bool approximate = false;
+                for (const slang::ast::Expression *sel_expr : item.selectors) {
+                  slang::ast::EvalContext eval_ctx(*item.symbol);
+                  if (auto range = sel_expr->evalSelector(eval_ctx, false)) {
+                    int64_t abs_left  = range->left  + static_cast<int64_t>(item.member_bit_offset);
+                    int64_t abs_right = range->right + static_cast<int64_t>(item.member_bit_offset);
+                    rec.bit_map += (abs_left == abs_right)
+                        ? "[" + std::to_string(abs_left) + "]"
+                        : "[" + std::to_string(abs_left) + ":" + std::to_string(abs_right) + "]";
+                    continue;
+                  }
+                  // Non-constant selector — fall back to source text with member range prefix
+                  approximate = true;
+                  if (const auto *sel = sel_expr->as_if<slang::ast::ElementSelectExpression>()) {
+                    rec.bit_map += "[" + GetSourceText(sel->selector().sourceRange, sm) + "]";
+                  } else if (const auto *sel = sel_expr->as_if<slang::ast::RangeSelectExpression>()) {
+                    rec.bit_map += "[" + GetSourceText(sel->left().sourceRange, sm) + ":"
+                                + GetSourceText(sel->right().sourceRange, sm) + "]";
+                  } else {
+                    rec.bit_map += "[" + GetSourceText(sel_expr->sourceRange, sm) + "]";
+                  }
+                }
+                rec.bit_map_approximate = approximate;
+              }
+            } else {
+              // Normal (non-member) case
+              auto bit_desc = DescribeBitSelectors(item.selectors, sm, *item.symbol);
+              rec.bit_map = std::move(bit_desc.first);
+              rec.bit_map_approximate = bit_desc.second;
+            }
           }
           if (item.assignment != nullptr) {
             if (auto off = GetSourceOffsetRange(item.assignment->sourceRange, sm); off.has_value()) {

@@ -752,12 +752,14 @@ def main():
             "missing struct field load for pkt.valid or pkt.code",
         )
 
-        # Bit-map should encode member offset (pkt.data = bits [7:4])
+        # Bit-map should encode correct absolute range for sub-selected member
+        # pkt.data is at bits [3:0]; pkt.data[1:0] should produce [1:0], not [3:0]
         data_loads = run_trace_json(rtl_trace, struct_db, "loads", "struct_top.u_cons.pkt")
         assert_any(
             data_loads.get("endpoints", []),
-            lambda e: "pkt.data" in e.get("path", "") and e.get("bit_map", ""),
-            "missing struct field load for pkt.data with bit_map",
+            lambda e: "pkt.data" in e.get("path", "") and e.get("bit_map", "") == "[1:0]",
+            f"pkt.data[1:0] should have bit_map '[1:0]', got: "
+            + str([e.get("bit_map") for e in data_loads.get("endpoints", []) if "pkt.data" in e.get("path", "")]),
         )
 
         print("semantic_regression: PASS")
