@@ -721,6 +721,45 @@ def main():
             expect=1,
         )
 
+        # 24) Struct member access — packed struct field drivers/loads
+        struct_fixture = src_dir / "tests" / "fixtures" / "struct_top.sv"
+        if not struct_fixture.exists():
+            raise SystemExit(f"fixture not found: {struct_fixture}")
+        struct_db = tmpdir / "struct.db"
+
+        run_cmd(
+            [
+                str(rtl_trace), "compile",
+                "--db", str(struct_db),
+                "--single-unit", str(struct_fixture),
+                "--top", "struct_top",
+            ]
+        )
+
+        # Drivers of struct_prod.pkt should include pkt.valid assignment
+        pkt_drivers = run_trace_json(rtl_trace, struct_db, "drivers", "struct_top.u_prod.pkt")
+        assert_any(
+            pkt_drivers.get("endpoints", []),
+            lambda e: "pkt.valid" in e.get("path", ""),
+            "missing struct field driver for pkt.valid",
+        )
+
+        # Loads of struct_cons.pkt should include pkt.valid read
+        pkt_loads = run_trace_json(rtl_trace, struct_db, "loads", "struct_top.u_cons.pkt")
+        assert_any(
+            pkt_loads.get("endpoints", []),
+            lambda e: "pkt.valid" in e.get("path", "") or "pkt.code" in e.get("path", ""),
+            "missing struct field load for pkt.valid or pkt.code",
+        )
+
+        # Bit-map should encode member offset (pkt.data = bits [7:4])
+        data_loads = run_trace_json(rtl_trace, struct_db, "loads", "struct_top.u_cons.pkt")
+        assert_any(
+            data_loads.get("endpoints", []),
+            lambda e: "pkt.data" in e.get("path", "") and e.get("bit_map", ""),
+            "missing struct field load for pkt.data with bit_map",
+        )
+
         print("semantic_regression: PASS")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

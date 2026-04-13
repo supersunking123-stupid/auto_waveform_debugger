@@ -101,6 +101,11 @@ struct ExprTraceResult {
   bool context_from_instance_port = false;
   const slang::ast::InstanceSymbol *context_instance = nullptr;
   const slang::ast::PortSymbol *context_port = nullptr;
+  // Struct member access metadata (Level 1). Non-empty when this result was
+  // produced by resolving a MemberAccessExpression chain to a parent struct.
+  std::string member_path;         // e.g. ".aw.valid"
+  uint64_t member_bit_offset = 0;  // bit offset within parent struct
+  uint64_t member_bit_width = 0;   // bit width of the accessed member
 };
 
 using TraceResult = std::variant<const slang::ast::PortSymbol *, ExprTraceResult>;
@@ -190,6 +195,70 @@ const slang::ast::InstanceSymbol *GetContainingInstanceSymbol(const slang::ast::
 bool IsTraceable(const slang::ast::Symbol *sym) {
   if (sym == nullptr) return false;
   return sym->kind == slang::ast::SymbolKind::Net || sym->kind == slang::ast::SymbolKind::Variable;
+}
+
+// --- Struct member access resolution (Level 1) ---
+
+struct MemberAccessInfo {
+  const slang::ast::Symbol *parent_symbol = nullptr;
+  std::string member_path;        // e.g. ".aw.valid"
+  uint64_t bit_offset = 0;        // cumulative offset within parent struct
+  uint64_t bit_width = 0;         // width of innermost field
+  bool resolved = false;
+};
+
+// Walks a MemberAccessExpression chain (e.g. my_struct.aw.valid) back to the
+// root traceable symbol (Net or Variable), accumulating bit offsets and member
+// names along the way.  Only handles packed struct types in Level 1.
+MemberAccessInfo ResolveStructMemberAccess(const slang::ast::MemberAccessExpression &expr) {
+  MemberAccessInfo info;
+
+  // Collect FieldSymbols from outer to inner.
+  // For my_struct.aw.valid:
+  //   outer MAE: member=valid, value=MAE(member=aw, value=NamedValue(my_struct))
+  //   collected: [valid, aw]
+  struct FieldEntry { const slang::ast::FieldSymbol *field; };
+  std::vector<FieldEntry> fields;
+
+  const slang::ast::Expression *current = &expr;
+  while (auto *mae = current->as_if<slang::ast::MemberAccessExpression>()) {
+    const auto *fs = mae->member.as_if<slang::ast::FieldSymbol>();
+    if (fs == nullptr) return info;  // non-field member — not handled
+    fields.push_back({fs});
+    current = &mae->value();
+  }
+
+  // Base must be a NamedValueExpression with a traceable symbol.
+  const auto *nve = current->as_if<slang::ast::NamedValueExpression>();
+  if (nve == nullptr) return info;
+  if (!IsTraceable(&nve->symbol)) return info;
+
+  // Verify root is a packed struct type.
+  const slang::ast::Type &root_type = nve->symbol.as_if<slang::ast::ValueSymbol>()->getType();
+  const slang::ast::Type &canonical = root_type.getCanonicalType();
+  if (canonical.kind != slang::ast::SymbolKind::PackedStructType) return info;
+
+  // Reverse: fields are [valid, aw] (outer first), we need [aw, valid] for
+  // correct bit-offset accumulation (outer-to-inner in source order).
+  std::reverse(fields.begin(), fields.end());
+
+  uint64_t offset = 0;
+  std::string path;
+  for (const auto &entry : fields) {
+    offset += entry.field->bitOffset;
+    path += ".";
+    path += std::string(entry.field->name);
+  }
+
+  // Innermost field (last in reversed = first in original = outermost MAE member)
+  const slang::ast::Type &field_type = fields.back().field->getType().getCanonicalType();
+
+  info.parent_symbol = &nve->symbol;
+  info.member_path = std::move(path);
+  info.bit_offset = offset;
+  info.bit_width = field_type.getBitWidth();
+  info.resolved = true;
+  return info;
 }
 
 bool SymbolPathLess(const slang::ast::Symbol *lhs, const slang::ast::Symbol *rhs) {
@@ -393,6 +462,56 @@ class BodyTraceIndexBuilder : public slang::ast::ASTVisitor<BodyTraceIndexBuilde
   }
 
   void handle(const slang::ast::MemberAccessExpression &expr) {
+    // Try to resolve struct member access (e.g. pkt.valid → parent pkt + offset)
+    auto mai = ResolveStructMemberAccess(expr);
+    if (mai.resolved) {
+      if constexpr (DRIVERS) {
+        if (checking_instance_port_expression_ || checking_lhs_) {
+          ExprTraceResult result;
+          result.expr = &expr;
+          result.symbol = mai.parent_symbol;
+          result.trace_body = &body_;
+          if (checking_lhs_) result.assignment = current_assignment_;
+          result.selectors = selector_stack_;
+          result.member_path = std::move(mai.member_path);
+          result.member_bit_offset = mai.bit_offset;
+          result.member_bit_width = mai.bit_width;
+          if (checking_instance_port_expression_ && active_instance_ != nullptr && active_port_ != nullptr) {
+            result.context_from_instance_port = true;
+            result.context_instance = active_instance_;
+            result.context_port = active_port_;
+          }
+          Entries()[mai.parent_symbol].push_back(std::move(result));
+        }
+      } else {
+        if (!(checking_lhs_ && selector_depth_ == 0)) {
+          ExprTraceResult result;
+          result.expr = &expr;
+          result.symbol = mai.parent_symbol;
+          result.assignment = current_assignment_;
+          result.trace_body = &body_;
+          result.selectors = selector_stack_;
+          result.member_path = std::move(mai.member_path);
+          result.member_bit_offset = mai.bit_offset;
+          result.member_bit_width = mai.bit_width;
+          if (checking_instance_port_expression_ && active_instance_ != nullptr && active_port_ != nullptr) {
+            result.context_from_instance_port = true;
+            result.context_instance = active_instance_;
+            result.context_port = active_port_;
+          }
+          if (current_assignment_ == nullptr && current_condition_expr_ != nullptr &&
+              !condition_lhs_stack_.empty()) {
+            result.context_lhs_signals = condition_lhs_stack_.back();
+          } else if (current_assignment_ == nullptr && !timed_lhs_stack_.empty()) {
+            result.context_lhs_signals = timed_lhs_stack_.back();
+          }
+          Entries()[mai.parent_symbol].push_back(std::move(result));
+        }
+      }
+      return;
+    }
+
+    // Fall through: original behavior for non-struct member access
     const slang::ast::Symbol *sym = expr.getSymbolReference();
     if (!IsTraceable(sym)) return;
     if constexpr (DRIVERS) {
@@ -536,6 +655,22 @@ class PortConnectionResultCollector
   }
 
   void handle(const slang::ast::MemberAccessExpression &expr) {
+    auto mai = ResolveStructMemberAccess(expr);
+    if (mai.resolved) {
+      if (!visited_.insert(mai.parent_symbol).second) return;
+      ExprTraceResult result;
+      result.expr = &expr;
+      result.symbol = mai.parent_symbol;
+      result.assignment = nullptr;
+      result.context_from_instance_port = true;
+      result.context_instance = instance_;
+      result.context_port = port_;
+      result.member_path = std::move(mai.member_path);
+      result.member_bit_offset = mai.bit_offset;
+      result.member_bit_width = mai.bit_width;
+      out_.push_back(std::move(result));
+      return;
+    }
     const slang::ast::Symbol *sym = expr.getSymbolReference();
     if (!IsTraceable(sym)) return;
     if (!visited_.insert(sym).second) return;
@@ -1042,6 +1177,8 @@ SymbolRefList CollectRhsSignals(const slang::ast::AssignmentExpression *assignme
     }
 
     void handle(const slang::ast::MemberAccessExpression &expr) {
+      auto mai = ResolveStructMemberAccess(expr);
+      if (mai.resolved) { out_.push_back(mai.parent_symbol); return; }
       if (const slang::ast::Symbol *sym = expr.getSymbolReference(); IsTraceable(sym)) out_.push_back(sym);
     }
 
@@ -1070,6 +1207,8 @@ SymbolRefList CollectLhsSignals(const slang::ast::AssignmentExpression *assignme
     }
 
     void handle(const slang::ast::MemberAccessExpression &expr) {
+      auto mai = ResolveStructMemberAccess(expr);
+      if (mai.resolved) { out_.push_back(mai.parent_symbol); return; }
       if (const slang::ast::Symbol *sym = expr.getSymbolReference(); IsTraceable(sym)) out_.push_back(sym);
     }
 
@@ -1102,6 +1241,8 @@ SymbolRefList CollectLhsSignalsFromStatement(const slang::ast::Statement &stmt) 
         }
 
         void handle(const slang::ast::MemberAccessExpression &expr) {
+          auto mai = ResolveStructMemberAccess(expr);
+          if (mai.resolved) { out_.push_back(mai.parent_symbol); return; }
           if (const slang::ast::Symbol *sym = expr.getSymbolReference(); IsTraceable(sym)) out_.push_back(sym);
         }
 
@@ -1218,8 +1359,12 @@ EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManag
               rec.path_id = it->second;
             }
           }
-          if (rec.path_id == std::numeric_limits<uint32_t>::max()) {
+          if (rec.path_id == std::numeric_limits<uint32_t>::max() || !item.member_path.empty()) {
+            // Build path string directly: parent hierarchical path + member suffix
+            // (path_id points to the parent struct name, missing the member part)
             rec.path = item.symbol != nullptr ? item.symbol->getHierarchicalPath() : "";
+            rec.path += item.member_path;
+            rec.path_id = std::numeric_limits<uint32_t>::max();  // use string, not ID
           }
           const auto loc = item.expr->sourceRange.start();
           rec.file = std::string(sm.getFileName(loc));
@@ -1228,6 +1373,13 @@ EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManag
             auto bit_desc = DescribeBitSelectors(item.selectors, sm, *item.symbol);
             rec.bit_map = std::move(bit_desc.first);
             rec.bit_map_approximate = bit_desc.second;
+          }
+          // Struct member access: encode member bit offset into bit_map
+          if (item.member_bit_width > 0) {
+            uint64_t lo = item.member_bit_offset;
+            uint64_t hi = lo + item.member_bit_width - 1;
+            std::string member_range = "[" + std::to_string(hi) + ":" + std::to_string(lo) + "]";
+            rec.bit_map = std::move(member_range) + rec.bit_map;
           }
           if (item.assignment != nullptr) {
             if (auto off = GetSourceOffsetRange(item.assignment->sourceRange, sm); off.has_value()) {
