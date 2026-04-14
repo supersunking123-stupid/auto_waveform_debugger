@@ -762,6 +762,34 @@ def main():
             + str([e.get("bit_map") for e in data_loads.get("endpoints", []) if "pkt.data" in e.get("path", "")]),
         )
 
+        # 25) Multi-member port connection: {pkt.valid, pkt.code[0]} must
+        #     produce two distinct member endpoints, not collapse to one.
+        concat_fixture = src_dir / "tests" / "fixtures" / "concat_top.sv"
+        if not concat_fixture.exists():
+            raise SystemExit(f"fixture not found: {concat_fixture}")
+        concat_db = tmpdir / "concat.db"
+
+        run_cmd(
+            [
+                str(rtl_trace), "compile",
+                "--db", str(concat_db),
+                "--single-unit", str(concat_fixture),
+                "--top", "concat_top",
+            ]
+        )
+
+        concat_loads = run_trace_json(rtl_trace, concat_db, "loads", "concat_top.u_src.pkt")
+        assert_any(
+            concat_loads.get("endpoints", []),
+            lambda e: "pkt.valid" in e.get("path", ""),
+            "multi-member port: pkt.valid endpoint missing",
+        )
+        assert_any(
+            concat_loads.get("endpoints", []),
+            lambda e: "pkt.code" in e.get("path", ""),
+            "multi-member port: pkt.code endpoint missing",
+        )
+
         print("semantic_regression: PASS")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)

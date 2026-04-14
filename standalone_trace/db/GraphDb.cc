@@ -774,12 +774,22 @@ std::vector<TraceResult> ComputeIndexedTraceResults(
     bool followed = false;
     if (expr != nullptr && expr->context_from_instance_port && expr->context_port != nullptr &&
         expr->context_port->internalSymbol != nullptr) {
-      const slang::ast::Symbol *internal = expr->context_port->internalSymbol;
-      if (visited.insert(internal).second) {
-        std::vector<TraceResult> nested = ComputeIndexedTraceResults<DRIVERS>(internal, cache, visited);
-        if (!nested.empty()) {
-          out.insert(out.end(), std::make_move_iterator(nested.begin()), std::make_move_iterator(nested.end()));
-          followed = true;
+      if (!expr->member_path.empty()) {
+        // Struct member through a port connection: keep the member-specific
+        // result as-is.  Don't follow internalSymbol here because the
+        // recursive trace operates at whole-struct granularity and would
+        // lose member specificity.  Multiple distinct members of the same
+        // port (e.g. {pkt.valid, pkt.code[0]}) each produce their own
+        // endpoint because we do NOT mark the internal symbol as visited.
+        // (followed stays false so the member result is pushed below.)
+      } else {
+        const slang::ast::Symbol *internal = expr->context_port->internalSymbol;
+        if (visited.insert(internal).second) {
+          std::vector<TraceResult> nested = ComputeIndexedTraceResults<DRIVERS>(internal, cache, visited);
+          if (!nested.empty()) {
+            out.insert(out.end(), std::make_move_iterator(nested.begin()), std::make_move_iterator(nested.end()));
+            followed = true;
+          }
         }
       }
     }
