@@ -219,7 +219,9 @@ This is the preferred mode for large designs because it avoids reloading the gra
 - string interning reduces duplication
 - reverse-reference ranges make traversal faster
 
-In the current format (`GraphDbFileHeader.version = 2`), the DB also stores an additional reverse-reference table for inferred assignment LHS paths. This specifically accelerates `drivers` queries on interface-member / bind-assignment targets that do not naturally produce a direct symbol-keyed driver edge, for example:
+In the current format (`GraphDbFileHeader.version = 5`), the DB also stores:
+
+- **Assignment-LHS reverse-reference tables** (`assignment_lhs_ref_ranges`, `assignment_lhs_ref_signal_ids`): map an inferred assignment LHS hierarchical path to candidate source signals whose `loads` endpoints contain that assignment. This specifically accelerates `drivers` queries on interface-member / bind-assignment targets that do not naturally produce a direct symbol-keyed driver edge, for example:
 - `top.u_bind.mon_if.master_if[0].rlast`
 - other `if0.sig`-style interface member assignments
 
@@ -250,6 +252,16 @@ This keeps DB size under control.
 
 Compile also stores `assignment_text` in expression endpoints while building the graph, which allows the assignment-LHS reverse-reference table to be derived once during DB creation instead of being reconstructed by scanning source text during later queries.
 
+### Struct member tracing
+
+Packed struct fields are handled at two levels:
+
+**Level 1 — Expression tracing** (`ResolveStructMemberAccess`): When the AST contains a `MemberAccessExpression` (e.g., `pkt.valid`), the tracer resolves the chain to the parent struct's `Symbol*` plus a bit offset/width. Endpoints carry the full member path (e.g., `top.req.aw.valid`) with an absolute bit range.
+
+**Level 2 — Signal decomposition** (`DecomposeStructMembers`): After `CollectTraceableSymbols`, packed struct fields are enumerated as additional `SignalCompileItem` entries (recursively, max depth 2). These are stored in the DB with `parent_signal_id`, `member_bit_offset`, and `member_bit_width`. Member signals skip `BuildSignalRecord` — their endpoints are materialized at query time by filtering the parent's endpoints via `EndpointMatchesSignalSelect()`. Member signals are excluded from the `symbol_path_ids` reverse index because they reuse the parent's `Symbol*`.
+
+DB version 5 extended `GraphSignalRecord` from 20 to 32 bytes to carry member metadata. The loader handles v4 (20-byte records) and v5 (32-byte records) transparently.
+
 ## Memory Optimization
 
 To handle large designs like NVDLA within a reasonable memory envelope, several optimizations were implemented to reduce peak RSS fragmentation and allocation overhead:
@@ -278,7 +290,7 @@ Recommendation: omit `--low-mem` when the machine has ≥10 GB free RAM. The ful
 ### Allocation-reduction optimizations (applied to the compile hot loop)
 
 - **`string_view`-keyed `InternString`**: Index maps `string_view → uint32_t` instead of `std::string → uint32_t`, pointing directly into the string pool. Eliminates one string copy per intern.
-- **Symbol* → path_id reverse index**: Pre-builds a `Symbol* → uint32_t` map from already-collected signal paths. `ResolveTraceResult` skips `getHierarchicalPath()` for known symbols.
+- **Symbol* → path_id reverse index**: Pre-builds a `Symbol* → uint32_t` map from already-collected signal paths. `ResolveTraceResult` skips `getHierarchicalPath()` for known symbols. Member signals (which reuse the parent's `Symbol*`) are excluded to prevent last-member-wins corruption.
 - **`SymbolPathLess`**: Compares `getHierarchicalPath()` string_views directly instead of materializing two `std::string` temporaries per sort comparison.
 - **`std::from_chars` for integer parsing**: `ParseExactBitMapText` and `TryParseSimpleInt` use `from_chars` on `string_view` instead of allocating a `std::string` and calling `std::stoll` with try/catch.
 - **Clock/reset name detection**: `LooksLikeClockOrResetName` and `ClassifyGlobalNetCategory` use `string_view`-based case-insensitive comparison instead of allocating and lowering a `std::string`.
