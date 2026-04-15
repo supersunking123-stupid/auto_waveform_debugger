@@ -427,10 +427,67 @@ def main():
         ):
             raise AssertionError(f"unexpected DOUBLE_WIDTH parameter payload: {double_width}")
 
-        shutil.copyfile(db, v3_db)
-        with v3_db.open("r+b") as handle:
-            handle.seek(16)
-            handle.write((3).to_bytes(4, "little"))
+        # v3 DB backward compat: create a proper v4-format DB, then patch version to 3.
+        # v5 has 32-byte signal records; we must strip the 3 extra uint32_t fields
+        # per record so the v4 loader (20-byte records) can read it.
+        # We also need to truncate the v4-only sections (hierarchy params) at the end.
+        import struct as _struct
+        _orig = open(db, "rb").read()
+        _hdr_size = _struct.calcsize("16sII15Q")  # 16+4+4+120 = 144
+        _hdr = _struct.unpack_from("16sII15Q", _orig, 0)
+        _fields = _hdr[3:]
+        _str_count = _fields[0]   # string_count
+        _str_blob_sz = _fields[1] # string_blob_size
+        _sig_count = _fields[2]   # signal_count
+        _ep_count = _fields[3]    # endpoint_count
+        _sr_count = _fields[4]    # signal_ref_count
+        _lrr_count = _fields[5]   # load_ref_range_count
+        _lr_count = _fields[6]    # load_ref_count
+        _drr_count = _fields[7]   # driver_ref_range_count
+        _dr_count = _fields[8]    # driver_ref_count
+        _lhrr_count = _fields[9]  # assignment_lhs_ref_range_count
+        _lhr_count = _fields[10]  # assignment_lhs_ref_count
+        _hier_count = _fields[11] # hierarchy_count
+        _hier_child_count = _fields[12] # hierarchy_child_count
+        _gn_count = _fields[13]   # global_net_count
+        _gs_count = _fields[14]   # global_sink_count
+
+        # Walk file layout with correct struct sizes:
+        # GraphPathRefRange = 12 bytes (3 uint32_t)
+        # GraphEndpointRecord = 48 bytes
+        # GraphHierarchyRecord = 24 bytes (v3+, 6 uint32_t)
+        # GraphGlobalNetRecord = 12 bytes
+        _str_off_end = _hdr_size + (_str_count + 1) * 4  # uint32_t offsets
+        _sig_start = _str_off_end + _str_blob_sz
+        _sig_end_v5 = _sig_start + _sig_count * 32
+
+        # Compute v3 boundary (all sections before v4-only param data)
+        _v3_end = _sig_end_v5
+        _v3_end += _ep_count * 48           # endpoints
+        _v3_end += _sr_count * 4            # signal_refs
+        _v3_end += _lrr_count * 12          # load_ref_ranges
+        _v3_end += _lr_count * 4            # load_ref_signal_ids
+        _v3_end += _drr_count * 12          # driver_ref_ranges
+        _v3_end += _dr_count * 4            # driver_ref_signal_ids
+        _v3_end += _lhrr_count * 12         # assignment_lhs_ref_ranges
+        _v3_end += _lhr_count * 4           # assignment_lhs_ref_signal_ids
+        _v3_end += _hier_count * 24         # hierarchy
+        _v3_end += _hier_child_count * 4    # hierarchy_children
+        _v3_end += _gn_count * 12           # global_nets
+        _v3_end += _gs_count * 4            # global_sinks
+
+        # Build v3 file: strip v5 signal records to v4, truncate at v3 boundary
+        _before_sigs = _orig[:_sig_start]
+        _v5_sigs = _orig[_sig_start:_sig_end_v5]
+        _v4_sigs = bytearray()
+        for _i in range(_sig_count):
+            _v4_sigs += _v5_sigs[_i*32:_i*32+20]  # keep first 5 uint32_t
+        _post_sig = _orig[_sig_end_v5:_v3_end]
+        _out = bytearray(_before_sigs) + _v4_sigs + bytearray(_post_sig)
+        # Patch version to 3
+        _struct.pack_into("<I", _out, 16, 3)
+        with open(v3_db, "wb") as _f:
+            _f.write(_out)
 
         whereis_params_v3 = run_json_cmd(
             [
@@ -789,6 +846,41 @@ def main():
             lambda e: "pkt.code" in e.get("path", ""),
             "multi-member port: pkt.code endpoint missing",
         )
+
+        # 26) Level 2 — find discovers struct members as first-class signals
+        find_valid = run_json_cmd(
+            [
+                str(rtl_trace), "find",
+                "--db", str(struct_db),
+                "--query", "pkt.valid",
+                "--format", "json",
+            ]
+        )
+        find_entries = find_valid if isinstance(find_valid, list) else find_valid.get("matches", find_valid.get("results", []))
+        member_paths = [e if isinstance(e, str) else e.get("path", "") for e in find_entries]
+        if not any("pkt.valid" in p for p in member_paths):
+            raise AssertionError(f"find 'pkt.valid' should discover member signals: {find_valid}")
+
+        # 27) Level 2 — trace member signal returns filtered endpoints
+        valid_drivers = run_trace_json(rtl_trace, struct_db, "drivers", "struct_top.u_prod.pkt.valid")
+        valid_eps = valid_drivers.get("endpoints", [])
+        # Should only contain pkt.valid assignments, not pkt.code or pkt.data
+        for ep in valid_eps:
+            if "pkt.code" in ep.get("path", "") or "pkt.data" in ep.get("path", ""):
+                raise AssertionError(
+                    f"pkt.valid drivers should not include other members: {ep}"
+                )
+        if len(valid_eps) < 2:
+            raise AssertionError(f"pkt.valid should have >= 2 drivers (reset+increment), got {len(valid_eps)}: {valid_drivers}")
+
+        valid_loads = run_trace_json(rtl_trace, struct_db, "loads", "struct_top.u_cons.pkt.valid")
+        valid_load_eps = valid_loads.get("endpoints", [])
+        # Should only contain the hit = pkt.valid & ... assignment
+        for ep in valid_load_eps:
+            if "pkt.data" in ep.get("path", "") or "pkt.code" in ep.get("path", ""):
+                raise AssertionError(
+                    f"pkt.valid loads should not include other members: {ep}"
+                )
 
         print("semantic_regression: PASS")
     finally:

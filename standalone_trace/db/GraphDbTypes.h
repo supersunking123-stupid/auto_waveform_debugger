@@ -94,6 +94,10 @@ struct GraphSignalRecord {
   uint32_t driver_count = 0;
   uint32_t load_begin = 0;
   uint32_t load_count = 0;
+  // Level 2: struct member metadata (zeroed for non-member signals and v4 DBs)
+  uint32_t parent_signal_id = std::numeric_limits<uint32_t>::max();
+  uint32_t member_bit_offset = 0;
+  uint32_t member_bit_width = 0;
 };
 
 struct GraphEndpointRecord {
@@ -290,7 +294,7 @@ constexpr char kGraphDbMagic[kGraphDbMagicSize] = {
 
 struct GraphDbFileHeader {
   char magic[kGraphDbMagicSize];
-  uint32_t version = 4;
+  uint32_t version = 5;
   uint32_t reserved = 0;
   uint64_t string_count = 0;
   uint64_t string_blob_size = 0;

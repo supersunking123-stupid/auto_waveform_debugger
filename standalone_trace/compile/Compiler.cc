@@ -75,6 +75,7 @@ bool IsIgnoredCompileDiag(const slang::Diagnostic &diag, const slang::SourceMana
 bool HasBlockingCompileDiagnostics(slang::ast::Compilation &compilation,
                                    const slang::DiagnosticEngine &diagEngine,
                                    bool relax_defparam);
+void DecomposeStructMembers(std::vector<SignalCompileItem> &signals, int max_depth);
 
 } // namespace rtl_trace
 
@@ -407,6 +408,7 @@ int RunCompile(int argc, char *argv[]) {
   logger.Log("step: collect traceable symbols");
   LogMem("MemBeforeCollectSymbols");
   CollectTraceableSymbols(root, signals);
+  DecomposeStructMembers(signals, 2);
   LogMem("MemAfterCollectSymbols");
   logger.Log("collected symbols: " + std::to_string(signals.size()));
 

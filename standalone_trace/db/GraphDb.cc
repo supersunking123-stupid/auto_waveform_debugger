@@ -1530,6 +1530,67 @@ void CollectTraceableSymbols(const slang::ast::RootSymbol &root,
             out.end());
 }
 
+// --- Struct member decomposition (Level 2) ---
+
+void DecomposePackedStructFields(std::vector<SignalCompileItem> &signals,
+                                  uint32_t parent_idx,
+                                  int max_depth,
+                                  int current_depth,
+                                  uint64_t cumulative_offset) {
+  const SignalCompileItem &parent = signals[parent_idx];
+  if (parent.sym == nullptr) return;
+
+  const auto *vs = parent.sym->as_if<slang::ast::ValueSymbol>();
+  if (vs == nullptr) return;
+
+  const slang::ast::Type &canonical = vs->getType().getCanonicalType();
+  if (canonical.kind != slang::ast::SymbolKind::PackedStructType) return;
+
+  const auto *pst = canonical.as_if<slang::ast::PackedStructType>();
+  if (pst == nullptr) return;
+  const slang::ast::Scope &scope = *pst;
+  for (const auto &field : scope.membersOfType<slang::ast::FieldSymbol>()) {
+    const uint64_t field_offset = cumulative_offset + field.bitOffset;
+    const slang::ast::Type &field_type = field.getType().getCanonicalType();
+    const uint64_t field_width = field_type.getBitWidth();
+
+    SignalCompileItem item;
+    item.path = parent.path + "." + std::string(field.name);
+    item.sym = parent.sym;   // reuse parent's AST symbol for BuildSignalRecord
+    item.body = parent.body;
+    item.parent_signal_idx = parent_idx;
+    item.member_bit_offset = field_offset;
+    item.member_bit_width = field_width;
+    item.struct_depth = current_depth;
+
+    const uint32_t child_idx = static_cast<uint32_t>(signals.size());
+    signals.push_back(std::move(item));
+
+    // Recurse into nested packed structs
+    if (current_depth < max_depth &&
+        field_type.kind == slang::ast::SymbolKind::PackedStructType) {
+      DecomposePackedStructFields(signals, child_idx, max_depth, current_depth + 1, field_offset);
+    }
+  }
+}
+
+void DecomposeStructMembers(std::vector<SignalCompileItem> &signals, int max_depth) {
+  const size_t original_count = signals.size();
+  for (size_t i = 0; i < original_count; ++i) {
+    const SignalCompileItem &item = signals[i];
+    if (item.sym == nullptr) continue;
+    if (item.parent_signal_idx != std::numeric_limits<uint32_t>::max()) continue;  // already a member
+
+    const auto *vs = item.sym->as_if<slang::ast::ValueSymbol>();
+    if (vs == nullptr) continue;
+
+    const slang::ast::Type &canonical = vs->getType().getCanonicalType();
+    if (canonical.kind != slang::ast::SymbolKind::PackedStructType) continue;
+
+    DecomposePackedStructFields(signals, static_cast<uint32_t>(i), max_depth, 1, 0);
+  }
+}
+
 void CollectInstanceHierarchy(const slang::ast::RootSymbol &root, const slang::SourceManager &sm,
                               TraceDb &db) {
   db.hierarchy.reserve(2000000);
@@ -1866,6 +1927,10 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
     if (signals[i].sym != nullptr) {
       symbol_path_ids[signals[i].sym] = graph.signals[i].name_str_id;
     }
+    // Level 2: struct member metadata
+    graph.signals[i].parent_signal_id = signals[i].parent_signal_idx;
+    graph.signals[i].member_bit_offset = static_cast<uint32_t>(signals[i].member_bit_offset);
+    graph.signals[i].member_bit_width = static_cast<uint32_t>(signals[i].member_bit_width);
   }
 
   auto build_signal_record = [&](const slang::ast::Symbol *sym) -> SignalRecord {
@@ -1916,6 +1981,11 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
     for (size_t sig_id : bucket) {
       const SignalCompileItem &item = signals[sig_id];
       if (item.sym == nullptr || !IsTraceable(item.sym)) continue;
+      // Level 2: struct member signals derive endpoints from parent at query time
+      if (item.parent_signal_idx != std::numeric_limits<uint32_t>::max()) {
+        ++signal_count;
+        continue;
+      }
 
       const auto t_signal_record_start = profile_save_graph ? Clock::now() : Clock::time_point{};
       SignalRecord rec = build_signal_record(item.sym);
@@ -2255,7 +2325,9 @@ bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db)
   GraphDbFileHeader header;
   if (!ReadBinaryValue(in, header)) return false;
   if (std::memcmp(header.magic, kGraphDbMagic, sizeof(header.magic)) != 0) return false;
-  if (header.version != 1 && header.version != 2 && header.version != 3 && header.version != 4) return false;
+  if (header.version != 1 && header.version != 2 && header.version != 3 && header.version != 4 &&
+      header.version != 5)
+    return false;
 
   std::vector<uint32_t> string_offsets;
   if (!ReadBinaryVector(in, string_offsets, static_cast<size_t>(header.string_count + 1))) return false;
@@ -2272,8 +2344,26 @@ bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db)
     graph.strings[i] = string_blob.substr(start, end - start);
   }
 
-  if (!ReadBinaryVector(in, graph.signals, static_cast<size_t>(header.signal_count)) ||
-      !ReadBinaryVector(in, graph.endpoints, static_cast<size_t>(header.endpoint_count)) ||
+  // Read signal records. v4 has 20-byte records (5 fields), v5 has 32-byte (8 fields).
+  if (header.version <= 4) {
+    struct GraphSignalRecordV4 {
+      uint32_t name_str_id, driver_begin, driver_count, load_begin, load_count;
+    };
+    std::vector<GraphSignalRecordV4> v4_signals;
+    if (!ReadBinaryVector(in, v4_signals, static_cast<size_t>(header.signal_count))) return false;
+    graph.signals.resize(v4_signals.size());
+    for (size_t i = 0; i < v4_signals.size(); ++i) {
+      graph.signals[i].name_str_id = v4_signals[i].name_str_id;
+      graph.signals[i].driver_begin = v4_signals[i].driver_begin;
+      graph.signals[i].driver_count = v4_signals[i].driver_count;
+      graph.signals[i].load_begin = v4_signals[i].load_begin;
+      graph.signals[i].load_count = v4_signals[i].load_count;
+      // parent_signal_id, member_bit_offset, member_bit_width stay at defaults (UINT32_MAX / 0)
+    }
+  } else {
+    if (!ReadBinaryVector(in, graph.signals, static_cast<size_t>(header.signal_count))) return false;
+  }
+  if (!ReadBinaryVector(in, graph.endpoints, static_cast<size_t>(header.endpoint_count)) ||
       !ReadBinaryVector(in, graph.signal_refs, static_cast<size_t>(header.signal_ref_count)) ||
       !ReadBinaryVector(in, graph.load_ref_ranges, static_cast<size_t>(header.load_ref_range_count)) ||
       !ReadBinaryVector(in, graph.load_ref_signal_ids, static_cast<size_t>(header.load_ref_count)) ||
@@ -2455,6 +2545,21 @@ const SignalRecord &SessionSignalRecord(TraceSession &session, uint32_t id) {
   if (cached != session.materialized_signal_records.end()) return cached->second;
   const GraphDb &graph = *session.graph;
   const GraphSignalRecord &gs = graph.signals[id];
+
+  // Level 2: struct member signals derive endpoints from parent by bit-range filtering
+  if (gs.parent_signal_id != std::numeric_limits<uint32_t>::max()) {
+    const SignalRecord &parent = SessionSignalRecord(session, gs.parent_signal_id);
+    int32_t hi = static_cast<int32_t>(gs.member_bit_offset + gs.member_bit_width - 1);
+    int32_t lo = static_cast<int32_t>(gs.member_bit_offset);
+    auto sel = std::make_pair(hi, lo);
+    SignalRecord rec;
+    for (const EndpointRecord &e : parent.drivers)
+      if (EndpointMatchesSignalSelect(e, sel)) rec.drivers.push_back(e);
+    for (const EndpointRecord &e : parent.loads)
+      if (EndpointMatchesSignalSelect(e, sel)) rec.loads.push_back(e);
+    return session.materialized_signal_records.emplace(id, std::move(rec)).first->second;
+  }
+
   SignalRecord rec;
   auto materialize_endpoint = [&](const GraphEndpointRecord &ge) {
     EndpointRecord e;
