@@ -199,11 +199,11 @@ Repeat level by level until:
 Search for bus handshake and clock/reset signals:
 
 ```python
-node_prefix = "^" + escape_regex("{node}") + r"\.[^.]*"
-rtl_trace_serve_query("{session_id}", "find --query '{node_prefix}(clk|clock)' --regex --limit 20 --format json")
-rtl_trace_serve_query("{session_id}", "find --query '{node_prefix}(rst|reset)' --regex --limit 20 --format json")
-rtl_trace_serve_query("{session_id}", "find --query '{node_prefix}.*valid' --regex --limit 30 --format json")
-rtl_trace_serve_query("{session_id}", "find --query '{node_prefix}.*ready' --regex --limit 30 --format json")
+node_signal_re = "^" + escape_regex("{node}") + r"\..*"
+rtl_trace_serve_query("{session_id}", "find --query '{node_signal_re}(clk|clock)' --regex --limit 20 --format json")
+rtl_trace_serve_query("{session_id}", "find --query '{node_signal_re}(rst|reset)' --regex --limit 20 --format json")
+rtl_trace_serve_query("{session_id}", "find --query '{node_signal_re}valid' --regex --limit 30 --format json")
+rtl_trace_serve_query("{session_id}", "find --query '{node_signal_re}ready' --regex --limit 30 --format json")
 ```
 
 Bus protocol fingerprinting:
@@ -225,8 +225,8 @@ double-counting the same interface.
 Also probe for control signals:
 
 ```python
-rtl_trace_serve_query("{session_id}", "find --query '{node_prefix}(fsm|state|mode|sel)' --regex --limit 10 --format json")
-rtl_trace_serve_query("{session_id}", "find --query '{node_prefix}(enable|en|grant|arb)' --regex --limit 10 --format json")
+rtl_trace_serve_query("{session_id}", "find --query '{node_signal_re}(fsm|state|mode|sel)' --regex --limit 10 --format json")
+rtl_trace_serve_query("{session_id}", "find --query '{node_signal_re}(enable|en|grant|arb)' --regex --limit 10 --format json")
 ```
 
 ## Step 3 — Trace key connections
@@ -238,7 +238,7 @@ use dotted paths instead of flat names:
 ```python
 # Find the actual signal name containing "valid" for the AW channel
 rtl_trace_serve_query("{session_id}",
-    "find --query '^{esc_node}\\.[^.]*aw.*valid' --regex --limit 5 --format json")
+    "find --query '^{esc_node}\\..*aw.*valid' --regex --limit 5 --format json")
 ```
 
 Then trace the exact signal name returned by `find`:

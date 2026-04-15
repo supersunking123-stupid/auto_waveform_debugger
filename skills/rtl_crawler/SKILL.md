@@ -124,10 +124,11 @@ Repeat until one of these conditions is met:
 Search for bus handshake and clock/reset signals:
 
 ```python
-rtl_trace_serve_query(session_id, "find --query {node_path}.*clk --limit 20 --format json")
-rtl_trace_serve_query(session_id, "find --query {node_path}.*rst --limit 20 --format json")
-rtl_trace_serve_query(session_id, "find --query {node_path}.*valid --limit 30 --format json")
-rtl_trace_serve_query(session_id, "find --query {node_path}.*ready --limit 30 --format json")
+node_re = "^" + escape_regex(node_path) + r"\..*"
+rtl_trace_serve_query(session_id, "find --query '{node_re}(clk|clock)' --regex --limit 20 --format json")
+rtl_trace_serve_query(session_id, "find --query '{node_re}(rst|reset)' --regex --limit 20 --format json")
+rtl_trace_serve_query(session_id, "find --query '{node_re}valid' --regex --limit 30 --format json")
+rtl_trace_serve_query(session_id, "find --query '{node_re}ready' --regex --limit 30 --format json")
 ```
 
 Use the signal names to fingerprint the bus protocol:
@@ -149,8 +150,8 @@ double-counting the same interface.
 Also search for control signals that reveal the block's function:
 
 ```python
-rtl_trace_serve_query(session_id, "find --query {node_path}.*fsm* --limit 10 --format json")
-rtl_trace_serve_query(session_id, "find --query {node_path}.*state* --limit 10 --format json")
+rtl_trace_serve_query(session_id, "find --query '{node_re}(fsm|state|mode|sel)' --regex --limit 10 --format json")
+rtl_trace_serve_query(session_id, "find --query '{node_re}(enable|en|grant|arb)' --regex --limit 10 --format json")
 ```
 
 ### 3c. Trace key connections
@@ -162,7 +163,7 @@ dotted paths (`req.aw.valid`) instead of flat names (`aw_valid`):
 ```python
 # Find the actual signal name containing "valid" for the AW channel
 rtl_trace_serve_query(session_id,
-    "find --query '{node}.*aw.*valid' --regex --limit 5 --format json")
+    "find --query '^" + escape_regex(node) + r"\..*aw.*valid' --regex --limit 5 --format json")
 ```
 
 Then trace the exact signal name returned:
