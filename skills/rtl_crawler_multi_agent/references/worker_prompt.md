@@ -212,6 +212,16 @@ Bus protocol fingerprinting:
 - `psel`, `penable`, `paddr` → APB
 - `tvalid`, `tready`, `tdata` → AXI-Stream
 
+**Struct member signals:** DBs compiled with struct member decomposition
+(v5+) expose individual packed struct fields as dotted-path signals
+(e.g. `req.aw.valid` instead of `req_aw_valid`). When `find` returns
+signals with extra dot segments between the instance path and the
+terminal name, those are struct member fields. They carry finer-grained
+bit information but represent the same bus. Treat `node.req.aw.valid`
+the same way you would treat `node.aw_valid` for protocol fingerprinting.
+Group struct member signals by their parent struct name to avoid
+double-counting the same interface.
+
 Also probe for control signals:
 
 ```python
@@ -221,13 +231,23 @@ rtl_trace_serve_query("{session_id}", "find --query '{node_prefix}(enable|en|gra
 
 ## Step 3 — Trace key connections
 
-For each detected bus interface, trace ONE handshake signal:
+For each detected bus interface, trace ONE handshake signal. **Resolve
+the signal name first** using `find` — struct member decomposition may
+use dotted paths instead of flat names:
+
+```python
+# Find the actual signal name containing "valid" for the AW channel
+rtl_trace_serve_query("{session_id}",
+    "find --query '^{esc_node}\\.[^.]*aw.*valid' --regex --limit 5 --format json")
+```
+
+Then trace the exact signal name returned by `find`:
 
 ```python
 rtl_trace_serve_query("{session_id}",
-    "trace --mode drivers --signal {node}.awvalid --depth 2 --format json")
+    "trace --mode drivers --signal {resolved_signal} --depth 2 --format json")
 rtl_trace_serve_query("{session_id}",
-    "trace --mode loads --signal {node}.awvalid --depth 2 --format json")
+    "trace --mode loads --signal {resolved_signal} --depth 2 --format json")
 ```
 
 Be selective:
