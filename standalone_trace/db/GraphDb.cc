@@ -1924,7 +1924,10 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
   symbol_path_ids.reserve(signals.size());
   for (size_t i = 0; i < signals.size(); ++i) {
     graph.signals[i].name_str_id = intern(signals[i].path);
-    if (signals[i].sym != nullptr) {
+    // Member signals reuse the parent's Symbol*, so they must NOT be inserted
+    // into symbol_path_ids — otherwise the last member overwrites the parent's
+    // path, corrupting LHS/RHS resolution for all sibling endpoints.
+    if (signals[i].sym != nullptr && signals[i].parent_signal_idx == std::numeric_limits<uint32_t>::max()) {
       symbol_path_ids[signals[i].sym] = graph.signals[i].name_str_id;
     }
     // Level 2: struct member metadata

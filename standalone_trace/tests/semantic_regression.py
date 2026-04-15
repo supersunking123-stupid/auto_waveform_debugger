@@ -882,6 +882,34 @@ def main():
                     f"pkt.valid loads should not include other members: {ep}"
                 )
 
+        # 28) Level 2 — member signal RHS must not be corrupted by sibling members.
+        #     The hit = pkt.valid & pkt.code[0] endpoint reads pkt (the parent struct),
+        #     NOT pkt.data (which was the bug from reusing parent Symbol* in
+        #     symbol_path_ids — last member won and rewrote all LHS/RHS refs).
+        valid_loads_rh = run_trace_json(rtl_trace, struct_db, "loads", "struct_top.u_cons.pkt.valid")
+        assert_any(
+            valid_loads_rh.get("endpoints", []),
+            lambda e: "pkt.valid" in e.get("path", "") and
+                      any("pkt.data" not in r for r in e.get("rhs", [])),
+            "pkt.valid loads: RHS should reference the parent struct, not pkt.data "
+            "(symbol_path_ids corruption from member signal reuse)",
+        )
+        # Also check no endpoint path is rewritten to a wrong sibling
+        for ep in valid_loads_rh.get("endpoints", []):
+            for r in ep.get("rhs", []):
+                if "pkt.data" in r:
+                    raise AssertionError(
+                        f"pkt.valid loads: rhs should not reference pkt.data, got rhs={ep['rhs']}"
+                    )
+
+        # 29) Level 2 — code member drivers must not expand into data at cone-level 1
+        code_drivers = run_trace_json(rtl_trace, struct_db, "drivers", "struct_top.u_prod.pkt.code")
+        for ep in code_drivers.get("endpoints", []):
+            if "pkt.data" in ep.get("path", ""):
+                raise AssertionError(
+                    f"pkt.code drivers at cone-level 1 should not contain pkt.data: {ep}"
+                )
+
         print("semantic_regression: PASS")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
