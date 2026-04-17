@@ -94,13 +94,15 @@ If the project already has a Makefile for the full-system simulation, **reuse it
 3. Write a minimal testbench that instantiates the DUT.
 4. Copy the Makefile to your scratch directory and modify **only** the testbench file list — replace `tb_top.v` with your new testbench, keep all other testbench support files (like the DUT sub-modules). Remove the DUT file list (`dut.f`) if your DUT is a standalone module that doesn't need the full design.
 5. Run `make build` and `make run`.
+6. If you also need a structural DB, inspect the project's `build_trace_db` or equivalent target and reuse its `rtl_trace`-specific flags as well. Do not assume the plain `vcs` build target and the `rtl_trace compile` target use the same compatibility settings.
 
-**Why this is better:** The existing Makefile already contains all the defines (`+define+NO_PERFMON_HISTOGRAM`, `+define+PRAND_OFF`, etc.), include paths (`+incdir+`), and compile flags that the design needs. Discovering these from source files requires multiple compile-error-retry cycles. The Makefile has already solved this problem.
+**Why this is better:** The existing Makefile already contains the defines (`+define+NO_PERFMON_HISTOGRAM`, `+define+PRAND_OFF`, etc.), include paths (`+incdir+`), and compile flags that the design needs. For structural DB builds, the project may also carry `rtl_trace`-specific compatibility flags such as `--compat vcs` or `-Wno-duplicate-definition`. Discovering these from source files requires multiple compile-error-retry cycles. The Makefile has already solved this problem.
 
 **Example:** For the NVDLA `synth_tb` Makefile at `verif/sim/Makefile`:
 - `VCS_ARGS` (line 419) contains all compile flags including `+define+NO_PERFMON_HISTOGRAM`
 - `TB_FILES` (line 205) contains all testbench source files including `id_fifo.v`
 - `TB_VCS_BLD_ARGS` (line 218) contains all `+incdir+` paths
+- `build_trace_db` should keep its own `rtl_trace` compatibility flags in sync with the design's vendor-library requirements
 - To test `id_fifo` in isolation, copy the Makefile and change `TB_FILES` to: `my_tb_id_fifo.sv ${TBDIR}/id_fifo.v`
 - Remove `-f ${DUTFILE}` from the build command since the full DUT is not needed
 

@@ -44,6 +44,8 @@ Common compile flags for tricky designs:
 - `--relax-defparam` — tolerate non-standard defparam usage.
 - `--mfcu` — multi-file compilation unit mode.
 - `--low-mem` — reduce memory usage for very large designs.
+- `--compat vcs` — match VCS-style compatibility for flows that depend on vendor or legacy source behavior.
+- `-Wno-duplicate-definition` — needed in some vendor-library flows that intentionally duplicate helper modules across cells.
 
 **Do not proceed to other structural commands until you know the correct DB path or compile succeeds.**
 

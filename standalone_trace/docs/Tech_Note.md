@@ -127,6 +127,24 @@ Important supporting functions:
 - `SaveGraphDb(...)`
 - `LoadGraphDb(...)`
 
+### Compile diagnostics and compatibility flags
+
+Compile blocking is decided from the **effective** diagnostic severity after slang compatibility mode and warning overrides are applied, not from each diagnostic's default severity. `HasBlockingCompileDiagnostics(...)` queries `diagEngine.getSeverity(...)`, so flags such as `--compat vcs` and `-Wno-*` directly affect whether DB generation stops.
+
+`IsIgnoredCompileDiag(...)` still hard-whitelists a small set of compatibility cases:
+- `$` system-task / system-function diagnostics
+- `--relax-defparam` cases
+- `UnknownSystemName`
+
+Everything else is evaluated after severity remapping. This matters for vendor-heavy flows: if a diagnostic's effective severity remains `Error` (e.g., a case that the compat mode does not remap), `rtl_trace compile` will stop unless the project recipe explicitly downgrades or suppresses it.
+
+**NVDLA note:** the `verif/sim` and `verif/sim_vip` `build_trace_db` recipes need explicit `rtl_trace` compatibility flags:
+- `--compat vcs`
+- `-Wno-duplicate-definition`
+- VCS-matched defines such as `+define+VLIB_NO_UDP`, `+define+DESIGNWARE_NOEXIST`, `+define+NVTOOLS_SYNC2D_GENERIC_CELL`, `+define+NO_PERFMON_HISTOGRAM`, `+define+PRAND_OFF`, and `+define+NO_DUMPS`
+
+Without those flags, the NVDLA sync-cell libraries can trip duplicate `first_stage_of_sync` helper-module diagnostics during elaboration and prevent DB generation.
+
 ### 2. Driver/load extraction during compile
 
 The compile phase derives structure from `slang` AST nodes.
