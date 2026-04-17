@@ -49,6 +49,7 @@ void CollectTraceableSymbols(const slang::ast::RootSymbol &root,
 void CollectInstanceHierarchy(const slang::ast::RootSymbol &root,
                               const slang::SourceManager &sm,
                               TraceDb &db,
+                              SourceInfoCache &source_info_cache,
                               SourcePathMode source_path_mode);
 void BuildHierarchyFromSignals(TraceDb &db);
 slang::flat_hash_map<std::string_view, size_t> BuildSubtreeSignalCounts(
@@ -65,6 +66,7 @@ bool SaveGraphDb(const std::string &db_path,
                  const TraceDb &hier_db,
                  const std::vector<std::vector<size_t>> *buckets,
                  size_t &signal_count,
+                 SourceInfoCache &source_info_cache,
                  SourcePathMode source_path_mode,
                  bool low_mem,
                  CompileLogger *logger);
@@ -412,6 +414,7 @@ int RunCompile(int argc, char *argv[]) {
 
   const slang::ast::RootSymbol &root = compilation->getRoot();
   const slang::SourceManager &sm = *compilation->getSourceManager();
+  SourceInfoCache source_info_cache;
 
   std::vector<SignalCompileItem> signals;
   signals.reserve(2000000);
@@ -425,7 +428,7 @@ int RunCompile(int argc, char *argv[]) {
   TraceDb hier_db;
   logger.Log("step: collect instance hierarchy");
   LogMem("MemBeforeCollectHierarchy");
-  CollectInstanceHierarchy(root, sm, hier_db, source_path_mode);
+  CollectInstanceHierarchy(root, sm, hier_db, source_info_cache, source_path_mode);
   LogMem("MemAfterCollectHierarchy");
 
   std::vector<PartitionRecord> parts;
@@ -450,7 +453,8 @@ int RunCompile(int argc, char *argv[]) {
   logger.Log("step: emit db");
   size_t written_signal_count = 0;
   LogMem("MemBeforeSaveGraphDb");
-  if (!SaveGraphDb(db_path, signals, sm, hier_db, &buckets, written_signal_count, source_path_mode, low_mem,
+  if (!SaveGraphDb(db_path, signals, sm, hier_db, &buckets, written_signal_count, source_info_cache,
+                   source_path_mode, low_mem,
                    &logger)) {
     std::cerr << "Failed to write DB: " << db_path << "\n";
     return 1;

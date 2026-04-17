@@ -36,6 +36,12 @@ std::string ToLower(std::string s);
 bool LooksLikeOptionToken(const std::string &s);
 std::string ToAbsPathString(const std::filesystem::path &p, const std::filesystem::path &base);
 
+struct SourceInfoCache {
+  slang::flat_hash_map<uint32_t, std::vector<size_t>> line_start_offsets_by_buffer;
+  slang::flat_hash_map<uint32_t, std::string> physical_path_by_buffer;
+  slang::flat_hash_map<std::string, std::string> normalized_path_cache;
+};
+
 // --- Bit / range utilities ---
 
 std::optional<std::pair<int32_t, int32_t>> ParseExactBitMapText(std::string_view bit_map);

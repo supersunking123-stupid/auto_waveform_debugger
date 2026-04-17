@@ -175,6 +175,7 @@ const SymbolRefList &GetCachedStatementLhsSignals(
     const slang::ast::Statement &stmt, PerBodyTraceCache &cache);
 EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManager &sm,
                                   bool drivers_mode, TraceCompileCache *cache,
+                                  SourceInfoCache &source_info_cache,
                                   SourcePathMode source_path_mode,
                                   const slang::flat_hash_map<const slang::ast::Symbol *, uint32_t> *symbol_path_ids = nullptr);
 const slang::ast::InstanceBodySymbol *GetContainingInstance(const slang::ast::Symbol *sym) {
@@ -801,18 +802,21 @@ std::vector<TraceResult> ComputeIndexedTraceResults(
 
 SignalRecord BuildSignalRecord(const slang::ast::Symbol *sym, const slang::SourceManager &sm,
                                TraceCompileCache &cache,
+                               SourceInfoCache &source_info_cache,
                                SourcePathMode source_path_mode,
                                const slang::flat_hash_map<const slang::ast::Symbol *, uint32_t> *symbol_path_ids = nullptr) {
   SignalRecord rec;
   std::unordered_set<const slang::ast::Symbol *> visited_drivers;
   visited_drivers.insert(sym);
   for (const TraceResult &r : ComputeIndexedTraceResults</*DRIVERS*/ true>(sym, cache, visited_drivers))
-    rec.drivers.push_back(std::move(ResolveTraceResult(r, sm, true, &cache, source_path_mode, symbol_path_ids)));
+    rec.drivers.push_back(
+        std::move(ResolveTraceResult(r, sm, true, &cache, source_info_cache, source_path_mode, symbol_path_ids)));
 
   std::unordered_set<const slang::ast::Symbol *> visited_loads;
   visited_loads.insert(sym);
   for (const TraceResult &r : ComputeIndexedTraceResults</*DRIVERS*/ false>(sym, cache, visited_loads))
-    rec.loads.push_back(std::move(ResolveTraceResult(r, sm, false, &cache, source_path_mode, symbol_path_ids)));
+    rec.loads.push_back(
+        std::move(ResolveTraceResult(r, sm, false, &cache, source_info_cache, source_path_mode, symbol_path_ids)));
 
   return rec;
 }
@@ -847,8 +851,12 @@ slang::SourceLocation GetPhysicalSourceLoc(slang::SourceLocation loc,
   return original.valid() ? original : loc;
 }
 
-std::string NormalizeSourcePathString(std::string_view path) {
+std::string NormalizeSourcePathString(std::string_view path, SourceInfoCache &source_info_cache) {
   if (path.empty()) return "";
+  std::string key(path);
+  auto it = source_info_cache.normalized_path_cache.find(key);
+  if (it != source_info_cache.normalized_path_cache.end()) return it->second;
+
   std::filesystem::path normalized(path);
   std::error_code ec;
   if (!normalized.is_absolute()) {
@@ -860,32 +868,48 @@ std::string NormalizeSourcePathString(std::string_view path) {
     std::filesystem::path canon = std::filesystem::weakly_canonical(normalized, ec);
     if (!ec) normalized = std::move(canon);
   }
-  return normalized.lexically_normal().string();
+
+  auto [inserted_it, _] =
+      source_info_cache.normalized_path_cache.emplace(std::move(key), normalized.lexically_normal().string());
+  return inserted_it->second;
 }
 
-std::string GetAbsoluteSourcePath(slang::SourceLocation loc,
-                                  const slang::SourceManager &sm) {
+std::string GetAbsoluteSourcePath(slang::SourceLocation loc, const slang::SourceManager &sm,
+                                  SourceInfoCache &source_info_cache) {
   const slang::SourceLocation file_loc = GetPhysicalSourceLoc(loc, sm);
   if (!file_loc.valid()) return "";
+
+  const uint32_t buffer_id = file_loc.buffer().getId();
+  auto path_it = source_info_cache.physical_path_by_buffer.find(buffer_id);
+  if (path_it != source_info_cache.physical_path_by_buffer.end()) return path_it->second;
+
+  std::string path;
   const std::filesystem::path &full_path = sm.getFullPath(file_loc.buffer());
-  if (!full_path.empty()) return full_path.string();
+  if (!full_path.empty()) {
+    path = full_path.string();
+  } else {
+    const std::string_view raw_name = sm.getRawFileName(file_loc.buffer());
+    if (!raw_name.empty()) {
+      path = NormalizeSourcePathString(raw_name, source_info_cache);
+    } else {
+      path = NormalizeSourcePathString(sm.getFileName(file_loc), source_info_cache);
+    }
+  }
 
-  const std::string_view raw_name = sm.getRawFileName(file_loc.buffer());
-  if (!raw_name.empty()) return NormalizeSourcePathString(raw_name);
-
-  return NormalizeSourcePathString(sm.getFileName(file_loc));
+  source_info_cache.physical_path_by_buffer.emplace(buffer_id, path);
+  return path;
 }
 
-int GetPhysicalSourceLine(slang::SourceLocation loc, const slang::SourceManager &sm) {
+int GetPhysicalSourceLine(slang::SourceLocation loc, const slang::SourceManager &sm,
+                          SourceInfoCache &source_info_cache) {
   const slang::SourceLocation file_loc = GetPhysicalSourceLoc(loc, sm);
   if (!file_loc.valid()) return 0;
 
-  static std::unordered_map<uint32_t, std::vector<size_t>> line_start_cache;
   const uint32_t buffer_id = file_loc.buffer().getId();
   const std::string_view text = sm.getSourceText(file_loc.buffer());
-  if (file_loc.offset() > text.size()) return static_cast<int>(sm.getLineNumber(loc));
+  if (file_loc.offset() > text.size()) return static_cast<int>(sm.getLineNumber(file_loc));
 
-  auto [it, inserted] = line_start_cache.try_emplace(buffer_id);
+  auto [it, inserted] = source_info_cache.line_start_offsets_by_buffer.try_emplace(buffer_id);
   std::vector<size_t> &line_starts = it->second;
   if (inserted) {
     line_starts.push_back(0);
@@ -906,17 +930,19 @@ int GetPhysicalSourceLine(slang::SourceLocation loc, const slang::SourceManager 
 }
 
 std::string GetStoredSourcePath(slang::SourceLocation loc, const slang::SourceManager &sm,
+                                SourceInfoCache &source_info_cache,
                                 SourcePathMode source_path_mode) {
   if (source_path_mode == SourcePathMode::kPhysicalAbsolute)
-    return GetAbsoluteSourcePath(loc, sm);
+    return GetAbsoluteSourcePath(loc, sm, source_info_cache);
   if (!loc.valid()) return "";
   return std::string(sm.getFileName(loc));
 }
 
 int GetStoredSourceLine(slang::SourceLocation loc, const slang::SourceManager &sm,
+                        SourceInfoCache &source_info_cache,
                         SourcePathMode source_path_mode) {
   if (source_path_mode == SourcePathMode::kPhysicalAbsolute)
-    return GetPhysicalSourceLine(loc, sm);
+    return GetPhysicalSourceLine(loc, sm, source_info_cache);
   return static_cast<int>(sm.getLineNumber(loc));
 }
 
@@ -1433,6 +1459,7 @@ bool AreSortedUniqueValues(const std::vector<T> &values) {
 
 EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManager &sm, bool drivers_mode,
                                   TraceCompileCache *cache,
+                                  SourceInfoCache &source_info_cache,
                                   SourcePathMode source_path_mode,
                                   const slang::flat_hash_map<const slang::ast::Symbol *, uint32_t> *symbol_path_ids) {
   EndpointRecord rec;
@@ -1445,8 +1472,8 @@ EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManag
           rec.path = item->getHierarchicalPath();
           rec.direction = DirectionToString(item->direction);
           const auto loc = item->location;
-          rec.file = GetStoredSourcePath(loc, sm, source_path_mode);
-          rec.line = GetStoredSourceLine(loc, sm, source_path_mode);
+          rec.file = GetStoredSourcePath(loc, sm, source_info_cache, source_path_mode);
+          rec.line = GetStoredSourceLine(loc, sm, source_info_cache, source_path_mode);
         } else {
           rec.kind = EndpointKind::kExpr;
           PerBodyTraceCache *body_cache =
@@ -1465,8 +1492,8 @@ EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManag
             rec.path_id = std::numeric_limits<uint32_t>::max();  // use string, not ID
           }
           const auto loc = item.expr->sourceRange.start();
-          rec.file = GetStoredSourcePath(loc, sm, source_path_mode);
-          rec.line = GetStoredSourceLine(loc, sm, source_path_mode);
+          rec.file = GetStoredSourcePath(loc, sm, source_info_cache, source_path_mode);
+          rec.line = GetStoredSourceLine(loc, sm, source_info_cache, source_path_mode);
           if (item.symbol != nullptr) {
             if (item.member_bit_width > 0) {
               // Struct member access: compute absolute bit ranges by adding
@@ -1675,15 +1702,17 @@ void DecomposeStructMembers(std::vector<SignalCompileItem> &signals, int max_dep
 }
 
 void CollectInstanceHierarchy(const slang::ast::RootSymbol &root, const slang::SourceManager &sm,
-                              TraceDb &db, SourcePathMode source_path_mode) {
+                              TraceDb &db, SourceInfoCache &source_info_cache,
+                              SourcePathMode source_path_mode) {
   db.hierarchy.reserve(2000000);
   auto note_instance = [&](const slang::ast::InstanceSymbol &inst) {
     auto &node = db.hierarchy[std::string(inst.getHierarchicalPath())];
     node.module = std::string(inst.getDefinition().name);
     const auto loc = inst.getDefinition().location;
     if (loc.valid()) {
-      node.source_file = GetStoredSourcePath(loc, sm, source_path_mode);
-      node.source_line = static_cast<uint32_t>(std::max(GetStoredSourceLine(loc, sm, source_path_mode), 0));
+      node.source_file = GetStoredSourcePath(loc, sm, source_info_cache, source_path_mode);
+      node.source_line = static_cast<uint32_t>(
+          std::max(GetStoredSourceLine(loc, sm, source_info_cache, source_path_mode), 0));
     }
     const auto params = inst.body.getParameters();
     node.parameters.clear();
@@ -1891,7 +1920,8 @@ std::vector<std::vector<size_t>> BucketSignalsByPartitions(
 bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem> &signals,
                  const slang::SourceManager &sm, const TraceDb &hier_db,
                  const std::vector<std::vector<size_t>> *buckets, size_t &signal_count,
-                 SourcePathMode source_path_mode, bool low_mem, CompileLogger *logger) {
+                 SourceInfoCache &source_info_cache, SourcePathMode source_path_mode, bool low_mem,
+                 CompileLogger *logger) {
   using Clock = std::chrono::steady_clock;
   auto fmt_seconds = [](const Clock::time_point &start, const Clock::time_point &end) {
     std::ostringstream os;
@@ -2020,7 +2050,8 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
   }
 
   auto build_signal_record = [&](const slang::ast::Symbol *sym) -> SignalRecord {
-    return BuildSignalRecord(sym, sm, trace_cache, source_path_mode, &symbol_path_ids);
+    return BuildSignalRecord(sym, sm, trace_cache, source_info_cache, source_path_mode,
+                             &symbol_path_ids);
   };
 
   auto sort_bucket_for_locality = [&](std::vector<size_t> &bucket) {

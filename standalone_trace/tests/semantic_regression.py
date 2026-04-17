@@ -87,7 +87,9 @@ def main():
 
     rtl_trace = Path(args.rtl_trace).resolve()
     src_dir = Path(args.source_dir).resolve()
+    repo_root = src_dir.parent
     fixture = src_dir / "tests" / "fixtures" / "semantic_top.sv"
+    logical_fixture = fixture.relative_to(repo_root)
     if not rtl_trace.exists():
         raise SystemExit(f"rtl_trace not found: {rtl_trace}")
     if not fixture.exists():
@@ -111,10 +113,11 @@ def main():
                 "--db",
                 str(logical_db),
                 "--single-unit",
-                str(fixture),
+                str(logical_fixture),
                 "--top",
                 "semantic_top",
-            ]
+            ],
+            cwd=repo_root,
         )
         logical_whereis = run_json_cmd(
             [
