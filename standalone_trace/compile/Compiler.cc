@@ -48,7 +48,8 @@ void CollectTraceableSymbols(const slang::ast::RootSymbol &root,
                              std::vector<SignalCompileItem> &out);
 void CollectInstanceHierarchy(const slang::ast::RootSymbol &root,
                               const slang::SourceManager &sm,
-                              TraceDb &db);
+                              TraceDb &db,
+                              SourcePathMode source_path_mode);
 void BuildHierarchyFromSignals(TraceDb &db);
 slang::flat_hash_map<std::string_view, size_t> BuildSubtreeSignalCounts(
     const std::vector<SignalCompileItem> &signals);
@@ -64,6 +65,7 @@ bool SaveGraphDb(const std::string &db_path,
                  const TraceDb &hier_db,
                  const std::vector<std::vector<size_t>> *buckets,
                  size_t &signal_count,
+                 SourcePathMode source_path_mode,
                  bool low_mem,
                  CompileLogger *logger);
 bool HasUnknownSysNameWarningControl(const std::vector<std::string> &args);
@@ -231,6 +233,7 @@ int RunCompile(int argc, char *argv[]) {
   bool relax_defparam = false;
   bool mfcu = false;
   bool low_mem = false;
+  SourcePathMode source_path_mode = SourcePathMode::kLogical;
   size_t partition_budget = 0;
   std::string compile_log_path;
   std::vector<std::string> passthrough_args;
@@ -239,7 +242,7 @@ int RunCompile(int argc, char *argv[]) {
     const std::string arg = argv[i];
     if (arg == "-h" || arg == "--help") {
       std::cout << "Usage: rtl_trace compile [--db <file>] [--incremental] [--relax-defparam] [--mfcu] "
-                   "[--low-mem] [--partition-budget <N>] [--compile-log <file>] "
+                   "[--low-mem] [--physical-source-paths] [--partition-budget <N>] [--compile-log <file>] "
                    "[slang source args...]\n";
       return 0;
     }
@@ -265,6 +268,10 @@ int RunCompile(int argc, char *argv[]) {
     }
     if (arg == "--low-mem") {
       low_mem = true;
+      continue;
+    }
+    if (arg == "--physical-source-paths") {
+      source_path_mode = SourcePathMode::kPhysicalAbsolute;
       continue;
     }
     if (arg == "--partition-budget") {
@@ -317,7 +324,8 @@ int RunCompile(int argc, char *argv[]) {
   CompileLogger logger(compile_log_path);
   logger.Log("compile begin: db=" + db_path + " incremental=" + (incremental ? "1" : "0") +
              " mfcu=" + (mfcu ? "1" : "0") + " partition_budget=" +
-             std::to_string(partition_budget));
+             std::to_string(partition_budget) + " source_paths=" +
+             (source_path_mode == SourcePathMode::kPhysicalAbsolute ? "physical-absolute" : "logical"));
 
   if (!HasTopArg(passthrough_args)) {
     std::cerr << "Missing required option: --top <module>\n";
@@ -339,6 +347,8 @@ int RunCompile(int argc, char *argv[]) {
   const std::filesystem::path meta_path = db_path_fs.string() + ".meta";
   std::vector<std::string> fingerprint_args = passthrough_args;
   if (mfcu) fingerprint_args.push_back("--mfcu=grouped-v1");
+  if (source_path_mode == SourcePathMode::kPhysicalAbsolute)
+    fingerprint_args.push_back("--physical-source-paths");
   const std::string new_fingerprint = ComputeCompileFingerprint(fingerprint_args);
   if (incremental && std::filesystem::exists(db_path_fs) && std::filesystem::exists(meta_path)) {
     logger.Log("step: incremental fingerprint check");
@@ -415,7 +425,7 @@ int RunCompile(int argc, char *argv[]) {
   TraceDb hier_db;
   logger.Log("step: collect instance hierarchy");
   LogMem("MemBeforeCollectHierarchy");
-  CollectInstanceHierarchy(root, sm, hier_db);
+  CollectInstanceHierarchy(root, sm, hier_db, source_path_mode);
   LogMem("MemAfterCollectHierarchy");
 
   std::vector<PartitionRecord> parts;
@@ -440,7 +450,7 @@ int RunCompile(int argc, char *argv[]) {
   logger.Log("step: emit db");
   size_t written_signal_count = 0;
   LogMem("MemBeforeSaveGraphDb");
-  if (!SaveGraphDb(db_path, signals, sm, hier_db, &buckets, written_signal_count, low_mem,
+  if (!SaveGraphDb(db_path, signals, sm, hier_db, &buckets, written_signal_count, source_path_mode, low_mem,
                    &logger)) {
     std::cerr << "Failed to write DB: " << db_path << "\n";
     return 1;

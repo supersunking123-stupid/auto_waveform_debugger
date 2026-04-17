@@ -34,7 +34,7 @@ ninja -C build
 ## Usage
 
 ```bash
-build/rtl_trace compile --db rtl_trace.db --top <top_module> [--incremental] [--relax-defparam] [--mfcu] [--low-mem] [--partition-budget N] [--compile-log <file>] [slang source args...]
+build/rtl_trace compile --db rtl_trace.db --top <top_module> [--incremental] [--relax-defparam] [--mfcu] [--low-mem] [--physical-source-paths] [--partition-budget N] [--compile-log <file>] [slang source args...]
 build/rtl_trace trace --db rtl_trace.db --mode drivers --signal top.u0.sig[3] \
   [--cone-level N] [--prefer-port-hop] [--depth N] [--max-nodes N] [--include RE] [--exclude RE] [--stop-at RE] [--format text|json]
 build/rtl_trace trace --db rtl_trace.db --mode loads --signal top.u0.sig[7:4] \
@@ -52,6 +52,7 @@ Notes:
 - `compile --relax-defparam` relaxes defparam-related errors (for example, unresolved cross-hierarchy defparams) so a usable DB can still be generated.
 - `compile --mfcu` uses grouped MFCU mode: source files from each `-f` filelist are merged into one compilation unit, and source files passed directly on the command line are merged into another compilation unit, instead of merging all inputs into one unit.
 - `compile --low-mem` enables a tighter compile-cache budget during `SaveGraphDb`: per-body trace caches are kept in a much smaller LRU window and are dropped more aggressively between partitions. This reduces peak memory at the cost of extra cache rebuilds on some designs.
+- `compile --physical-source-paths` stores source locations as physical absolute paths and physical line numbers, which is useful when downstream tools run from shadow workspaces and need to open the original file reliably.
 - `compile --partition-budget N` partitions the DB build by instance-tree budget and actually processes the resulting buckets sequentially during graph generation. The log prints the partitioning result and per-partition progress.
 - `compile --compile-log <file>` writes key compile-stage steps and partition information into a log file while still printing to the console. During DB generation it also records `save_graph_db` sub-step timings such as `build_graph` and `write_file`.
 - The `trace` phase only queries the DB and does not parse RTL again.
@@ -76,6 +77,7 @@ Additional `trace` output details:
 - `mode=loads`: if an expression can be associated with an assignment, the tool prints:
   - `lhs <hierarchical_path>` (LHS signal list)
 - `--format json`: output includes `summary`, `endpoints`, and `stops`, which is convenient for agents / scripts.
+- Source file locations in query results use the source-path style chosen at `compile` time. Without extra flags they keep the legacy logical/display form; with `compile --physical-source-paths` they are emitted as physical absolute paths when available.
 - Bit-select queries are supported: `--signal top.sig[3]`, `--signal top.sig[7:4]`.
 - `hier`: prints the instance hierarchy tree (supports `--root`, `--depth`, `--max-nodes`, `--format json`, `--show-source`).
 - `hier --show-source`: also prints the instantiated module definition file and line when available in the DB.

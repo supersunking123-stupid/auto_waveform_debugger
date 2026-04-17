@@ -25,6 +25,7 @@ namespace rtl_trace {
 // --- Runtime types (used by all modules) ---
 
 enum class EndpointKind { kPort, kExpr };
+enum class SourcePathMode : uint8_t { kLogical = 0, kPhysicalAbsolute = 1 };
 
 struct EndpointRecord {
   EndpointKind kind = EndpointKind::kExpr;

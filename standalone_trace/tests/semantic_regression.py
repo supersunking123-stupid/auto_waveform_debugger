@@ -69,6 +69,16 @@ def normalize_reported_path(path_str):
     return str(Path(path_str).resolve())
 
 
+def assert_absolute_reported_path(path_str, context):
+    if not Path(path_str).is_absolute():
+        raise AssertionError(f"{context} should be an absolute path, got: {path_str}")
+
+
+def assert_nonabsolute_reported_path(path_str, context):
+    if Path(path_str).is_absolute():
+        raise AssertionError(f"{context} should use the legacy logical path form, got: {path_str}")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Standalone trace semantic regression suite")
     ap.add_argument("--rtl-trace", required=True, help="Path to rtl_trace binary")
@@ -90,14 +100,51 @@ def main():
         low_mem_db = tmpdir / "semantic_low_mem.db"
         inc_db = tmpdir / "semantic_inc.db"
         v3_db = tmpdir / "semantic_v3.db"
+        logical_db = tmpdir / "semantic_logical.db"
+        physical_source_path_flag = "--physical-source-paths"
 
-        # 1) compile smoke
+        # 1) default compile preserves legacy logical source paths
+        run_cmd(
+            [
+                str(rtl_trace),
+                "compile",
+                "--db",
+                str(logical_db),
+                "--single-unit",
+                str(fixture),
+                "--top",
+                "semantic_top",
+            ]
+        )
+        logical_whereis = run_json_cmd(
+            [
+                str(rtl_trace),
+                "whereis-instance",
+                "--db",
+                str(logical_db),
+                "--instance",
+                "semantic_top.u_cons",
+                "--format",
+                "json",
+            ]
+        )
+        logical_source = logical_whereis.get("source")
+        if (
+            logical_source is None
+            or normalize_reported_path(logical_source.get("file", "")) != str(fixture)
+            or logical_source.get("line") != 15
+        ):
+            raise AssertionError(f"unexpected logical whereis source info: {logical_whereis}")
+        assert_nonabsolute_reported_path(logical_source.get("file", ""), "default whereis source file")
+
+        # 2) compile smoke with physical absolute source paths
         c = run_cmd(
             [
                 str(rtl_trace),
                 "compile",
                 "--db",
                 str(db),
+                physical_source_path_flag,
                 "--single-unit",
                 str(fixture),
                 "--top",
@@ -114,6 +161,7 @@ def main():
                 "compile",
                 "--db",
                 str(part_db),
+                physical_source_path_flag,
                 "--partition-budget",
                 "1",
                 "--single-unit",
@@ -131,6 +179,7 @@ def main():
                 "compile",
                 "--db",
                 str(low_mem_db),
+                physical_source_path_flag,
                 "--low-mem",
                 "--single-unit",
                 str(fixture),
@@ -156,6 +205,10 @@ def main():
             lambda e: e.get("assignment") == "data <= data + 8'h01" and e.get("path") == "semantic_top.u_prod.data",
             "missing increment driver assignment after cross-port traversal",
         )
+        for ep in endpoints:
+            if normalize_reported_path(ep.get("file", "")) != str(fixture):
+                raise AssertionError(f"unexpected endpoint source info: {ep}")
+            assert_absolute_reported_path(ep.get("file", ""), f"drivers endpoint {ep.get('path', '')}")
         part_drivers = run_trace_json(rtl_trace, part_db, "drivers", "semantic_top.u_cons.in_bus")
         if part_drivers != drivers:
             raise AssertionError(
@@ -273,6 +326,7 @@ def main():
                 "--db",
                 str(inc_db),
                 "--incremental",
+                physical_source_path_flag,
                 "--single-unit",
                 str(fixture),
                 "--top",
@@ -286,6 +340,7 @@ def main():
                 "--db",
                 str(inc_db),
                 "--incremental",
+                physical_source_path_flag,
                 "--single-unit",
                 str(fixture),
                 "--top",
@@ -338,6 +393,7 @@ def main():
             or source.get("line") != 15
         ):
             raise AssertionError(f"unexpected hier source info: {hier_with_source}")
+        assert_absolute_reported_path(source.get("file", ""), "hier source file")
 
         hier_without_source = run_json_cmd(
             [
@@ -378,6 +434,7 @@ def main():
             or whereis_source.get("line") != 15
         ):
             raise AssertionError(f"unexpected whereis source info: {whereis}")
+        assert_absolute_reported_path(whereis_source.get("file", ""), "whereis source file")
 
         whereis_params = run_json_cmd(
             [
@@ -719,6 +776,7 @@ def main():
                 "compile",
                 "--db", str(inc_miss_db),
                 "--incremental",
+                physical_source_path_flag,
                 "--single-unit",
                 str(tmp_fixture),
                 "--top", "semantic_top",
@@ -733,6 +791,7 @@ def main():
                 "compile",
                 "--db", str(inc_miss_db),
                 "--incremental",
+                physical_source_path_flag,
                 "--single-unit",
                 str(tmp_fixture),
                 "--top", "semantic_top",
@@ -756,6 +815,7 @@ def main():
                 str(rtl_trace),
                 "compile",
                 "--db", str(compat_db),
+                physical_source_path_flag,
                 "--single-unit",
                 str(compat_fixture),
                 "--top", "compat_severity_top",
@@ -771,6 +831,7 @@ def main():
                 str(rtl_trace),
                 "compile",
                 "--db", str(compat_db_nocompat),
+                physical_source_path_flag,
                 "--single-unit",
                 str(compat_fixture),
                 "--top", "compat_severity_top",
@@ -788,6 +849,7 @@ def main():
             [
                 str(rtl_trace), "compile",
                 "--db", str(struct_db),
+                physical_source_path_flag,
                 "--single-unit", str(struct_fixture),
                 "--top", "struct_top",
             ]
@@ -830,6 +892,7 @@ def main():
             [
                 str(rtl_trace), "compile",
                 "--db", str(concat_db),
+                physical_source_path_flag,
                 "--single-unit", str(concat_fixture),
                 "--top", "concat_top",
             ]

@@ -80,7 +80,7 @@ Build or rebuild the structural DB from RTL.
 Typical form:
 
 ```text
-rtl_trace compile --db <db_path> --top <top_module> [--incremental] [--relax-defparam] [--mfcu] [--low-mem] [--partition-budget N] [--compile-log <file>] [slang source args...]
+rtl_trace compile --db <db_path> --top <top_module> [--incremental] [--relax-defparam] [--mfcu] [--low-mem] [--physical-source-paths] [--partition-budget N] [--compile-log <file>] [slang source args...]
 ```
 
 Common flags:
