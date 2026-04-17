@@ -42,6 +42,11 @@ struct SourceInfoCache {
   slang::flat_hash_map<std::string, std::string> normalized_path_cache;
 };
 
+struct CompileContext {
+  SourceInfoCache source_info_cache;
+  SourcePathMode source_path_mode = SourcePathMode::kLogical;
+};
+
 // --- Bit / range utilities ---
 
 std::optional<std::pair<int32_t, int32_t>> ParseExactBitMapText(std::string_view bit_map);

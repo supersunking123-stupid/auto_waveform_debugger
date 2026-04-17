@@ -49,8 +49,7 @@ void CollectTraceableSymbols(const slang::ast::RootSymbol &root,
 void CollectInstanceHierarchy(const slang::ast::RootSymbol &root,
                               const slang::SourceManager &sm,
                               TraceDb &db,
-                              SourceInfoCache &source_info_cache,
-                              SourcePathMode source_path_mode);
+                              CompileContext &compile_ctx);
 void BuildHierarchyFromSignals(TraceDb &db);
 slang::flat_hash_map<std::string_view, size_t> BuildSubtreeSignalCounts(
     const std::vector<SignalCompileItem> &signals);
@@ -66,8 +65,7 @@ bool SaveGraphDb(const std::string &db_path,
                  const TraceDb &hier_db,
                  const std::vector<std::vector<size_t>> *buckets,
                  size_t &signal_count,
-                 SourceInfoCache &source_info_cache,
-                 SourcePathMode source_path_mode,
+                 CompileContext &compile_ctx,
                  bool low_mem,
                  CompileLogger *logger);
 bool HasUnknownSysNameWarningControl(const std::vector<std::string> &args);
@@ -235,7 +233,7 @@ int RunCompile(int argc, char *argv[]) {
   bool relax_defparam = false;
   bool mfcu = false;
   bool low_mem = false;
-  SourcePathMode source_path_mode = SourcePathMode::kLogical;
+  CompileContext compile_ctx;
   size_t partition_budget = 0;
   std::string compile_log_path;
   std::vector<std::string> passthrough_args;
@@ -273,7 +271,7 @@ int RunCompile(int argc, char *argv[]) {
       continue;
     }
     if (arg == "--physical-source-paths") {
-      source_path_mode = SourcePathMode::kPhysicalAbsolute;
+      compile_ctx.source_path_mode = SourcePathMode::kPhysicalAbsolute;
       continue;
     }
     if (arg == "--partition-budget") {
@@ -327,7 +325,7 @@ int RunCompile(int argc, char *argv[]) {
   logger.Log("compile begin: db=" + db_path + " incremental=" + (incremental ? "1" : "0") +
              " mfcu=" + (mfcu ? "1" : "0") + " partition_budget=" +
              std::to_string(partition_budget) + " source_paths=" +
-             (source_path_mode == SourcePathMode::kPhysicalAbsolute ? "physical-absolute" : "logical"));
+             (compile_ctx.source_path_mode == SourcePathMode::kPhysicalAbsolute ? "physical-absolute" : "logical"));
 
   if (!HasTopArg(passthrough_args)) {
     std::cerr << "Missing required option: --top <module>\n";
@@ -349,7 +347,7 @@ int RunCompile(int argc, char *argv[]) {
   const std::filesystem::path meta_path = db_path_fs.string() + ".meta";
   std::vector<std::string> fingerprint_args = passthrough_args;
   if (mfcu) fingerprint_args.push_back("--mfcu=grouped-v1");
-  if (source_path_mode == SourcePathMode::kPhysicalAbsolute)
+  if (compile_ctx.source_path_mode == SourcePathMode::kPhysicalAbsolute)
     fingerprint_args.push_back("--physical-source-paths");
   const std::string new_fingerprint = ComputeCompileFingerprint(fingerprint_args);
   if (incremental && std::filesystem::exists(db_path_fs) && std::filesystem::exists(meta_path)) {
@@ -414,8 +412,6 @@ int RunCompile(int argc, char *argv[]) {
 
   const slang::ast::RootSymbol &root = compilation->getRoot();
   const slang::SourceManager &sm = *compilation->getSourceManager();
-  SourceInfoCache source_info_cache;
-
   std::vector<SignalCompileItem> signals;
   signals.reserve(2000000);
   logger.Log("step: collect traceable symbols");
@@ -428,7 +424,7 @@ int RunCompile(int argc, char *argv[]) {
   TraceDb hier_db;
   logger.Log("step: collect instance hierarchy");
   LogMem("MemBeforeCollectHierarchy");
-  CollectInstanceHierarchy(root, sm, hier_db, source_info_cache, source_path_mode);
+  CollectInstanceHierarchy(root, sm, hier_db, compile_ctx);
   LogMem("MemAfterCollectHierarchy");
 
   std::vector<PartitionRecord> parts;
@@ -453,8 +449,7 @@ int RunCompile(int argc, char *argv[]) {
   logger.Log("step: emit db");
   size_t written_signal_count = 0;
   LogMem("MemBeforeSaveGraphDb");
-  if (!SaveGraphDb(db_path, signals, sm, hier_db, &buckets, written_signal_count, source_info_cache,
-                   source_path_mode, low_mem,
+  if (!SaveGraphDb(db_path, signals, sm, hier_db, &buckets, written_signal_count, compile_ctx, low_mem,
                    &logger)) {
     std::cerr << "Failed to write DB: " << db_path << "\n";
     return 1;

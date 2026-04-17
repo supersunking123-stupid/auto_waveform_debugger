@@ -8,12 +8,13 @@ from pathlib import Path
 
 
 def run_cmd(cmd, cwd=None, expect=0):
-    proc = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True)
+    run_cwd = None if cwd is None else str(cwd)
+    proc = subprocess.run(cmd, cwd=run_cwd, text=True, capture_output=True)
     if proc.returncode != expect:
         raise AssertionError(
             "Command failed\n"
             f"cmd: {' '.join(cmd)}\n"
-            f"cwd: {cwd}\n"
+            f"cwd: {run_cwd}\n"
             f"expected_rc: {expect}, actual_rc: {proc.returncode}\n"
             f"stdout:\n{proc.stdout}\n"
             f"stderr:\n{proc.stderr}\n"
