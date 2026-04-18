@@ -274,6 +274,14 @@ serve session.
 **Optional: parallel.** If the user asks and the serve backend handles
 concurrent queries, spawn all workers at once.
 
+**Model selection for workers.** Workers execute a well-scoped,
+prompt-driven task (expand hierarchy, detect interfaces, trace
+connections, write a markdown doc). They do not need the most capable
+model. Spawn workers with a cost-effective model such as `haiku` or
+`chatgpt-5.4-mini` to reduce token spend without sacrificing doc
+quality. The orchestrator itself should continue using the default
+model since it handles classification, dedup, and escalation decisions.
+
 ### Handling worker escalations
 
 A worker may return an `ESCALATION` **instead of** a normal summary.
