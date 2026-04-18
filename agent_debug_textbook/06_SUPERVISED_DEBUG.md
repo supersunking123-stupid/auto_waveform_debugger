@@ -4,7 +4,7 @@
 
 **When to use:** The model executing the debug is prone to drifting from playbooks, making tool calls that don't match stated intent, or drawing conclusions from unverified assumptions. If a single-agent debug session has already failed, or the debug is especially high-risk/ambiguous, retry with this two-agent setup. Do not use supervised mode by default for every short, routine debug.
 
-**Prerequisites:** Same as Playbook 04 — a compiled structural database and a waveform file. The Supervisor does not call MCP tools directly; it operates by reviewing the Debugger's actions and steering via structured feedback.
+**Prerequisites:** Same as Playbook 04 — a compiled structural database, a waveform file, and a sufficient architecture document for the relevant design or subsystem. If that document does not already exist, Phase 0 must route through `08_DESIGN_MAPPING.md` before active debugging. The Supervisor does not call MCP tools directly; it operates by reviewing the Debugger's actions and steering via structured feedback.
 
 ---
 
@@ -12,7 +12,7 @@
 
 ### Debugger
 
-The Debugger follows Playbooks 01–05 and `rtl_debug_guide.md` exactly as written. It:
+The Debugger follows Playbooks 01–08 and `rtl_debug_guide.md` exactly as written. It:
 - Executes all MCP tool calls
 - Records observations and summaries after each phase
 - Presents compact batches of planned tool calls, then reports results and conclusions to the Supervisor before moving to the next phase
@@ -57,6 +57,8 @@ The agents alternate in compact batches. Each phase of the debug workflow (Phase
 ```
 
 **Critical rule:** The Debugger must **never advance to the next phase** without Supervisor approval. Per-call approval is only required in high-risk states (timescale uncertainty, path ambiguity, contradictory results, or golden-boundary ambiguity). Routine cursor/bookmark updates and tightly related read batches should be reviewed at the batch level, not one call at a time.
+
+**Phase 0 gate:** The Supervisor must block Phase 1 if the Debugger has not checked architecture-document sufficiency. If no sufficient doc exists and the Debugger did not route through `08_DESIGN_MAPPING.md`, stop the debug and require that mapping first.
 
 ## Efficiency rules for supervised mode
 
@@ -105,6 +107,12 @@ This check enforces Rule 11 (layer-by-layer tracing). If the Debugger descends o
 
 > "Signal A = X & Y. You found Y is wrong and moved on. But you didn't verify X. Check X first — if X is also wrong, the root cause may be elsewhere."
 
+### Design-map sufficiency check
+
+> "You are debugging inside `top.u_dma`, but what are its major child blocks, interfaces, and clock/reset boundaries? If you cannot answer that from an existing doc, why did you skip Phase 0 mapping?"
+
+The Supervisor checks whether the Debugger has enough architectural context for the current scope. If the Debugger is inside an opaque subsystem and no sufficient doc exists, the Supervisor redirects to `08_DESIGN_MAPPING.md` instead of approving more cone tracing.
+
 ### Golden-boundary check
 
 > "You are questioning whether the vendor VIP is correct. Stop. The VIP is trusted. Trace the immediate driver of the interface signal instead; the source may be DUT RTL or home-grown testbench RTL."
@@ -137,7 +145,7 @@ Only **EDA-vendor protocol VIP monitors/checkers** are golden by default. Do not
 
 The first session the Debugger creates should capture the complete error scenario. This session serves as the **home base** for the entire debug. Every causal chain must ultimately explain the signals in this snapshot. When a dead end is reached, the Debugger returns here to try a different path.
 
-### Setup (Phase 0, step 5)
+### Setup (Phase 1, step 1.2 after Phase 0 mapping)
 
 ```python
 # 1. Create the anchor session
@@ -166,15 +174,20 @@ create_signal_group(group_name="error_interface",
 
 ### Backtracking protocol
 
-When the Debugger hits a dead end (two consecutive phases with no progress, or a branch that terminates at a correct signal):
+When the Debugger hits a dead end (two consecutive phases with no progress, a branch that terminates at a correct signal, or repeated looping inside the same subsystem):
 
 ```
 1. Supervisor: "Return to error_scenario session."
 2. Debugger: switch_session(session_name="error_scenario")
-3. Supervisor: "Which signals in the error-interface group have you NOT yet traced?"
-4. Debugger: lists untraced signals.
-5. Supervisor: "Trace <next_signal>. Start from Phase 2."
-6. Debugger: proceeds with new branch.
+3. Supervisor: "Is this a branch dead end, or are you missing subsystem context?"
+4. If subsystem context is missing:
+   - Supervisor: "Pause tracing. Run Playbook 08 using the design top module, then read the doc for the current subsystem."
+   - Debugger: generates or reads the subsystem doc, summarizes it, then returns.
+5. If subsystem context is already sufficient:
+   - Supervisor: "Which signals in the error-interface group have you NOT yet traced?"
+   - Debugger: lists untraced signals.
+   - Supervisor: "Trace <next_signal>. Start from Phase 2."
+6. Debugger: proceeds with the approved branch.
 ```
 
 This prevents the Debugger from wandering into unrelated parts of the design. Every investigation branch originates from the error scenario and must reconnect to it.
@@ -278,6 +291,7 @@ Quick reference for the Supervisor's most common interventions:
 | Debugger concludes root cause but hasn't checked all RHS drivers | Block conclusion, list unchecked drivers, require verification |
 | Debugger questions an EDA-vendor VIP, or treats a home-grown model as golden | Redirect: "Trust the vendor VIP. Trace the immediate driver of the flagged signal; the source may be DUT RTL or home-grown testbench RTL." |
 | Debugger is processing >20 transitions by inspection | Instruct: "Write a Python script to process this data. I will review it." |
+| Debugger skipped Phase 0 design-map check or is looping in an undocumented subsystem | Block and redirect: "Run Playbook 08 using the design top module, then read the relevant subsystem doc before more tracing." |
 | Debugger is stuck after two attempts on the same branch | Instruct: "Return to error_scenario session. Pick a different signal to trace." |
 | Debugger's conclusion doesn't explain the error-scenario snapshot | Block conclusion: "Your root cause must explain why <signal> was <value> at the error point. It currently doesn't." |
 | Debugger skips a playbook phase | Block: "You skipped Phase N. Go back and complete it." |
@@ -296,19 +310,25 @@ The user's session acts as the Supervisor. It spawns the Debugger as a subagent:
 ```
 Agent(
     prompt="""You are the Debugger agent. Follow the debug workflow in
-    agent_debug_textbook/04_ROOT_CAUSE_ANALYSIS.md exactly. After each phase,
+    agent_debug_textbook/04_ROOT_CAUSE_ANALYSIS.md exactly. Complete Phase 0
+    before Phase 1. After each phase,
     report each phase or compact batch of tool calls, results, and conclusions
     back to me for review. Do not advance to the next phase until I approve.
 
     The failure is: <error message>
     Waveform: <path>
     Structural DB: <path>
+    Existing architecture docs: <paths or "none">
+    Design top module for crawler (required if docs are missing): <top_module>
+    Crawl output dir (required if docs are missing): <output_dir>
+    Crawl depth (optional): <max_depth or default 4>
+    Current subsystem of interest, if already known: <instance path or "unknown">
     """,
     description="RTL debug agent"
 )
 ```
 
-The Supervisor (outer agent) reviews each batch/phase response and sends corrections or approval via `SendMessage`.
+The Supervisor (outer agent) reviews each batch/phase response and sends corrections or approval via `SendMessage`. The prompt must provide enough Phase 0 context for the Debugger to either reuse existing docs or invoke Playbook 08 cleanly. At minimum, that means either doc paths, or `top_module` plus crawl output settings.
 
 ### Option B — Debugger spawns Supervisor for review
 
@@ -320,7 +340,9 @@ Agent(
     Check: (1) do tool call arguments match stated intent? (2) are all claimed
     values backed by tool results? (3) does the conclusion follow logically?
     (4) is a vendor VIP being questioned, or is a home-grown model being treated
-    as golden? (5) were all RHS drivers checked?
+    as golden? (5) were all RHS drivers checked? (6) if Phase 0 required
+    design mapping, did the Debugger have either existing doc paths or crawler
+    inputs (`top_module`, `output_dir`, optional `max_depth`)?
 
     Playbook rules: <paste relevant rules>
 
@@ -340,6 +362,7 @@ Insert this block after each phase:
 ```
 SELF-REVIEW CHECKPOINT — Phase N complete
 □ Do my tool call arguments match what I said I would do?
+□ Did I complete the Phase 0 architecture-document sufficiency check? If not, stop.
 □ Is every factual claim backed by a tool result I can point to?
 □ Does my conclusion follow from the observations without unstated assumptions?
 □ Did I check all RHS drivers, not just the first suspicious one?
@@ -353,6 +376,7 @@ SELF-REVIEW CHECKPOINT — Phase N complete
 
 - **Use supervised mode selectively.** It reduces false starts, but it adds review latency. Prefer it after a failed single-agent pass or when the session is large, ambiguous, or high-risk.
 - **Keep Supervisor prompts short and rule-based.** The Supervisor's effectiveness comes from mechanical checks, not from being a better debugger. A checklist is more reliable than open-ended reasoning.
+- **Phase 0 is mandatory here too.** Supervised mode does not excuse missing design context. If the subsystem is undocumented, map it before approving more tracing.
 - **The error-scenario session is non-negotiable.** Every investigation branch must start from and reconnect to the error scenario. If the Debugger cannot explain the error snapshot, the investigation is incomplete.
 - **Python scripts are for data processing, not for tool calls.** The script processes data already returned by MCP tools. It does not replace the tools — it supplements them for tasks where humans would use a spreadsheet or a short script.
 - **Backtracking is not failure.** In a complex design, the first branch often leads to a correct signal (dead end). Returning to the error scenario and trying the next suspect is the designed workflow, not an admission of failure.

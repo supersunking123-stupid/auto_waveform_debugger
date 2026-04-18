@@ -4,6 +4,8 @@
 
 **When to use:** You need to answer questions about RTL connectivity, signal fanin/fanout, or design hierarchy. No simulation values are involved.
 
+**Boundary:** This playbook is for targeted structural questions. If what you really need is a persistent architecture map of the full design or of a complex subsystem, switch to `08_DESIGN_MAPPING.md` and use the `rtl-crawler-multi-agent` skill instead of manually expanding the hierarchy forever.
+
 ---
 
 ## Tools available in this playbook
@@ -89,6 +91,8 @@ What do you need to know?
 1. `rtl_trace(args=["hier", "--db", "rtl_trace.db", "--root", "top", "--depth", "2", "--format", "json"])` — see the top-level structure.
 2. Drill into interesting submodules: `rtl_trace(args=["hier", "--db", "rtl_trace.db", "--root", "top.u_interesting", "--depth", "2"])`.
 3. `rtl_trace(args=["find", "--db", "rtl_trace.db", "--query", "interesting_signal", "--limit", "20"])` — locate specific signals.
+
+If you still cannot state the major child blocks, interfaces, and boundaries after a few targeted hierarchy queries, stop and switch to `08_DESIGN_MAPPING.md`.
 
 ### Sequence B — Trace a signal's connectivity
 
@@ -176,6 +180,15 @@ When you need to run many queries against the same database, use serve mode to a
 | 1–2 quick queries | `rtl_trace(...)` one-shot calls |
 | 3+ queries on the same DB | `rtl_trace_serve_start/query/stop` |
 | Exploratory browsing (unknown number of queries) | Serve mode |
+
+### Sequence G — Switch from ad hoc browsing to crawler mapping
+
+Use this when hierarchy browsing stops being targeted and starts turning into documentation work:
+
+1. You have already used several `hier` / `find` / `trace` calls and still cannot explain the subsystem boundary.
+2. The same subsystem keeps reappearing in your traces, but you do not know its major child blocks or interfaces.
+3. Stop this playbook and route to `08_DESIGN_MAPPING.md`.
+4. Generate or read the subsystem architecture doc, then come back here only for targeted follow-up questions.
 
 ---
 

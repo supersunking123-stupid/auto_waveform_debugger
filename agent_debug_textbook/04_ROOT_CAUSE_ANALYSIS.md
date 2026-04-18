@@ -4,7 +4,7 @@
 
 **When to use:** A failure, assertion, or unexpected behavior has been observed, and you need to trace it back to its origin. This is the most complex playbook and prescribes a specific multi-phase workflow.
 
-**Prerequisites:** A compiled structural database and a waveform file must both be available. Before starting, determine whether a usable `rtl_trace.db` already exists and what path to use. If local context does not make that clear, ask the user. If no DB exists, ask the user for the exact command or flow used in this project to generate it rather than guessing compile flags. See Playbook 02.
+**Prerequisites:** A compiled structural database and a waveform file must both be available. Before starting, determine whether a usable `rtl_trace.db` already exists and what path to use. If local context does not make that clear, ask the user. If no DB exists, ask the user for the exact command or flow used in this project to generate it rather than guessing compile flags. Also determine whether a sufficient architecture document already exists for the design or subsystem you are about to debug. If not, start with `08_DESIGN_MAPPING.md`. See Playbook 02 and Playbook 08.
 
 ---
 
@@ -30,6 +30,9 @@ This playbook draws from all other playbooks. The tools are organized by the pha
 **Optional efficiency chain:**
 `create_signal_expression`, `update_signal_expression`, `delete_signal_expression`, `list_signal_expressions`
 
+**Phase 0 — Orient and map (when docs are missing or insufficient):**
+`rtl-crawler-multi-agent` skill, followed by reading the generated or existing architecture docs before proceeding
+
 ## Efficiency defaults
 
 Use these defaults unless you have a specific reason not to:
@@ -42,6 +45,50 @@ Use these defaults unless you have a specific reason not to:
 ---
 
 ## The debug workflow
+
+### Phase 0 — Orient and map
+
+**Goal:** Establish whether you already have enough architectural context to debug efficiently. If not, generate it before active waveform investigation.
+
+**Phase 0 watchlist** — verify before each step:
+- **Design-map sufficiency:** A doc is sufficient only if it covers the relevant design or subsystem and identifies major hierarchy boundaries, interfaces/peers, clock/reset domains, and control/dataflow landmarks.
+- **Smallest supported mapping action:** If failure ownership is unclear, map the full design. If the failure is already localized to one opaque subsystem, refresh or reuse the full-design crawl and then read that subsystem's generated doc.
+- **Map before deep tracing:** Do not start a long driver-cone descent in a subsystem whose major child blocks and boundaries you cannot name yet.
+
+```
+0.1  Identify the likely debug scope.
+     - If you do not know whether the failure belongs to the DUT, testbench, or one of
+       several top-level subsystems, the scope is the full design.
+     - If the failure is already localized to one subsystem, the scope is that subsystem.
+
+0.2  Check whether an architecture document has already been provided for that scope.
+     This may be a user-provided design doc, an existing `design_index.md`, or a prior
+     crawler-generated subsystem architecture doc.
+
+0.3  Apply the sufficiency rubric:
+     - Does the doc show the major child blocks or wrappers?
+     - Does it identify the relevant external interfaces and peer blocks?
+     - Does it describe the relevant clock/reset domains?
+     - Does it give you enough control/dataflow landmarks to choose the first branch?
+
+0.4  If the doc is insufficient or missing, switch to Playbook 08 and use the
+     `rtl-crawler-multi-agent` skill.
+     - No top-level map or unclear ownership → full-design crawl
+     - Existing top-level map but opaque local subsystem → refresh the full-design
+       crawl, then read the generated subsystem doc for that block
+
+0.5  Read the resulting doc set before proceeding.
+     At minimum, read `design_index.md` plus the subsystem doc most relevant to the failure.
+
+0.6  Write a short working summary for yourself:
+     - subsystem boundary
+     - major child blocks / wrappers
+     - relevant interfaces and peers
+     - relevant clock/reset domains
+     - first debug branch suggested by the map
+```
+
+**Output of Phase 0:** You either have a sufficient architecture document already, or you generated one. You know which subsystem boundary you are debugging inside and which branch to inspect first.
 
 ### Phase 1 — Observe the symptom
 
@@ -121,7 +168,8 @@ Use these defaults unless you have a specific reason not to:
 
 **Phase 2 watchlist** — verify before each step:
 - **Rule 3:** If a FIFO, CDC synchronizer, or arbiter is in the suspect cone, check pointer/flag values explicitly — their failures are deferred and non-local, and waveform tools alone may not surface them.
-- **Rule 4:** If you have made >10 calls on a single block's internal signals without a concrete root cause, stop and escalate to a local testbench (see `EDA_USE.md`).
+- **Design Mapping trigger:** If you have made 8 or more investigation-oriented calls inside one subsystem without shrinking the suspect set or moving the causal frontier deeper, pause and run Playbook 08 to refresh/read the design map for that subsystem.
+- **Rule 4:** After one bounded post-crawl pass, if you have still made >10 calls on a single block's internal signals without a concrete root cause, stop and escalate to a local testbench (see `EDA_USE.md`).
 - **Rule 11:** Do not stop at the first wrong signal — every wrong driver must be traced to its own root cause before declaring a conclusion.
 
 ```
@@ -171,6 +219,13 @@ Use these defaults unless you have a specific reason not to:
      and does not scale. If you have made more than ~5 waveform queries on a
      signal without a structural trace guiding them, stop and switch to iterative
      structural tracing with batched reads.
+
+2.6  Loop detection:
+     If you revisit the same suspect cone or the same 2–3 suspect signals twice
+     without a new explanation, stop Phase 2 and run Playbook 08 to refresh/read
+     the design map for the current subsystem. After reading the subsystem map,
+     restart Phase 2 from the subsystem boundary rather than from the last leaf
+     signal you touched.
 ```
 
 **Output of Phase 2:** You have a short list of suspect signals and can see their values leading up to the failure.
@@ -184,7 +239,8 @@ Use these defaults unless you have a specific reason not to:
 **Phase 3 watchlist** — verify before each step:
 - **Rule 11:** Trace EVERY wrong branch to a stop criterion. A state machine in an unexpected state is not a root cause — ask why it entered that state and keep tracing.
 - **Rule 5:** Each step must answer "why does this signal have this value?" not "what is this signal's value?" — distinguish observation (symptom) from explanation (cause).
-- **Rule 4:** The >10 calls escalation trigger still applies. If a block remains opaque after 10 calls in Phase 3, spawn a local test rather than continuing passive observation.
+- **Design Mapping trigger:** If Phase 3 keeps descending inside one opaque subsystem but you still cannot name the next meaningful branch, stop and run Playbook 08 to refresh/read the design map for that subsystem before making more causal calls.
+- **Rule 4:** The >10 calls escalation trigger still applies after the mapping pass. If a block remains opaque after one bounded post-crawl pass, spawn a local test rather than continuing passive observation.
 - **Rule 13:** Contradictory driver values (same signal, two different values) → path mismatch or timescale error. Stop and verify before continuing.
 
 ```
@@ -225,6 +281,12 @@ Use these defaults unless you have a specific reason not to:
 3.4  Bookmark each key causal point as you confirm it:
      → create_bookmark(bookmark_name="cause_L1", time=T_cause1, description="...")
      → create_bookmark(bookmark_name="root_cause", time=T_root, description="...")
+
+3.5  If you had to switch to Playbook 08 during Phase 2 or Phase 3, restart the
+     causal loop from the mapped subsystem boundary:
+     - use the documented child blocks as the next branch points
+     - use the documented interfaces as search anchors
+     - use the documented clocks/resets to avoid crossing domains accidentally
 ```
 
 **Common mistake:** Finding that `signal B is 0 when it should be 1` and immediately concluding "the logic driving B is the bug — let me fix it." B's driver may itself be driven by a wrong signal. Check B's drivers before touching any code.
@@ -279,6 +341,10 @@ get_snapshot(signals=["error_interface"], signals_are_groups=True, time="BM_erro
 ```
 Symptom: top.u_fifo.overflow == 1 at time 320000
 
+Phase 0:
+  Existing FIFO subsystem doc is already available and sufficient.
+  No crawler run needed.
+
 Phase 1:
   set_cursor(time=320000)
   create_bookmark(bookmark_name="overflow", time=320000)
@@ -316,7 +382,7 @@ Phase 4:
 
 ## Tips
 
-- **Always start with Phase 1.** Skipping observation leads to chasing the wrong signal.
+- **Always start with Phase 0.** Skipping design mapping or observation leads to chasing the wrong signal.
 - **Use bookmarks aggressively.** They let you reference times symbolically (`"BM_error_point"`, `"BM_root_cause"`) instead of memorizing numbers.
 - **Use signal groups** to keep track of suspects and related signals across phases.
 - **The debug loop is iterative.** Phase 3 often reveals a deeper cause that sends you back to Phase 2 with a new target signal. This is normal.

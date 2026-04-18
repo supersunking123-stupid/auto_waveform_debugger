@@ -14,12 +14,16 @@ Before touching any waveform, understand what you are looking at.
 
 1. **Read the failure description.** Extract the failing signal, the time of failure, the test name, and any error or assertion message. If the description is vague ("test hangs", "output mismatch"), your first job is to make it concrete.
    - When reading a simulation log, do **not** dump the whole file into context. Start with targeted extraction such as `grep` for `UVM_ERROR` / `UVM_FATAL` / assertion text, plus `head` and `tail` for setup/final status. Expand only around the relevant matches.
-2. **Understand the design context.** Use structural exploration (`hier`, `find`) to understand the module hierarchy around the failure point. You do not need to understand the entire chip — just the neighborhood of the symptom.
-3. **Identify the clock domain(s).** Determine which clock drives the failing logic. If multiple clock domains are nearby, note the boundaries immediately — they will matter later.
-4. **Determine the waveform time precision. Do this before passing any time value to any tool.** Call `get_signal_info` on any signal in the waveform and read the timescale it reports. The waveform timestamps are in units of the *precision* — the second number in the `` `timescale `` directive. See Rule 12 for the full explanation and conversion procedure.
-5. **Set up your workspace.** Create a session, bookmark the failure time, and create a signal group for the signals mentioned in the failure. This is your anchor; you will always be able to return here.
+2. **Check whether a sufficient architecture document already exists for the relevant design or subsystem.** A sufficient doc may be user-provided or crawler-generated, but it must identify the major hierarchy boundaries, interfaces/peer blocks, clock/reset domains, and the main control/dataflow landmarks relevant to the current failure.
+   - If no sufficient doc exists, use `rtl-crawler-multi-agent` before active debugging.
+   - If the failure ownership is unclear, crawl the full design.
+   - If the failure is already localized but the subsystem is still opaque, rerun or reuse the full-design crawl and then read the generated doc for that subsystem.
+3. **Understand the design context.** Use the architecture doc first, then targeted structural exploration (`hier`, `find`) to understand the module hierarchy around the failure point. You do not need to understand the entire chip — just the neighborhood of the symptom.
+4. **Identify the clock domain(s).** Determine which clock drives the failing logic. If multiple clock domains are nearby, note the boundaries immediately — they will matter later.
+5. **Determine the waveform time precision. Do this before passing any time value to any tool.** Call `get_signal_info` on any signal in the waveform and read the timescale it reports. The waveform timestamps are in units of the *precision* — the second number in the `` `timescale `` directive. See Rule 12 for the full explanation and conversion procedure.
+6. **Set up your workspace.** Create a session, bookmark the failure time, and create a signal group for the signals mentioned in the failure. This is your anchor; you will always be able to return here.
 
-**Do not start tracing signals until Phase 0 is complete.** Agents that skip orientation waste time chasing irrelevant signals.
+**Do not start tracing signals until Phase 0 is complete.** Agents that skip orientation or design mapping waste time chasing irrelevant signals.
 
 ### Phase 1 — Observe the symptom
 
@@ -129,13 +133,35 @@ These components share a dangerous property: they work correctly 99% of the time
 - Priority inversion, starvation, and deadlock are common under heavy load.
 - When an arbiter is near the failure, check: are all requestors getting grants eventually? Is the grant signal consistent with the priority scheme? Is there a cycle where no grant is issued despite pending requests?
 
-### Rule 4 — Spawn subagents for local verification
+### Rule 3A — Build a design map before deep-tracing a complex subsystem
 
-If a component is suspicious and waveform debugging is proving difficult — the cone is too deep, the behavior is stateful, or the timing too subtle — spawn a subagent to build a standalone test for that component.
+Signal tracing explains **local causation**. It does **not** give you a stable architectural map of a complex subsystem. In deeply hierarchical designs, those are different needs. If you keep tracing signals in circles because you do not know the subsystem's major blocks, interfaces, or control/dataflow shape, stop and build the map first.
 
-**Escalation trigger:** If you have made more than ~10 tool calls focused on a single block's internal signals without identifying a concrete root cause, stop passive waveform observation and escalate to a local testbench. More queries on the same block are unlikely to converge faster than targeted simulation would.
+Use `rtl-crawler-multi-agent` when any of these are true:
 
-- The subagent should create a minimal testbench exercising the suspected corner case.
+- No sufficient architecture doc exists for the current design or subsystem.
+- You cannot name the subsystem's major child blocks, interfaces, and clock/reset boundaries from memory.
+- You have made repeated driver/load traces inside one subsystem, but the next branch point is still unclear.
+- You revisit the same suspect cone or same 2–3 signals twice without a new explanation.
+
+The current crawler flow is rooted at the design `top_module`; it does not take a subsystem-root parameter. When you need local subsystem context, rerun or reuse the full-design crawl and then focus on the generated subsystem doc.
+
+After the crawl:
+
+1. Read `design_index.md` plus the relevant subsystem doc.
+2. Summarize the subsystem boundary, major child blocks, interfaces/peers, and clocks/resets.
+3. Restart the debug from that mapped boundary instead of from the last leaf signal you touched.
+
+### Rule 4 — Escalate in two steps: crawl first, simulate second
+
+If a component is suspicious and waveform debugging is proving difficult, do **not** jump directly from passive tracing to local simulation. First build the subsystem map; then, if the bug is still opaque, isolate the block in a local testbench.
+
+**Step 1 — Crawler escalation:** If you have made about **8 investigation-oriented tool calls** focused on one subsystem without shrinking the suspect set or moving the causal frontier deeper, stop passive tracing and run `rtl-crawler-multi-agent` on the full design (or reuse a current full-design crawl), then read the generated doc for that subsystem. If ownership is still unclear, use the top-level map first.
+
+**Step 2 — Local-test escalation:** After reading the generated map and making one bounded post-crawl debug pass, if you still have made more than about **10 tool calls** focused on a single block's internal signals without identifying a concrete root cause, spawn a subagent to build a standalone testbench for that component. More queries on the same block are unlikely to converge faster than targeted simulation would.
+
+- The crawler run should produce the architectural landmarks you were missing: child blocks, interfaces, clock/reset boundaries, and likely control/dataflow branch points.
+- The subagent should then create a minimal testbench exercising the suspected corner case.
 - Consult `EDA_USE.md` for simulator setup on this machine.
 - This is effective for any component where targeted stimulus reveals internal behavior more directly than passive observation: counters and pointers (exercise boundary conditions), arbiters (drive concurrent requests), state machines (force edge-case transitions), CDC logic (vary sampling edge timing), FIFOs (fill-drain across the wrap boundary).
 - The resulting waveform can be loaded into an MCP session and analyzed with the same playbooks as a full-system waveform.
@@ -407,19 +433,21 @@ When forming hypotheses (Rule 2), check whether the symptom matches any of these
 
 If you have exhausted your hypothesis checklist and still cannot find the root cause:
 
-1. **Widen the observation window.** You may be looking at the wrong time range. Search for the *first* occurrence of the anomaly — the failure you are seeing may be a secondary effect of an earlier bug.
+1. **Map the current subsystem before more tracing.** If you do not already have a sufficient architecture doc for the block you are stuck in, use or refresh the full-design `rtl-crawler-multi-agent` output now. Read the generated subsystem doc, identify the major child blocks and interfaces, then restart from the subsystem boundary.
 
-2. **Switch direction.** If you have been tracing drivers (backward), try tracing loads (forward) from a known-good signal to see where it goes wrong. The corruption point may be easier to find from the other side.
+2. **Widen the observation window.** You may be looking at the wrong time range. Search for the *first* occurrence of the anomaly — the failure you are seeing may be a secondary effect of an earlier bug.
 
-3. **Check a different clock domain.** If the failure is near a CDC boundary, the root cause may be in the other clock domain entirely. Switch your investigation to that side.
+3. **Switch direction.** If you have been tracing drivers (backward), try tracing loads (forward) from a known-good signal to see where it goes wrong. The corruption point may be easier to find from the other side.
 
-4. **Compare with a passing test.** If you have a waveform from a passing test, compare the signal values at the same logical point (same transaction number, same state machine state, not necessarily the same absolute time). The difference often reveals the bug.
+4. **Check a different clock domain.** If the failure is near a CDC boundary, the root cause may be in the other clock domain entirely. Switch your investigation to that side.
 
-5. **Question the testbench (with caution — see Rule 14).** The testbench itself may be incorrect — wrong expected values, wrong timing constraints, or wrong stimulus. Rule 14 still applies: trust EDA-vendor VIP protocol checkers, but do not automatically treat home-grown models, assertions, or scoreboards as golden. Use the driver trace and waveform to decide whether the source is DUT RTL or testbench RTL.
+5. **Compare with a passing test.** If you have a waveform from a passing test, compare the signal values at the same logical point (same transaction number, same state machine state, not necessarily the same absolute time). The difference often reveals the bug.
 
-6. **Spawn a subagent (Rule 4).** Isolate the suspicious block and test it independently. Sometimes the system-level waveform is too complex to debug efficiently.
+6. **Question the testbench (with caution — see Rule 14).** The testbench itself may be incorrect — wrong expected values, wrong timing constraints, or wrong stimulus. Rule 14 still applies: trust EDA-vendor VIP protocol checkers, but do not automatically treat home-grown models, assertions, or scoreboards as golden. Use the driver trace and waveform to decide whether the source is DUT RTL or testbench RTL.
 
-7. **Ask for help.** If you have spent significant effort and are not making progress, summarize your findings and present them. A clear summary of what you have checked and eliminated is valuable even without a final answer.
+7. **Spawn a subagent for local verification (Rule 4).** Isolate the suspicious block and test it independently. Use this after the crawler pass if the system-level waveform is still too complex to debug efficiently.
+
+8. **Ask for help.** If you have spent significant effort and are not making progress, summarize your findings and present them. A clear summary of what you have checked and eliminated is valuable even without a final answer.
 
 ---
 
