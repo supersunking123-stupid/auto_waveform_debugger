@@ -1,6 +1,6 @@
 ---
 name: rtl-crawler-multi-agent
-description: "Systematically explore an RTL design's structural hierarchy using rtl_trace tools, then generate per-subsystem markdown documentation describing the architecture. Use this skill whenever the user asks to 'crawl', 'explore', 'document', or 'map' an RTL design, or when they mention 'RTL Crawler'. Also trigger when the user wants to generate architecture docs from a compiled rtl_trace database, or asks you to understand the structure of a chip/SoC/ASIC/FPGA design before debugging. This skill produces markdown files that serve as a shared knowledge base so that other agents (or humans) can quickly orient themselves in the design without repeating the exploration."
+description: "Multi-agent version of RTL Crawler. Use only when the user explicitly asks for subagents, delegation, or parallel agent work while crawling/mapping an RTL design, or otherwise clearly authorizes multi-agent execution. If the user wants RTL crawling but has not authorized delegation, use the sibling `rtl-crawler` skill instead. This skill explores the structural hierarchy with rtl_trace and generates per-subsystem markdown architecture docs plus a design index."
 ---
 
 # RTL Crawler — Orchestrator
@@ -12,6 +12,10 @@ assembling the final index document.
 
 Worker agents handle the detail work — deep-crawling one subsystem each
 and writing its architecture doc.
+
+This skill is **multi-agent only**. If the user has not explicitly
+authorized subagents / delegation / parallel agent work, stop and use
+the sibling `rtl-crawler` skill instead.
 
 ---
 
@@ -118,15 +122,32 @@ To confirm a suspected wrapper, use regex-scoped signal searches.
 anchors.  Also escape the literal instance path before embedding it in a
 regex.
 
+Because modern DBs may expose direct **struct-member signals** such as
+`child.req.aw.valid`, probe both flat direct signals and direct
+struct-member fields. First collect the immediate child instance names
+from the `hier --depth 1` result. When reviewing the `find` matches
+below, ignore any result whose first token after `child.` is one of
+those child instance names; that match belongs to a descendant child
+block, not to the current instance's own local logic.
+
 ```python
-local_prefix = "^" + escape_regex(child) + r"\.[^.]*"
+flat_prefix = "^" + escape_regex(child) + r"\.[^.]*"
+struct_prefix = "^" + escape_regex(child) + r"\.[^.]+(\.[^.]+){0,2}"
 rtl_trace_serve_query(
     session_id,
-    f"find --query '{local_prefix}(valid|ready|req|gnt)' --regex --limit 5 --format json",
+    f"find --query '{flat_prefix}(valid|ready|req|gnt)$' --regex --limit 5 --format json",
 )
 rtl_trace_serve_query(
     session_id,
-    f"find --query '{local_prefix}(fsm|state|mode|sel)' --regex --limit 5 --format json",
+    f"find --query '{struct_prefix}\\.(valid|ready|req|gnt)$' --regex --limit 5 --format json",
+)
+rtl_trace_serve_query(
+    session_id,
+    f"find --query '{flat_prefix}(fsm|state|mode|sel)$' --regex --limit 5 --format json",
+)
+rtl_trace_serve_query(
+    session_id,
+    f"find --query '{struct_prefix}\\.(fsm|state|mode|sel)$' --regex --limit 5 --format json",
 )
 ```
 
@@ -334,10 +355,12 @@ external_interfaces:
     protocol: AXI
     peer: top.io_die.d2d_subsys[0]
     key_signals: ar/aw/w/r/b
+    probe_signal: top.io_die.pcie_subsys.req.aw.valid
   - direction: slave
     protocol: APB
     peer: top.compute_die[0].u_cfg
     key_signals: psel/penable/paddr
+    probe_signal: top.io_die.pcie_subsys.cfg.penable
 
 top_level_children:
   - u_pcie_ctrl (pcie_controller) — main PCIe controller
@@ -374,11 +397,13 @@ After all workers (including any spawned from escalations) have returned,
 build the connectivity map.
 
 Match up `external_interfaces` from worker summaries.  For ambiguous or
-leaf-IP connections, trace explicitly:
+leaf-IP connections, trace explicitly using the worker-provided
+`probe_signal` field, which is the exact resolved signal path the worker
+already used to identify that interface:
 
 ```python
 rtl_trace_serve_query(session_id,
-    "trace --mode loads --signal {subsystem}.{port_signal} --depth 4 --format json")
+    "trace --mode loads --signal {probe_signal} --depth 4 --format json")
 ```
 
 Build the connectivity table.

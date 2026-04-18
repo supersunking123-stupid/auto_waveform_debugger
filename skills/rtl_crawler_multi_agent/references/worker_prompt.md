@@ -125,13 +125,25 @@ these are true:
    same function).
 3. The block itself has very few **direct** local signals beyond clock,
    reset, and passthrough wires.  Search only signals directly under the
-   instance, not deep descendants:
+   instance, not deep descendants.  Because DBs may expose direct
+   struct-member signals such as `req.aw.valid`, probe both flat direct
+   signals and direct struct-member fields.  First collect the immediate
+   child instance names from the `hier --depth 1` result.  When reviewing
+   the `find` matches below, ignore any result whose first token after
+   `{subsystem_instance}.` is one of those child instance names; that
+   match belongs to a descendant child block, not to the current
+   instance's own local logic:
    ```python
-   local_prefix = "^" + escape_regex("{subsystem_instance}") + r"\.[^.]*"
+   flat_prefix = "^" + escape_regex("{subsystem_instance}") + r"\.[^.]*"
+   struct_prefix = "^" + escape_regex("{subsystem_instance}") + r"\.[^.]+(\.[^.]+){0,2}"
    rtl_trace_serve_query("{session_id}",
-       "find --query '{local_prefix}(fsm|state|mode|sel)' --regex --limit 5 --format json")
+       "find --query '{flat_prefix}(fsm|state|mode|sel)$' --regex --limit 5 --format json")
    rtl_trace_serve_query("{session_id}",
-       "find --query '{local_prefix}(valid|ready|req|gnt)' --regex --limit 5 --format json")
+       "find --query '{struct_prefix}\\.(fsm|state|mode|sel)$' --regex --limit 5 --format json")
+   rtl_trace_serve_query("{session_id}",
+       "find --query '{flat_prefix}(valid|ready|req|gnt)$' --regex --limit 5 --format json")
+   rtl_trace_serve_query("{session_id}",
+       "find --query '{struct_prefix}\\.(valid|ready|req|gnt)$' --regex --limit 5 --format json")
    ```
    Few or no results = likely a wrapper.
 
@@ -250,6 +262,10 @@ rtl_trace_serve_query("{session_id}",
     "trace --mode loads --signal {resolved_signal} --depth 2 --format json")
 ```
 
+Record that exact resolved path as the interface's `probe_signal`.
+The orchestrator uses `probe_signal` later for Phase 4 fallback traces
+when interface matching is ambiguous.
+
 Be selective:
 - Trace `*valid` or `*ready` per bus, not every data bit.
 - Trace clock and reset to identify domains.
@@ -355,6 +371,7 @@ external_interfaces:
   - direction: {master/slave}
     protocol: {AXI/AHB/APB/custom}
     peer: {peer_instance_path}
+    probe_signal: {resolved_signal_path}
     key_signals: {summary}
 
 top_level_children:
