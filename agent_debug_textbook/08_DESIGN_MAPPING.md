@@ -1,12 +1,12 @@
 # Playbook 08 — Design Mapping
 
-**Role:** You are a design mapper. Your job is to establish the architectural context for debugging by reading existing architecture docs when they are sufficient, or by generating them with the `rtl-crawler-multi-agent` skill when they are not.
+**Role:** You are a design mapper. Your job is to establish the architectural context for debugging by reading existing architecture docs when they are sufficient, or by generating them with the crawler flow when they are not. Use `rtl-crawler` by default; use `rtl-crawler-multi-agent` only when delegation is explicitly authorized.
 
 **When to use:** Use this playbook before active debugging when the design or subsystem is unfamiliar, when no architecture document has been provided, or when tracing inside a subsystem has become circular and unproductive.
 
 **Prerequisites:** A usable structural database path must be known. If no compiled DB exists yet, ask the user for the exact project-specific compile flow rather than guessing the filelist or top-module recipe.
 
-**Important capability boundary:** The current `rtl-crawler-multi-agent` skill is rooted at the design `top_module`. It builds a full-design map and then emits per-subsystem docs from that top-level crawl. It does **not** take a subsystem-root parameter. When you need local subsystem context, rerun or reuse the full-design crawl and then focus on the generated doc for the subsystem you care about.
+**Important capability boundary:** The current crawler flow is rooted at the design `top_module`. Both `rtl-crawler` and `rtl-crawler-multi-agent` build a full-design map and then emit per-subsystem docs from that top-level crawl. Neither takes a subsystem-root parameter. When you need local subsystem context, rerun or reuse the full-design crawl and then focus on the generated doc for the subsystem you care about.
 
 ---
 
@@ -37,7 +37,7 @@ Do you already have architecture docs for the relevant scope?
 │   └─ Read them, summarize the boundaries/interfaces/clocks/resets, then return to the debug playbook
 │
 ├─ No top-level architecture map exists
-│   └─ Run a full-design crawl with `rtl-crawler-multi-agent`
+│   └─ Run a full-design crawl with the crawler flow (`rtl-crawler` by default; `rtl-crawler-multi-agent` only with explicit delegation)
 │
 ├─ A top-level map exists, but the current subsystem is undocumented or still opaque
 │   └─ Refresh the full-design crawl, then focus on the generated subsystem doc
@@ -50,7 +50,7 @@ Do you already have architecture docs for the relevant scope?
 
 ## Mandatory rules
 
-- **Use the `rtl-crawler-multi-agent` skill.** Do not try to recreate the crawler manually with ad hoc `hier` and `trace` calls across the entire design.
+- **Use the crawler flow.** Use `rtl-crawler` by default; use `rtl-crawler-multi-agent` only when delegation is explicitly authorized. Do not try to recreate the crawler manually with ad hoc `hier` and `trace` calls across the entire design.
 - **Map before you guess.** If the subsystem architecture is unclear, get the map before doing more driver-cone tracing.
 - **Pick the smallest supported action that resolves the uncertainty.**
   - No top-level map or unclear failure ownership → full-design crawl
@@ -78,7 +78,9 @@ Do you already have architecture docs for the relevant scope?
 Use this when you do not have a trustworthy top-level architecture map.
 
 1. Confirm `db_path` and `top_module`.
-2. Invoke the `rtl-crawler-multi-agent` skill.
+2. Invoke the crawler flow.
+   - Use `rtl-crawler` by default.
+   - Use `rtl-crawler-multi-agent` only when delegation is explicitly authorized.
 3. Provide:
    - `db_path`
    - `top_module`
@@ -92,7 +94,9 @@ Use this when you do not have a trustworthy top-level architecture map.
 Use this when you are stuck inside one subsystem and repeated traces are not shrinking the suspect set.
 
 1. Define the subsystem boundary you are currently inside.
-2. Invoke `rtl-crawler-multi-agent` using the design `top_module`, or reuse an existing full-design crawl if it is still current.
+2. Invoke the crawler flow using the design `top_module`, or reuse an existing full-design crawl if it is still current.
+   - Use `rtl-crawler` by default.
+   - Use `rtl-crawler-multi-agent` only when delegation is explicitly authorized.
 3. Read the resulting subsystem architecture doc for the boundary from step 1.
 4. Restart the debug from the subsystem boundary:
    - use documented child blocks as branch points

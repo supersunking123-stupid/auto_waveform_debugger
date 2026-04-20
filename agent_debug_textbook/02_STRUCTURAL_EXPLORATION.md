@@ -4,7 +4,7 @@
 
 **When to use:** You need to answer questions about RTL connectivity, signal fanin/fanout, or design hierarchy. No simulation values are involved.
 
-**Boundary:** This playbook is for targeted structural questions. If what you really need is a persistent architecture map of the full design or of a complex subsystem, switch to `08_DESIGN_MAPPING.md` and use the `rtl-crawler-multi-agent` skill instead of manually expanding the hierarchy forever.
+**Boundary:** This playbook is for targeted structural questions. If what you really need is a persistent architecture map of the full design or of a complex subsystem, switch to `08_DESIGN_MAPPING.md` and use the crawler flow instead of manually expanding the hierarchy forever. Use `rtl-crawler` by default; use `rtl-crawler-multi-agent` only when delegation is explicitly authorized.
 
 ---
 

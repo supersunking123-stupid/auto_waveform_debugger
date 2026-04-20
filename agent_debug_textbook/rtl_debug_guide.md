@@ -15,7 +15,7 @@ Before touching any waveform, understand what you are looking at.
 1. **Read the failure description.** Extract the failing signal, the time of failure, the test name, and any error or assertion message. If the description is vague ("test hangs", "output mismatch"), your first job is to make it concrete.
    - When reading a simulation log, do **not** dump the whole file into context. Start with targeted extraction such as `grep` for `UVM_ERROR` / `UVM_FATAL` / assertion text, plus `head` and `tail` for setup/final status. Expand only around the relevant matches.
 2. **Check whether a sufficient architecture document already exists for the relevant design or subsystem.** A sufficient doc may be user-provided or crawler-generated, but it must identify the major hierarchy boundaries, interfaces/peer blocks, clock/reset domains, and the main control/dataflow landmarks relevant to the current failure.
-   - If no sufficient doc exists, use `rtl-crawler-multi-agent` before active debugging.
+   - If no sufficient doc exists, use the crawler flow before active debugging: use `rtl-crawler` by default, and use `rtl-crawler-multi-agent` only when delegation is explicitly authorized.
    - If the failure ownership is unclear, crawl the full design.
    - If the failure is already localized but the subsystem is still opaque, rerun or reuse the full-design crawl and then read the generated doc for that subsystem.
 3. **Understand the design context.** Use the architecture doc first, then targeted structural exploration (`hier`, `find`) to understand the module hierarchy around the failure point. You do not need to understand the entire chip — just the neighborhood of the symptom.
@@ -137,12 +137,14 @@ These components share a dangerous property: they work correctly 99% of the time
 
 Signal tracing explains **local causation**. It does **not** give you a stable architectural map of a complex subsystem. In deeply hierarchical designs, those are different needs. If you keep tracing signals in circles because you do not know the subsystem's major blocks, interfaces, or control/dataflow shape, stop and build the map first.
 
-Use `rtl-crawler-multi-agent` when any of these are true:
+Use the crawler flow when any of these are true:
 
 - No sufficient architecture doc exists for the current design or subsystem.
 - You cannot name the subsystem's major child blocks, interfaces, and clock/reset boundaries from memory.
 - You have made repeated driver/load traces inside one subsystem, but the next branch point is still unclear.
 - You revisit the same suspect cone or same 2–3 signals twice without a new explanation.
+
+By default, run `rtl-crawler`. If delegation is explicitly authorized, you may use `rtl-crawler-multi-agent` instead.
 
 The current crawler flow is rooted at the design `top_module`; it does not take a subsystem-root parameter. When you need local subsystem context, rerun or reuse the full-design crawl and then focus on the generated subsystem doc.
 
@@ -177,10 +179,16 @@ At a subsystem boundary:
 
 - classify the subsystem egress harmful boundary
 - classify the relevant subsystem ingress data / handshake / mode groups
-- for harmful `X` tracing, this subsystem-boundary stop overrides the generic child-owner shortcut: even if structural tracing already names a deeper child owner, and even if the subsystem wrapper looks like pass-through wiring on the current path, you must classify the subsystem ingress groups first
+- record a compact subsystem-boundary evidence table for the current harmful timepoint, harmful path, and controlling context:
+  - harmful egress signal(s) checked and active-path proof
+  - relevant ingress groups checked
+  - per-group classification: harmful `X` / clean / gated off
+  - decision: stay at the higher layer or descend inside the subsystem
+- for harmful `X` tracing, this subsystem-boundary stop overrides the generic child-owner shortcut: even if structural tracing already names a deeper child owner, and even if the subsystem wrapper looks like pass-through wiring on the current path, you must complete the subsystem-boundary audit and its evidence table first
 - once that same subsystem boundary has already been audited at the same harmful timepoint for the same harmful path and controlling context, reuse the existing subsystem evidence table instead of bouncing back to the subsystem wrapper
 - if subsystem ingress is already harmful, keep tracing at the higher hierarchy layer across subsystem interfaces
 - descend into subsystem internals only if the subsystem egress is harmful while the relevant subsystem ingress groups are clean or gated off
+- if that compact subsystem-boundary evidence table is missing or incomplete, deeper descent is not allowed yet; finish the subsystem-boundary audit first
 
 This subsystem-boundary rule applies only to harmful `X` tracing. It does not change the normal logic-tracing workflow for non-`X` bugs.
 
@@ -205,9 +213,9 @@ Before any deep local source inspection, force a creator-block checkpoint:
   - per-input classification: harmful `X` / clean / gated off
   - reason for every `gated off` classification
 
-If harmful `X` inputs are still present, keep climbing. If a child instance owns the harmful boundary, move into that child, reset to the child's ingress boundary, and keep the hierarchy-first walk going. For harmful `X` bugs, child-output bit tracing is not allowed until the child ingress groups were classified. If that child sits inside a mapped subsystem, the subsystem ingress/egress audit must happen before any deeper child descent, even if the subsystem wrapper appears transparent on the current path. Only descend when harmful `X` outputs are present, harmful `X` inputs are absent, and structural tracing proves the current block's local logic is the owner.
+If harmful `X` inputs are still present, keep climbing. If a child instance owns the harmful boundary, move into that child, reset to the child's ingress boundary, and keep the hierarchy-first walk going. For harmful `X` bugs, child-output bit tracing is not allowed until the child ingress groups were classified. If that child sits inside a mapped subsystem, the subsystem ingress/egress audit and evidence table must be completed before any deeper child descent, even if the subsystem wrapper appears transparent on the current path. Only descend when harmful `X` outputs are present, harmful `X` inputs are absent, and structural tracing proves the current block's local logic is the owner.
 
-If the child or owner sits inside a mapped subsystem, stop at the subsystem boundary first and perform the same ingress/egress classification there before diving into internal child blocks. Do not treat "wrapper looks transparent" as a valid reason to skip this subsystem-boundary audit. But if that subsystem boundary was already audited at the same harmful timepoint for the same harmful path and controlling context, reuse the existing subsystem evidence table instead of repeating the same audit.
+If the child or owner sits inside a mapped subsystem, stop at the subsystem boundary first and complete the same ingress/egress audit there before diving into internal child blocks. Do not treat "wrapper looks transparent" as a valid reason to skip this subsystem-boundary audit. But if that subsystem boundary was already audited at the same harmful timepoint for the same harmful path and controlling context, reuse the existing subsystem evidence table instead of repeating the same audit.
 
 After Playbook 09 isolates the likely creator block, carry its creator-block / subsystem-boundary evidence tables into Playbook 04 and reuse them. Do not restart the same boundary audit unless the harmful timepoint, active path, controlling context, creator candidate, or audited subsystem boundary changed, or the earlier table was incomplete.
 
@@ -233,12 +241,12 @@ If delegation is not authorized, do the same port classification yourself in bou
 
 If a component is suspicious and waveform debugging is proving difficult, do **not** jump directly from passive tracing to local simulation. First build the subsystem map; then, if the bug is still opaque, isolate the block in a local testbench.
 
-**Step 1 — Crawler escalation:** If you have made about **8 investigation-oriented tool calls** focused on one subsystem without shrinking the suspect set or moving the causal frontier deeper, stop passive tracing and run `rtl-crawler-multi-agent` on the full design (or reuse a current full-design crawl), then read the generated doc for that subsystem. If ownership is still unclear, use the top-level map first.
+**Step 1 — Crawler escalation:** If you have made about **8 investigation-oriented tool calls** focused on one subsystem without shrinking the suspect set or moving the causal frontier deeper, stop passive tracing and run the crawler flow on the full design (or reuse a current full-design crawl), then read the generated doc for that subsystem. Use `rtl-crawler` by default; use `rtl-crawler-multi-agent` only when delegation is explicitly authorized. If ownership is still unclear, use the top-level map first.
 
-**Step 2 — Local-test escalation:** After reading the generated map and making one bounded post-crawl debug pass, if you still have made more than about **10 tool calls** focused on a single block's internal signals without identifying a concrete root cause, spawn a subagent to build a standalone testbench for that component. More queries on the same block are unlikely to converge faster than targeted simulation would.
+**Step 2 — Local-test escalation:** After reading the generated map and making one bounded post-crawl debug pass, if you still have made more than about **10 tool calls** focused on a single block's internal signals without identifying a concrete root cause, build a standalone testbench for that component. If delegation is explicitly authorized, you may spawn a subagent to prepare it; otherwise build it yourself. More queries on the same block are unlikely to converge faster than targeted simulation would.
 
 - The crawler run should produce the architectural landmarks you were missing: child blocks, interfaces, clock/reset boundaries, and likely control/dataflow branch points.
-- The subagent should then create a minimal testbench exercising the suspected corner case.
+- If a subagent is used, it should create a minimal testbench exercising the suspected corner case.
 - Consult `EDA_USE.md` for simulator setup on this machine.
 - This is effective for any component where targeted stimulus reveals internal behavior more directly than passive observation: counters and pointers (exercise boundary conditions), arbiters (drive concurrent requests), state machines (force edge-case transitions), CDC logic (vary sampling edge timing), FIFOs (fill-drain across the wrap boundary).
 - The resulting waveform can be loaded into an MCP session and analyzed with the same playbooks as a full-system waveform.
@@ -510,7 +518,7 @@ When forming hypotheses (Rule 2), check whether the symptom matches any of these
 
 If you have exhausted your hypothesis checklist and still cannot find the root cause:
 
-1. **Map the current subsystem before more tracing.** If you do not already have a sufficient architecture doc for the block you are stuck in, use or refresh the full-design `rtl-crawler-multi-agent` output now. Read the generated subsystem doc, identify the major child blocks and interfaces, then restart from the subsystem boundary.
+1. **Map the current subsystem before more tracing.** If you do not already have a sufficient architecture doc for the block you are stuck in, use or refresh the full-design crawler output now. Use `rtl-crawler` by default; use `rtl-crawler-multi-agent` only when delegation is explicitly authorized. Read the generated subsystem doc, identify the major child blocks and interfaces, then restart from the subsystem boundary.
 
 2. **Widen the observation window.** You may be looking at the wrong time range. Search for the *first* occurrence of the anomaly — the failure you are seeing may be a secondary effect of an earlier bug.
 

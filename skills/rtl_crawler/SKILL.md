@@ -1,38 +1,37 @@
 ---
 name: rtl-crawler
-description: "Systematically explore an RTL design's structural hierarchy using rtl_trace tools, then generate per-subsystem markdown documentation describing the architecture. Use this skill whenever the user asks to 'crawl', 'explore', 'document', or 'map' an RTL design, or when they mention 'RTL Crawler'. Also trigger when the user wants to generate architecture docs from a compiled rtl_trace database, or asks you to understand the structure of a chip/SoC/ASIC/FPGA design before debugging. This skill produces markdown files that serve as a shared knowledge base so that other agents (or humans) can quickly orient themselves in the design without repeating the exploration."
+description: "Single-agent RTL Crawler. Use this skill whenever the user asks to 'crawl', 'explore', 'document', or 'map' an RTL design, or when they mention 'RTL Crawler'. Also trigger when the user wants to generate architecture docs from a compiled rtl_trace database, or asks you to understand the structure of a chip/SoC/ASIC/FPGA design before debugging. This skill explores the structural hierarchy with rtl_trace and generates wrapper-aware per-subsystem markdown architecture docs plus a design index. If the user explicitly asks for subagents, delegation, or parallel agent work, use the sibling `rtl-crawler-multi-agent` skill instead."
 ---
 
 # RTL Crawler
 
-You are about to systematically explore an RTL design the way a human
-engineer would in Verdi: start at the top, drill into interesting blocks,
-note what each block does, sketch the interfaces, and stop when you hit
-well-known IP or leaf cells.
+You are running the single-agent RTL crawler flow. You own the full
+crawl: compile if needed, discover the real subsystem tree, deep-crawl
+each subsystem sequentially, and write the final wrapper-aware docs.
 
-Your output is a set of markdown files — one per major subsystem plus an
-index — that will be consumed by other agents or engineers. Keep them
-concise and factual. When you are unsure about a block's purpose, say so
-rather than guessing.
+This skill is **single-agent only**. If the user explicitly authorizes
+subagents, delegation, or parallel agent work for the crawl, stop and
+use the sibling `rtl-crawler-multi-agent` skill instead.
+
+Keep the docs concise and factual. Prefer structure over speculation.
+When a block's purpose is uncertain, say so.
 
 ---
 
 ## Before you start
 
-Gather these from the user (ask if not provided):
+Gather these from the user if they were not provided:
 
 | Parameter | Example | Notes |
 |-----------|---------|-------|
 | `db_path` | `rtl_trace.db` | Path to compiled structural DB |
 | `top_module` | `top` | Top-level instance name |
-| `max_depth` | `4` | How deep to crawl (default 4) |
+| `max_depth` | `4` | Deep-crawl depth per subsystem (default 4) |
 | `output_dir` | `./rtl_docs` | Where to write markdown files |
-| `filelist` | `files.f` | Only needed if DB must be compiled |
+| `filelist` | `files.f` | Needed only if the DB must be compiled |
 | `compile_args` | `--mfcu` | Extra compile flags (optional) |
 
-If the user gives you a compiled DB, skip Phase 1.  If they say "just
-explore as deep as you think is needed", use depth 4 and apply the
-stopping heuristics below.
+If the user gives you a compiled DB, skip Phase 1.
 
 ---
 
@@ -42,213 +41,295 @@ stopping heuristics below.
 rtl_trace(args=["compile", "--db", db_path, "--top", top_module, "-f", filelist, ...compile_args])
 ```
 
-If this fails, report the error and stop. You cannot crawl without a DB.
+If this fails, report the error and stop.
 
 ---
 
-## Phase 2 — Top-level discovery
+## Phase 2 — Recursive subsystem discovery
+
+Your first job is to discover the **real functional subsystem tree**,
+not just the top module's immediate children. Designs often hide real
+subsystems under wrapper layers.
 
 ### 2a. Start a serve session
 
-Use serve mode for the entire crawl. It avoids reloading the DB on every
-call and is significantly faster on large designs.
+Use serve mode for the whole crawl.
 
 ```python
 rtl_trace_serve_start(serve_args=["--db", db_path])
-# Save the returned session_id — you will use it for every subsequent query.
+# Save session_id and reuse it for every query.
 ```
 
-### 2b. List top-level children
+### 2b. Discovery loop
+
+Start with a discovery queue containing only `top_module`. Keep a
+visited set keyed by full instance path.
+
+For each queued node:
+
+1. Expand one level:
+   ```python
+   rtl_trace_serve_query(session_id, "hier --root {node} --depth 1 --format json --show-source")
+   ```
+2. For each child, identify it:
+   ```python
+   rtl_trace_serve_query(session_id, "whereis-instance --instance {child} --format json")
+   ```
+3. Classify the child using the rules below.
+4. Record a manifest entry with:
+   - `category`: `subsystem`, `wrapper`, `instance_array`, or `leaf_ip`
+   - `instance_path`
+   - `module_type`
+   - `source_file`
+   - `parent`
+   - `count` for arrays when applicable
+5. If the child is a wrapper, push it back onto the discovery queue.
+
+The loop ends when the queue is empty.
+
+### Classification rules
+
+Apply these in order:
+
+**1. Hard leaf IP**
+
+Classify as `leaf_ip` if either condition holds:
+- module type matches a hard-leaf pattern from the shared list below
+- `hier --depth 1` shows zero children
+
+Do not go deeper.
+
+**2. Instance-array candidate**
+
+Collapse siblings to one `instance_array` representative only if all of
+these match:
+- same indexed naming pattern
+- same module type
+- same source file
+- same immediate-child module fingerprint from `hier --depth 1`
+
+If any differ, keep separate manifest entries.
+
+**3. Wrapper**
+
+Classify as `wrapper` if the instance looks like a hierarchical
+container rather than one functional block. Typical wrapper signs:
+- it contains multiple children that are themselves substantial blocks
+- it has few direct local signals beyond clocks, resets, and pass-through plumbing
+- the children look functionally independent from one another
+
+To confirm a suspected wrapper, use regex-scoped direct-signal probes.
+`rtl_trace find` is literal substring match unless `--regex` is passed,
+so always pass `--regex` when using anchors or wildcards. Also escape
+the literal instance path before embedding it in a regex.
+
+Because DBs may expose direct struct-member signals such as
+`req.aw.valid`, probe both flat direct signals and direct struct-member
+fields. First collect the immediate child instance names from the
+`hier --depth 1` result. Ignore any `find` match whose first token after
+`child.` is one of those child names; that match belongs to a descendant
+child block, not to the current instance's own local logic.
 
 ```python
-rtl_trace_serve_query(session_id, "hier --root {top_module} --depth 1 --format json --show-source")
+flat_prefix = "^" + escape_regex(child) + r"\.[^.]*"
+struct_prefix = "^" + escape_regex(child) + r"\.[^.]+(\.[^.]+){0,2}"
+rtl_trace_serve_query(
+    session_id,
+    f"find --query '{flat_prefix}(valid|ready|req|gnt)$' --regex --limit 5 --format json",
+)
+rtl_trace_serve_query(
+    session_id,
+    f"find --query '{struct_prefix}\\.(valid|ready|req|gnt)$' --regex --limit 5 --format json",
+)
+rtl_trace_serve_query(
+    session_id,
+    f"find --query '{flat_prefix}(fsm|state|mode|sel)$' --regex --limit 5 --format json",
+)
+rtl_trace_serve_query(
+    session_id,
+    f"find --query '{struct_prefix}\\.(fsm|state|mode|sel)$' --regex --limit 5 --format json",
+)
 ```
 
-### 2c. Identify each child
+If the instance has multiple substantial children but few or no direct
+signals from those probes, it is likely a wrapper.
 
-For each child instance:
+If you are unsure whether a block is a wrapper or a subsystem, choose
+`subsystem`. False wrapper classifications are more damaging than
+slightly over-documenting one block.
 
-```python
-rtl_trace_serve_query(session_id, "whereis-instance --instance {child_path} --format json")
-```
+**4. Subsystem**
 
-Record the instance path, module type, and source file location.
+Everything else is a `subsystem`. This includes doc-worthy IP blocks
+such as PCIe, DDR/HBM controllers, CPUs or clusters, DMA engines, NoCs,
+peripheral fabrics, and similar major functional units.
 
-### 2d. Classify each child
+### Discovery depth limit
 
-Apply these rules in order:
+To prevent pathological wrapper chains from running away, limit wrapper
+nesting discovery to 4 levels. If you hit that limit, treat the
+remaining node as a `subsystem`.
 
-1. **Leaf IP** — module name matches any stop pattern (see §Stopping
-   heuristics).  Record it but do NOT crawl deeper.
-2. **Instance array** — multiple siblings share the same module type
-   (e.g. `u_core[0]` through `u_core[3]`).  Crawl ONE representative,
-   note the array count.
-3. **Subsystem** — everything else.  Gets its own markdown file and will
-   be crawled in Phase 3.
+### 2c. Build a coverage-dedup map
 
-Write down a subsystem manifest before proceeding. Example:
+After the manifest is complete, build a best-effort map of repeated
+internal blocks so later deep crawls can cross-reference instead of
+re-exploring structurally equivalent utility blocks.
 
-```
-subsystem:      top.u_noc          module: noc_top         source: rtl/noc/noc_top.sv:1
-subsystem:      top.u_gpu          module: gpu_wrapper     source: rtl/gpu/gpu_wrapper.sv:5
-leaf_ip:        top.u_ddr_ctrl     module: ddr4_mc         source: rtl/mem/ddr4_mc.sv:1
-instance_array: top.u_core[0..3]  module: riscv_core_wrap source: rtl/cpu/riscv_core_wrap.sv:1  count: 4
-```
+Use this fingerprint:
+
+`fingerprint = module_type + source_file + sorted(immediate_child_module_types)`
+
+You do not need a full pre-crawl. A quick `hier --depth 2` on each
+subsystem root is enough to identify the most common duplicates.
+
+When a deep crawl later sees a matching internal block with the same
+quick fingerprint, note it in the doc and cross-reference the earlier
+subsystem doc instead of fully re-crawling it.
 
 ---
 
-## Phase 3 — Subsystem deep crawl
+## Phase 3 — Sequential deep crawl and doc writing
 
-Run this phase once per subsystem, sequentially.  **Write each subsystem's
-doc immediately after finishing it** — do not wait until the end.
+Process manifest entries sequentially. Keep one in-memory summary per
+doc: clock domains, resets, external interfaces, top-level children,
+and debugging notes.
 
-### 3a. Expand hierarchy level by level
+Wrappers do **not** get the same deep internal exploration as
+subsystems, but they still get their own wrapper doc using the shared
+template.
 
-Starting from the subsystem root:
+### 3a. Deep-crawl one subsystem
+
+For each `subsystem` or `instance_array` representative:
+
+1. Expand the hierarchy level by level:
+   ```python
+   rtl_trace_serve_query(session_id, "hier --root {subsystem} --depth 2 --format json --show-source")
+   ```
+2. Classify children during the crawl:
+   - `leaf_ip`: hard leaf pattern or zero children
+   - `instance_array`: same type, source, and immediate-child fingerprint
+   - `interior node`: queue for later expansion
+3. Stop when any of these holds:
+   - current depth from subsystem root >= `max_depth`
+   - all remaining nodes are leaf IPs or already visited
+   - further depth adds noise without improving the architecture doc
+
+### 3b. Detect interfaces and control landmarks
+
+At each visited node, search for clocks, resets, handshake signals, and
+control landmarks:
 
 ```python
-rtl_trace_serve_query(session_id, "hier --root {node_path} --depth 2 --format json --show-source")
-```
-
-Use `--depth 2` to batch two levels per call (saves round trips).
-For each child returned, classify it the same way as Phase 2d.
-Queue unvisited, non-leaf children for the next expansion.
-
-Repeat until one of these conditions is met:
-- Current depth from subsystem root >= `max_depth`
-- All children are leaf IPs or already visited
-- Agent judgment says to stop (see §Stopping heuristics)
-
-### 3b. Detect interfaces at each node
-
-Search for bus handshake and clock/reset signals:
-
-```python
-node_re = "^" + escape_regex(node_path) + r"\..*"
+node_re = "^" + escape_regex(node) + r"\..*"
 rtl_trace_serve_query(session_id, "find --query '{node_re}(clk|clock)' --regex --limit 20 --format json")
 rtl_trace_serve_query(session_id, "find --query '{node_re}(rst|reset)' --regex --limit 20 --format json")
 rtl_trace_serve_query(session_id, "find --query '{node_re}valid' --regex --limit 30 --format json")
 rtl_trace_serve_query(session_id, "find --query '{node_re}ready' --regex --limit 30 --format json")
-```
-
-Use the signal names to fingerprint the bus protocol:
-- `aw/ar/w/r/b` channels with `valid`/`ready` → AXI
-- `haddr`, `htrans`, `hready` → AHB
-- `psel`, `penable`, `paddr` → APB
-- `tvalid`, `tready`, `tdata` → AXI-Stream
-
-**Struct member signals:** DBs compiled with struct member decomposition
-(v5+) expose individual struct fields as dotted-path signals (e.g.
-`req.aw.valid` instead of `req_aw_valid`). When you see results with
-extra dot segments between the instance path and the terminal signal
-name, those are struct member fields — they carry finer-grained bit
-information but represent the same bus. Treat `node.req.aw.valid` the
-same way you would treat `node.aw_valid` for protocol fingerprinting.
-Group struct member signals by their parent struct name to avoid
-double-counting the same interface.
-
-Also search for control signals that reveal the block's function:
-
-```python
 rtl_trace_serve_query(session_id, "find --query '{node_re}(fsm|state|mode|sel)' --regex --limit 10 --format json")
 rtl_trace_serve_query(session_id, "find --query '{node_re}(enable|en|grant|arb)' --regex --limit 10 --format json")
 ```
 
+Bus protocol fingerprints:
+- `aw/ar/w/r/b` with valid/ready -> AXI
+- `haddr`, `htrans`, `hready` -> AHB
+- `psel`, `penable`, `paddr` -> APB
+- `tvalid`, `tready`, `tdata` -> AXI-Stream
+
+**Struct member signals:** DBs compiled with struct-member decomposition
+may expose `req.aw.valid` instead of `req_aw_valid`. Treat these as the
+same logical interface and group them by the parent struct to avoid
+double-counting.
+
 ### 3c. Trace key connections
 
-For each detected interface, trace ONE handshake signal to find the peer.
-**Resolve the signal name first** — struct member decomposition may use
-dotted paths (`req.aw.valid`) instead of flat names (`aw_valid`):
+For each detected interface, trace one representative handshake signal.
+Resolve the exact signal path first with `find`, then trace that exact
+signal:
 
 ```python
-# Find the actual signal name containing "valid" for the AW channel
-rtl_trace_serve_query(session_id,
-    "find --query '^" + escape_regex(node) + r"\..*aw.*valid' --regex --limit 5 --format json")
+rtl_trace_serve_query(
+    session_id,
+    "find --query '^{esc_node}\\..*aw.*valid' --regex --limit 5 --format json",
+)
+rtl_trace_serve_query(
+    session_id,
+    "trace --mode drivers --signal {resolved_signal} --depth 2 --format json",
+)
+rtl_trace_serve_query(
+    session_id,
+    "trace --mode loads --signal {resolved_signal} --depth 2 --format json",
+)
 ```
 
-Then trace the exact signal name returned:
+Record the resolved signal as that interface's `probe_signal`. You will
+reuse it in Phase 4 when cross-subsystem interface matching is
+ambiguous.
 
-```python
-rtl_trace_serve_query(session_id,
-    "trace --mode drivers --signal {resolved_signal} --depth 2 --format json")
-rtl_trace_serve_query(session_id,
-    "trace --mode loads --signal {resolved_signal} --depth 2 --format json")
-```
+Be selective:
+- trace one `valid` or `ready` per bus, not every data bit
+- trace clocks and resets to identify domains
+- trace `enable`, `sel`, `mux`, `arb`, or similar control points when present
+- use `--depth 2` for normal traces
 
-Tracing strategy — be selective:
-- Trace `*valid` or `*ready` for each bus, not every data bit.
-- Trace clock and reset to identify domains.
-- Trace `*enable*`, `*sel*`, `*mux*` if present.
-- Use `--depth 2` to look one hop beyond the immediate connection.
-- Use `--stop-at` to prevent the trace from running into other subsystems:
+When tracing around one subsystem, prevent unbounded fanout into other
+subsystems by building a `--stop-at` regex from escaped sibling
+subsystem instance paths.
 
-```python
-rtl_trace_serve_query(session_id,
-    "trace --mode drivers --signal {sig} --depth 3 --stop-at {other_subsys_regex} --format json")
-```
+### 3d. Late wrapper correction
 
-### 3d. Record your findings
+Discovery should catch most wrappers, but if a subsystem assigned for
+deep crawl later proves to be a wrapper:
 
-For each node you visit, keep a structured note:
+1. Rewrite that manifest entry from `subsystem` or `instance_array` to
+   `wrapper`.
+2. Insert its child sub-manifest entries under that wrapper.
+3. Write the wrapper doc using the wrapper template.
+4. Continue the sequential crawl on the newly inserted child
+   subsystems.
 
-```
-Node: top.u_noc.u_xbar
-  Module type:   crossbar_4x4
-  Source:        rtl/noc/crossbar_4x4.sv:15
-  Clock domain:  noc_clk
-  Reset:         noc_rst_n (active low)
-  Interfaces:
-    - AXI slave port 0 ← top.u_noc.u_decode
-    - AXI master port 0 → top.u_noc.u_sram_if
-    - AXI master port 1 → top.u_noc.u_periph_if
-  Children:
-    - u_arb[0..3]: round_robin_arb (instance array, count=4)
-    - u_route_lut: route_lookup (leaf)
-```
+Do not silently keep a wrapper as if it were one monolithic subsystem.
 
-### 3e. Write the subsystem doc
+### 3e. Write the doc immediately
 
-After finishing a subsystem, write its markdown doc immediately.
-See `references/templates.md` for the exact template.
+After finishing a manifest entry, write its doc immediately:
+- subsystem docs use the subsystem template
+- wrapper docs use the wrapper template
+
+Read `references/templates.md` and follow it literally for filenames,
+overview fields, hierarchy tree style, wrapper layout, and link format.
 
 ---
 
-## Phase 4 — Interface mapping
+## Phase 4 — Cross-subsystem interface mapping
 
-After all subsystems are crawled, build the cross-subsystem connectivity.
-For each subsystem-level bus interface discovered in Phase 3, trace across
-boundaries:
+After all subsystem docs are written, build the system connectivity map.
+
+Match external interfaces from the collected per-doc summaries. When the
+peer is ambiguous or the connection crosses wrappers or leaf IP, trace
+explicitly from the recorded `probe_signal`:
 
 ```python
 rtl_trace_serve_query(session_id,
-    "trace --mode loads --signal {subsystem}.{port_signal} --depth 4 --format json")
+    "trace --mode loads --signal {probe_signal} --depth 4 --format json")
 ```
 
-Build a connectivity list:
-
-```
-u_cpu  → u_noc   via AXI master (instruction fetch, data access)
-u_noc  → u_sram  via AXI slave  (SRAM port)
-u_noc  → u_ddr   via AXI slave  (DDR controller)
-u_gpu  → u_noc   via AXI master (texture fetch)
-```
+Build the final connectivity table from those results.
 
 ---
 
 ## Phase 5 — Write the index document
 
-Write `design_index.md` in the output directory.  It contains:
-- Design metadata (top module, DB path, crawl date, depth)
-- Top-level hierarchy table with links to subsystem docs
-- **Top-level hierarchy tree** — a condensed indented tree that stops at
-  subsystem boundaries. Do NOT expand subsystem internals here; each
-  subsystem line should end with a `[doc](./..._architecture.md)` link.
-  The detailed internal trees belong in the per-subsystem docs only.
-- System interconnect (the connectivity list from Phase 4)
-- Clock domains summary
-- Reset tree summary
+Write `design_index.md` in `output_dir`. It must include:
+- design metadata
+- top-level hierarchy table
+- wrapper-aware condensed hierarchy tree
+- system interconnect table
+- clock domains summary
+- reset tree summary
 
-See `references/templates.md` for the exact template.
+Use the shared template in `references/templates.md`.
 
 Then stop the serve session:
 
@@ -258,82 +339,55 @@ rtl_trace_serve_stop(session_id)
 
 ---
 
-## Stopping heuristics
+## Hard leaf patterns
 
-Check these at every hierarchy node before expanding further.
+Use this narrow hard-leaf list. These are implementation blocks, not
+doc-worthy subsystems:
 
-### Hard stops (always stop here)
-
-| Condition | How to detect |
-|-----------|---------------|
-| Depth limit reached | `current_depth >= max_depth` |
-| Module name matches stop pattern | Regex on module type (see below) |
-| Leaf node (no children) | `hier --depth 1` returns zero children |
-| Module type already explored | You already fully crawled this module type in another instance — just cross-reference |
-
-### Stop patterns (regex, case-insensitive)
-
-These module names indicate known IP or leaf cells not worth crawling:
-
-```
+```text
 (sram|ram|rom|rf_|regfile)
 (fifo|async_fifo|sync_fifo)
-(cpu|core|processor|riscv|arm)
 (phy|pll|dll|serdes|io_pad)
-(mem_ctrl|ddr|hbm|lpddr)
-(wrapper|stub|blackbox)
+(stub|blackbox)
 (std_cell|lib_)
+(clock_gate|icg|reset_sync|cdc_sync)
+```
+
+Do **not** hard-stop broader subsystem keywords such as `cpu`, `pcie`,
+`ddr`, `dma`, `uart`, or `gpio`. Those are usually still subsystems.
+
+## Doc-worthy subsystem IP hints
+
+If a block matches one of these hints and is not a confirmed wrapper or
+hard leaf, prefer `subsystem`:
+
+```text
+(cpu|core|processor|riscv|arm)
+(mem_ctrl|ddr|hbm|lpddr)
 (uart|spi|i2c|gpio|timer|wdt)
 (axi_dma|dma_engine)
 (pcie|usb|ethernet|mac|gmii)
 ```
 
-The user can extend this list. When in doubt, ask.
-
-### Soft stops (use your judgment)
-
-Stop and summarize (don't crawl deeper) when you see:
-- **Standard IP names** — module name strongly suggests a well-known IP.
-  Record type and move on.
-- **Repetitive structure** — all children are identical instances.
-  Document one, note the count.
-- **Vendor/external source** — `--show-source` returns a path outside the
-  project tree (e.g. `/ip_lib/`, `/vendor/`, `/synopsys/`).
-- **Diminishing returns** — you already know enough to describe the block's
-  role and interfaces.  Going deeper adds noise.
+The user can extend either list.
 
 ---
 
-## Practical tips
+## Error handling
 
-**Budget your tool calls.** A large SoC can have hundreds of instances.
-
-- Use `--depth 2` or `--depth 3` on `hier` to batch multiple levels.
-- Use `--limit` on `find` to cap output.
-- Use `--stop-at` on `trace` to prevent unbounded fanout.
-- Trace one representative signal per bus, not every bit.
-
-**Handle unknowns honestly.** If you cannot determine a block's purpose:
-
-> **u_mystery_block** (`weird_module_v3`): Purpose unclear from structural
-> analysis alone. Contains a 4-deep pipeline and connects to the NOC via
-> a custom interface. Requires RTL source review or spec consultation.
-
-This is far more useful than a guess.
-
-**Maintain a visited set.** Keep track of which module types you have
-already fully explored. When you encounter the same module type again in
-a different instance, skip the deep crawl and write "Same architecture
-as {other_instance}, see [{other_doc}]."
-
-**Write docs incrementally.** After each subsystem crawl, write that
-subsystem's markdown file immediately. If the crawl is interrupted
-partway through, the completed subsystem docs are still usable.
+- If compile fails: report the error and stop.
+- If discovery exceeds 4 wrapper levels: treat the remaining node as a subsystem.
+- If the serve session dies: restart it and continue; already written docs are safe.
+- If a block's purpose remains unclear: document that uncertainty explicitly.
+- If cross-subsystem matching stays ambiguous after `probe_signal` tracing: record the best bounded hypothesis and say the connection needs further structural or RTL review.
 
 ---
 
 ## Output templates
 
-Read `references/templates.md` (in this skill directory) for the exact
-markdown templates for both the index document and per-subsystem documents.
-Read it before you start writing any docs.
+Read `references/templates.md` for:
+- `design_index.md`
+- subsystem architecture docs
+- wrapper docs
+
+Follow those templates exactly.

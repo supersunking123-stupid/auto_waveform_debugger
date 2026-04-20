@@ -31,7 +31,7 @@ This playbook draws from all other playbooks. The tools are organized by the pha
 `create_signal_expression`, `update_signal_expression`, `delete_signal_expression`, `list_signal_expressions`
 
 **Phase 0 — Orient and map (when docs are missing or insufficient):**
-`rtl-crawler-multi-agent` skill, followed by reading the generated or existing architecture docs before proceeding
+Crawler flow, followed by reading the generated or existing architecture docs before proceeding. Use `rtl-crawler` by default; use `rtl-crawler-multi-agent` only when delegation is explicitly authorized.
 
 **Special rule for harmful `X` symptoms:**
 Before declaring a creator block or descending into a large generated block, produce an explicit boundary evidence table per `09_X_TRACING.md`. A partial snapshot or source skim is not sufficient to prove that boundary inputs are clean or gated off. If ownership resolves to a child instance, restart from that child's ingress boundary before any child-output tracing. If the harmful boundary crosses a mapped subsystem boundary, stop at that subsystem instance first and classify subsystem ingress groups before descending to deeper children. For harmful `X` tracing, this subsystem-boundary gate overrides the generic child-owner shortcut; a pass-through-looking wrapper is not a valid reason to skip subsystem ingress classification. If Playbook 09 has already produced a complete boundary evidence table for the same harmful timepoint and current creator candidate, reuse that table instead of repeating the same audit in Playbook 04. Re-open the audit only if the harmful timepoint, active path, controlling context, or creator candidate changed, or if the earlier table was incomplete.
@@ -75,7 +75,9 @@ Use these defaults unless you have a specific reason not to:
      - Does it give you enough control/dataflow landmarks to choose the first branch?
 
 0.4  If the doc is insufficient or missing, switch to Playbook 08 and use the
-     `rtl-crawler-multi-agent` skill.
+     crawler flow.
+     - Use `rtl-crawler` by default
+     - Use `rtl-crawler-multi-agent` only when delegation is explicitly authorized
      - No top-level map or unclear ownership → full-design crawl
      - Existing top-level map but opaque local subsystem → refresh the full-design
        crawl, then read the generated subsystem doc for that block
