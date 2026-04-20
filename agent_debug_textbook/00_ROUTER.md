@@ -28,6 +28,7 @@ If at any point two consecutive tool results are empty or nonsensical, stop and 
 | **Supervised Debug** | Debug with a two-agent setup (Debugger + Supervisor) when single-agent attempts have failed or the model is prone to carelessness/hallucination | `06_SUPERVISED_DEBUG.md` |
 | **Virtual Signals** | Create derived signals (compound conditions, bus slices/concatenations) so that browsing and search tools can operate on them directly | `07_VIRTUAL_SIGNALS.md` |
 | **Design Mapping** | Obtain or generate architecture documentation for the full design or a subsystem before deep debug | `08_DESIGN_MAPPING.md` |
+| **X Tracing** | Find where a harmful `X` first becomes active by moving across parent/sibling hierarchy boundaries before deep cone tracing | `09_X_TRACING.md` |
 
 ## Step 2 — Routing rules
 
@@ -45,6 +46,7 @@ Follow these rules to pick the right playbook:
 10. **"Create a handshake / condition / error-flag signal" / "Slice or reassemble a bus" / "Define a derived observable"** → Virtual Signals
 11. **"I need an overview / architecture map / subsystem document"** → Design Mapping
 12. **"No sufficient design doc exists for this debug scope"** → Design Mapping
+13. **"Where did this `X` come from?" / "`X`-filled write/read data" / "unknown payload is propagating"** → X Tracing first, then Root-Cause Analysis inside the isolated creator block while reusing the completed boundary evidence table from Playbook 09
 
 ## Step 3 — Chaining playbooks
 
@@ -52,6 +54,7 @@ Some tasks require chaining. Common chains:
 
 - **Triage a failure with missing design context** → Design Mapping → Session Management (set up workspace) → Waveform Browsing (observe symptoms) → Signal Investigation (explain the anomaly)
 - **Full root-cause debug** → Design Mapping if docs are missing or insufficient → Session Management → Root-Cause Analysis (which internally chains Structural Exploration + Waveform Browsing, and may chain Virtual Signals for reusable protocol events)
+- **Harmful `X` debug** → Design Mapping if docs are missing → Session Management → X Tracing → Root-Cause Analysis once the likely creator block is isolated, reusing the completed creator-block / subsystem-boundary evidence from Playbook 09
 - **Supervised root-cause debug** → Supervised Debug (wraps Root-Cause Analysis with a Supervisor agent reviewing each phase)
 - **Design review / connectivity audit** → Structural Exploration → Waveform Browsing (verify structural understanding against simulation)
 - **Protocol or condition search** → Virtual Signals (define the handshake or condition as a named signal) → Waveform Browsing (search and count occurrences) → Signal Investigation (trace the real drivers of an anomalous event)
@@ -71,6 +74,7 @@ Quick reference of which tools belong to which playbook. Use the tools listed in
 | Virtual Signals | `create_signal_expression`, `update_signal_expression`, `delete_signal_expression`, `list_signal_expressions`, `create_bus_concat`, `create_bus_slice`, `create_bus_slices`, `create_reversed_bus` — plus all Waveform Browsing tools (they accept virtual signal names transparently) |
 | Supervised Debug | All tools from Root-Cause Analysis, used by the Debugger agent; Supervisor uses no MCP tools (review only) |
 | Design Mapping | `rtl-crawler-multi-agent` skill for full-design or subsystem docs; the skill uses `rtl_trace` compile/serve queries under the hood, but you should invoke the skill workflow rather than manually recreating it |
+| X Tracing | Waveform Browsing tools at instance boundaries, `find_edge` / `find_value_intervals` / `get_transitions` to locate the first harmful activation time, `rtl_trace hier` for parent/sibling movement, `rtl_trace trace` to confirm the structural owner of a boundary net, `whereis-instance` only for lookup after an instance is already known, plus Signal Investigation tools only after the likely creator instance is isolated |
 
 ---
 

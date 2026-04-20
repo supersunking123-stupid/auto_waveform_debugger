@@ -4,7 +4,7 @@
 
 **When to use:** The model executing the debug is prone to drifting from playbooks, making tool calls that don't match stated intent, or drawing conclusions from unverified assumptions. If a single-agent debug session has already failed, or the debug is especially high-risk/ambiguous, retry with this two-agent setup. Do not use supervised mode by default for every short, routine debug.
 
-**Prerequisites:** Same as Playbook 04 — a compiled structural database, a waveform file, and a sufficient architecture document for the relevant design or subsystem. If that document does not already exist, Phase 0 must route through `08_DESIGN_MAPPING.md` before active debugging. The Supervisor does not call MCP tools directly; it operates by reviewing the Debugger's actions and steering via structured feedback.
+**Prerequisites:** Same as Playbook 04 — a compiled structural database, a waveform file, and a sufficient architecture document for the relevant design or subsystem. If that document does not already exist, Phase 0 must route through `08_DESIGN_MAPPING.md` before active debugging. If the failure involves architecturally relevant unknown (`X`) values, supervised debug must route through `09_X_TRACING.md` before ordinary Playbook 04 phase work begins. The Supervisor does not call MCP tools directly; it operates by reviewing the Debugger's actions and steering via structured feedback.
 
 ---
 
@@ -12,7 +12,7 @@
 
 ### Debugger
 
-The Debugger follows Playbooks 01–08 and `rtl_debug_guide.md` exactly as written. It:
+The Debugger follows Playbooks 01–09 and `rtl_debug_guide.md` exactly as written. It:
 - Executes all MCP tool calls
 - Records observations and summaries after each phase
 - Presents compact batches of planned tool calls, then reports results and conclusions to the Supervisor before moving to the next phase
@@ -33,7 +33,7 @@ The Supervisor does **not** call MCP tools. It:
 
 ## Communication protocol
 
-The agents alternate in compact batches. Each phase of the debug workflow (Phase 0–4 from Playbook 04) follows this loop:
+The agents alternate in compact batches. Each phase of the debug workflow follows this loop. For ordinary bugs, use Phase 0–4 from Playbook 04. For harmful-`X` bugs, run Playbook 09 first; once Playbook 09 has produced the creator-block / subsystem-boundary evidence table, transition into Playbook 04 inside that isolated creator region while reusing that evidence instead of repeating the same audit.
 
 ```
 ┌──────────────────────────────────────────────────────┐
@@ -59,6 +59,8 @@ The agents alternate in compact batches. Each phase of the debug workflow (Phase
 **Critical rule:** The Debugger must **never advance to the next phase** without Supervisor approval. Per-call approval is only required in high-risk states (timescale uncertainty, path ambiguity, contradictory results, or golden-boundary ambiguity). Routine cursor/bookmark updates and tightly related read batches should be reviewed at the batch level, not one call at a time.
 
 **Phase 0 gate:** The Supervisor must block Phase 1 if the Debugger has not checked architecture-document sufficiency. If no sufficient doc exists and the Debugger did not route through `08_DESIGN_MAPPING.md`, stop the debug and require that mapping first.
+
+**Harmful-`X` gate:** If the failure includes architecturally relevant unknown (`X`) data or control, the Supervisor must block ordinary Playbook 04 tracing until the Debugger has completed Playbook 09 far enough to produce a creator-block / subsystem-boundary evidence table or to prove the source is outside the traced design boundary.
 
 ## Efficiency rules for supervised mode
 
@@ -310,8 +312,12 @@ The user's session acts as the Supervisor. It spawns the Debugger as a subagent:
 ```
 Agent(
     prompt="""You are the Debugger agent. Follow the debug workflow in
-    agent_debug_textbook/04_ROOT_CAUSE_ANALYSIS.md exactly. Complete Phase 0
-    before Phase 1. After each phase,
+    agent_debug_textbook/04_ROOT_CAUSE_ANALYSIS.md exactly. If the failure
+    involves architecturally relevant unknown (`X`) values, run
+    agent_debug_textbook/09_X_TRACING.md first and carry its completed
+    creator-block / subsystem-boundary evidence table into Playbook 04 instead
+    of repeating the same boundary audit. Complete Phase 0 before Phase 1.
+    After each phase,
     report each phase or compact batch of tool calls, results, and conclusions
     back to me for review. Do not advance to the next phase until I approve.
 
@@ -342,7 +348,10 @@ Agent(
     (4) is a vendor VIP being questioned, or is a home-grown model being treated
     as golden? (5) were all RHS drivers checked? (6) if Phase 0 required
     design mapping, did the Debugger have either existing doc paths or crawler
-    inputs (`top_module`, `output_dir`, optional `max_depth`)?
+    inputs (`top_module`, `output_dir`, optional `max_depth`)? (7) if the
+    failure involves architecturally relevant unknown (`X`) values, did the
+    Debugger complete Playbook 09 far enough to produce and reuse a valid
+    creator-block / subsystem-boundary evidence table before ordinary RCA?
 
     Playbook rules: <paste relevant rules>
 

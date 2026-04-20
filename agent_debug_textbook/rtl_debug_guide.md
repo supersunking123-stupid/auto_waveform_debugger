@@ -152,6 +152,83 @@ After the crawl:
 2. Summarize the subsystem boundary, major child blocks, interfaces/peers, and clocks/resets.
 3. Restart the debug from that mapped boundary instead of from the last leaf signal you touched.
 
+### Rule 3B — For harmful X bugs, move across hierarchy boundaries before deep cone tracing
+
+`X` bugs are easy to mishandle because the nearest visible `X` is often not the first harmful one. When the failure involves unknown data or control, start with the dedicated X-tracing flow in `09_X_TRACING.md`.
+
+The default method is:
+
+- verify the observed `X` is harmful by checking the corresponding `valid` / enable / select context
+- search backward to the earliest time that same `X` first becomes harmful
+- move upward through father and grandfather instance input ports
+- if an ancestor has harmful `X` outputs but no harmful suspicious `X` inputs, treat it only as a creator candidate and prove whether the owner is a child instance, local logic, parent-level glue, or top-level
+- if a child instance owns that harmful boundary, move the frontier into the child rather than stopping at the parent wrapper, unless the harmful boundary has crossed into a mapped subsystem and the subsystem-boundary gate applies first
+- if a child instance owns that harmful boundary, restart from the child's ingress input groups before tracing any child output bit or child internal net
+- if ownership resolves to parent-level glue or top-level connectivity, keep following the owning net at that level rather than pretending there is another instance port list to inspect
+- otherwise identify the same-level sibling instance or parent-level glue that drives the bad input
+- repeat until you find the first boundary with harmful suspicious `X` outputs, no harmful suspicious `X` inputs, and ownership resolved to local logic, or until you prove the source is outside the traced design boundary
+- only then descend into internal logic with ordinary driver tracing
+
+This hierarchy-first approach avoids wasting budget inside repeated local datapaths before you know which block is actually creating the harmful `X`.
+
+For harmful `X` bugs, keep the frontier at the **highest meaningful mapped subsystem layer** you can justify. If the harmful boundary crosses a major subsystem boundary identified by the design map (for example a top-level partition or other major child block), stop at that subsystem instance first. Do **not** jump directly to a deep internal leaf just because structural tracing can already name one.
+
+At a subsystem boundary:
+
+- classify the subsystem egress harmful boundary
+- classify the relevant subsystem ingress data / handshake / mode groups
+- for harmful `X` tracing, this subsystem-boundary stop overrides the generic child-owner shortcut: even if structural tracing already names a deeper child owner, and even if the subsystem wrapper looks like pass-through wiring on the current path, you must classify the subsystem ingress groups first
+- once that same subsystem boundary has already been audited at the same harmful timepoint for the same harmful path and controlling context, reuse the existing subsystem evidence table instead of bouncing back to the subsystem wrapper
+- if subsystem ingress is already harmful, keep tracing at the higher hierarchy layer across subsystem interfaces
+- descend into subsystem internals only if the subsystem egress is harmful while the relevant subsystem ingress groups are clean or gated off
+
+This subsystem-boundary rule applies only to harmful `X` tracing. It does not change the normal logic-tracing workflow for non-`X` bugs.
+
+For harmful `X` bugs, "find the exact RTL statement" means **find the exact RTL statement in the first creator block**. It does **not** mean "quote the first exact source line on the bad cone." Do not stop at:
+
+- a pipe/skid register that latched already-bad data
+- a FIFO or RAM storage write that stored already-bad data
+- a concat/pack statement whose active input is already harmful `X`
+- a mux/default-`X` branch if the selected live input is already harmful `X`
+
+Before any deep local source inspection, force a creator-block checkpoint:
+
+- current block
+- harmful `X` outputs present: yes / no
+- harmful `X` inputs present: yes / no
+- ownership of the bad boundary: child-instance / sibling / parent-glue / local logic / top-level
+- decision: keep climbing or descend locally
+- boundary evidence table:
+  - harmful output signal(s) checked
+  - active handshake / enable context
+  - relevant input groups checked
+  - per-input classification: harmful `X` / clean / gated off
+  - reason for every `gated off` classification
+
+If harmful `X` inputs are still present, keep climbing. If a child instance owns the harmful boundary, move into that child, reset to the child's ingress boundary, and keep the hierarchy-first walk going. For harmful `X` bugs, child-output bit tracing is not allowed until the child ingress groups were classified. If that child sits inside a mapped subsystem, the subsystem ingress/egress audit must happen before any deeper child descent, even if the subsystem wrapper appears transparent on the current path. Only descend when harmful `X` outputs are present, harmful `X` inputs are absent, and structural tracing proves the current block's local logic is the owner.
+
+If the child or owner sits inside a mapped subsystem, stop at the subsystem boundary first and perform the same ingress/egress classification there before diving into internal child blocks. Do not treat "wrapper looks transparent" as a valid reason to skip this subsystem-boundary audit. But if that subsystem boundary was already audited at the same harmful timepoint for the same harmful path and controlling context, reuse the existing subsystem evidence table instead of repeating the same audit.
+
+After Playbook 09 isolates the likely creator block, carry its creator-block / subsystem-boundary evidence tables into Playbook 04 and reuse them. Do not restart the same boundary audit unless the harmful timepoint, active path, controlling context, creator candidate, or audited subsystem boundary changed, or the earlier table was incomplete.
+
+Do **not** treat a partial snapshot or a quick wrapper/source skim as enough evidence for "inputs are clean or gated off", especially in large generated or HLS blocks. If the relevant input groups were not explicitly classified, the creator-block proof is incomplete and you must either classify the boundary yourself in bounded batches, delegate the boundary scan if delegation is explicitly authorized, or keep climbing.
+
+If the instance boundary has too many input ports to inspect comfortably, and delegation is explicitly authorized, delegate the port scan to a subagent and ask it to return only:
+
+- harmful suspicious `X` inputs
+- inactive / ignorable `X` inputs
+- clean relevant inputs
+
+When you do this, use a **minimal-context helper**, not a full-history fork:
+
+- pass only the instance path, failure time/bookmark, harmful boundary signal, and relevant valid/enable/select context
+- do not ask the helper to own the debug narrative
+- do not override model or agent settings on a forked child
+
+The main agent should keep ownership of the causal chain and decide where the X-tracing frontier moves next.
+
+If delegation is not authorized, do the same port classification yourself in bounded batches and keep only the compact summary table in context.
+
 ### Rule 4 — Escalate in two steps: crawl first, simulate second
 
 If a component is suspicious and waveform debugging is proving difficult, do **not** jump directly from passive tracing to local simulation. First build the subsystem map; then, if the bug is still opaque, isolate the block in a local testbench.

@@ -55,6 +55,8 @@ Phase 4: Verify and document (bookmarks, signal groups, causal chain)
 
 Phase 0 is mandatory. Before tracing any signal, you must either have a sufficient architecture document for the debug scope or generate one via `agent_debug_textbook/08_DESIGN_MAPPING.md`. The full Phase 0 procedure is in `agent_debug_textbook/04_ROOT_CAUSE_ANALYSIS.md`. Use it as a checklist.
 
+**For failures involving unknown (`X`) values**, route through `agent_debug_textbook/09_X_TRACING.md` to isolate the likely creator block via hierarchy-boundary walking before applying the standard Phase 1–4 flow.
+
 Efficiency defaults:
 - If you expect 3+ structural queries on the same DB, use `rtl_trace_serve_start/query/stop`.
 - If you need values for several signals at one time, use `get_snapshot` or `trace_with_snapshot`, not repeated `get_value_at_time`.
