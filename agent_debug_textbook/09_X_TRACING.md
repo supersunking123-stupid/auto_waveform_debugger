@@ -28,6 +28,20 @@ The goal is to find the **first harmful `X`**, not the loudest `X`.
 
 ---
 
+## What counts as a mapped subsystem boundary
+
+A **mapped subsystem boundary** is any hierarchy boundary that the current architecture context identifies as a meaningful debug stop, such as:
+
+- a wrapper, subsystem, partition, cluster, engine, or other major child block called out by the architecture doc or crawler output
+- the current debug-scope boundary chosen during orientation
+- the highest boundary where the current failure can still be explained in terms of interfaces, peers, clock/reset domains, or major control/dataflow landmarks
+
+This definition is intentionally generic. Do **not** depend on a design-specific instance name. Depend on whether the current architecture context says: "this boundary is a meaningful place to decide whether the harmful `X` is entering from outside or being created inside."
+
+If a boundary meets that definition, it is a subsystem-boundary stop for harmful `X` tracing.
+
+---
+
 ## Tool priorities for X tracing
 
 Prefer these in order:
@@ -51,10 +65,19 @@ Before any deep local tracing or source-file inspection, complete the **creator-
 - if ownership resolves to a child instance, **reset the frontier to that child's ingress boundary first**; do not continue from the child's bad output bit or child output bus yet
 - if the boundary driver is not a sibling instance, use `rtl_trace trace` to determine whether the owner is a child instance, parent-level glue, top-level connectivity, or local logic before descending
 - if the harmful boundary crosses a **mapped subsystem boundary** (for example a major child block from the architecture doc such as a top-level partition), stop at that subsystem instance first; do not jump directly to a deep leaf returned by structural trace
-- at a subsystem boundary, classify the subsystem **ingress groups** and **egress harmful boundary** before descending inside the subsystem
-- the subsystem-boundary stop overrides the generic child-owner shortcut for harmful `X` tracing: even if structural trace already names a deeper child owner, and even if the subsystem wrapper appears to be simple pass-through wiring on this path, you must classify the relevant subsystem ingress groups first
+- at a subsystem boundary, produce a **subsystem-boundary evidence table** before descending inside the subsystem
+- the subsystem-boundary evidence table must include:
+  - harmful egress signal(s) checked and the active-path proof for each one
+  - relevant ingress data groups
+  - matching `valid` / ready / enable / select groups
+  - active mode / config / state groups that control the harmful path
+  - per-group classification: `harmful X` / `clean` / `gated off`
+  - reason for every `gated off` classification
+  - decision: keep tracing at the higher layer or descend into subsystem internals
+- the subsystem-boundary stop overrides the generic child-owner shortcut for harmful `X` tracing: even if structural trace already names a deeper child owner, and even if the subsystem wrapper appears to be simple pass-through wiring on this path, you must complete the subsystem-boundary audit and evidence table first
 - once a mapped subsystem boundary has already been audited at the same harmful timepoint for the same harmful path and controlling context, reuse that evidence table instead of bouncing back to the subsystem wrapper again
 - descend into subsystem internals only if the subsystem egress is harmfully `X` while the relevant subsystem ingress groups are `clean` or `gated off`; if subsystem ingress is already harmful, keep tracing at the higher hierarchy layer instead of diving into the subsystem
+- if the subsystem-boundary evidence table does not yet exist for the current harmful timepoint, harmful path, and controlling context, descent below that boundary is **forbidden**
 
 ---
 
@@ -106,11 +129,12 @@ There are two valid outcomes from Phase 2:
    - If a **child instance** owns the harmful boundary output, move the X-tracing frontier into that child and continue the hierarchy-first walk there.
    - After moving into that child, restart the creator-block gate on the child's **ingress input groups** at the same harmful timepoint before tracing any child output bit or internal net.
    - If that child is a **mapped subsystem wrapper or major subsystem instance**, stop at the subsystem boundary first.
-     - Classify the subsystem ingress groups at the same harmful timepoint.
+     - Produce the subsystem-boundary evidence table at the same harmful timepoint.
      - If subsystem ingress is already harmful, do **not** descend into subsystem internals yet; keep tracing across the higher-level subsystem boundary or peer/top-level glue.
-      - Descend inside the subsystem only when the subsystem egress is harmful and the relevant subsystem ingress groups are `clean` or `gated off`.
-      - Do this even if structural tracing already identifies a deeper child owner or the subsystem wrapper looks like pass-through wiring on the current path.
-      - If that same subsystem boundary was already audited earlier at the same harmful timepoint for the same harmful path and controlling context, reuse the existing subsystem evidence table and continue to the deeper child instead of restarting the subsystem audit.
+     - Descend inside the subsystem only when the subsystem egress is harmful and the relevant subsystem ingress groups are `clean` or `gated off`.
+     - Do this even if structural tracing already identifies a deeper child owner or the subsystem wrapper looks like pass-through wiring on the current path.
+     - If that same subsystem boundary was already audited earlier at the same harmful timepoint for the same harmful path and controlling context, reuse the existing subsystem evidence table and continue to the deeper child instead of restarting the subsystem audit.
+     - If the subsystem-boundary evidence table is missing or incomplete, the next step is **not** "pick a deeper child." The next step is "finish the subsystem-boundary audit."
    - If **local logic** owns the harmful boundary output, this ancestor is the likely creator block and you may descend locally.
    - If **parent-level glue or top-level connectivity** owns the boundary, keep the frontier at that external owner rather than reporting the ancestor wrapper as the creator.
 
@@ -139,9 +163,10 @@ Otherwise continue on the structural owner identified in Phase 3:
      - for generated / HLS blocks, child-output bit tracing is forbidden until the ingress groups are classified
    - If the owner is a **mapped subsystem instance** or a child inside a mapped subsystem:
      - prefer the subsystem boundary over the deeper leaf boundary
-     - classify the subsystem ingress groups before descending to internal child blocks
+     - produce the subsystem-boundary evidence table before descending to internal child blocks
      - if subsystem ingress is already harmful, keep the frontier at the higher subsystem layer and continue tracing across subsystem interfaces
      - if that subsystem boundary was already audited at the same harmful timepoint for the same harmful path and controlling context, reuse the existing subsystem evidence table and continue downward instead of returning to the subsystem wrapper
+     - if the subsystem-boundary evidence table is missing or incomplete, any deeper internal descent is invalid
 2. If the owner is **parent-level glue** or **top-level connectivity**:
    - Stay at that owner level and use `rtl_trace trace` plus waveform checks on the owning net or top-level port.
    - Follow the same harmful-`X` / active-path test until you either re-enter a concrete instance, prove local glue owns the bad value, or prove the source is outside the traced design boundary.
@@ -159,31 +184,34 @@ Only after isolating the likely creator block should you descend into internal l
 
 Now:
 
-1. Complete the **creator-block check** and keep it in context:
+1. If the current creator candidate sits below a **mapped subsystem boundary** that has not yet been audited for the same harmful timepoint, harmful path, and controlling context, stop and return to the highest unaudited mapped subsystem boundary first.
+2. Produce any missing subsystem-boundary evidence table before local tracing continues.
+3. If the subsystem-boundary evidence table remains missing or incomplete, local descent is forbidden.
+4. Complete the **creator-block check** and keep it in context:
    - current block
    - harmful `X` outputs present: yes / no
    - harmful `X` inputs present: yes / no
    - driver ownership: child-instance / sibling / parent-glue / local logic / top-level
    - decision: continue hierarchy walk or descend locally
-2. Before descending, write an explicit **boundary evidence table**:
+5. Before descending, write an explicit **boundary evidence table**:
    - harmful output signal(s) checked
    - active handshake / enable context for those outputs
    - each relevant input group checked at the same timepoint
    - classification for each input group: `harmful X` / `clean` / `gated off`
    - reason for every `gated off` classification
-3. If harmful `X` inputs are still present, **do not** descend. Continue the hierarchy-first walk.
-4. If the boundary owner is a **child instance**, move into that child and continue the hierarchy-first walk.
-5. After moving into a child instance, restart from the child's ingress boundary:
+6. If harmful `X` inputs are still present, **do not** descend. Continue the hierarchy-first walk.
+7. If the boundary owner is a **child instance**, move into that child and continue the hierarchy-first walk.
+8. After moving into a child instance, restart from the child's ingress boundary:
    - classify the child's data ingress groups
    - classify the relevant `valid` / ready / enable / select context
    - classify active config / mode groups that can influence the harmful path
    - only after these ingress groups are explicitly classified may you consider local tracing inside the child
-6. If the child ingress groups are not yet classified, tracing a representative bad child output bit or child internal cone is **not allowed**.
-7. If harmful `X` outputs are present and harmful `X` inputs are absent, and ownership is **local logic**, descend into the block's internal logic.
-8. Pick the suspicious output that first becomes harmful at the earliest harmful timestamp you established in Phase 1.
-9. Trace its drivers using the regular root-cause workflow.
-10. Keep tracing until you can name a specific buggy statement, wrong gating condition, bad bit select, stale register capture, or other concrete cause.
-11. The final "exact RTL statement" must come from this creator block, not from an upstream or downstream transport/storage block.
+9. If the child ingress groups are not yet classified, tracing a representative bad child output bit or child internal cone is **not allowed**.
+10. If harmful `X` outputs are present and harmful `X` inputs are absent, and ownership is **local logic**, descend into the block's internal logic.
+11. Pick the suspicious output that first becomes harmful at the earliest harmful timestamp you established in Phase 1.
+12. Trace its drivers using the regular root-cause workflow.
+13. Keep tracing until you can name a specific buggy statement, wrong gating condition, bad bit select, stale register capture, or other concrete cause.
+14. The final "exact RTL statement" must come from this creator block, not from an upstream or downstream transport/storage block.
 
 ### RCA handoff rule
 
@@ -214,6 +242,10 @@ For **mapped subsystem boundaries**, apply the same rule at subsystem scope:
 - relevant subsystem ingress data groups
 - matching subsystem ingress `valid` / ready / enable / select groups
 - active subsystem mode / config / state groups that control the harmful path
+- harmful subsystem egress signal(s) and their active-path proof
+- the explicit decision: keep tracing at the higher layer or descend internally
+
+The subsystem-boundary evidence table is mandatory whenever the harmful frontier crosses a mapped subsystem boundary. Without that table, the proof is incomplete and descent below that boundary is forbidden.
 
 Do not skip the subsystem boundary just because structural tracing names a deeper internal child as the owner of the current harmful output.
 
@@ -228,6 +260,11 @@ For every relevant boundary input group, record one of:
 - `gated off` — the signal may be `X`, but its corresponding valid / enable / select / load condition is inactive at that same time
 
 If you cannot produce this table, the boundary proof is incomplete and you must keep climbing, classify the boundary yourself in bounded batches, or delegate the classification if delegation is explicitly authorized.
+
+Missing-table rule:
+
+- If the next intended move would cross below a mapped subsystem boundary and the subsystem-boundary evidence table for the current harmful timepoint, harmful path, and controlling context is missing or incomplete, that move is invalid.
+- The correct next action is to return to that boundary and finish the audit, not to choose a deeper child or representative output bit.
 
 ### Generated-block rule
 
@@ -318,6 +355,7 @@ Do not do these:
 - After resolving ownership to a child instance, continue from the child's bad output instead of resetting to the child's ingress boundary.
 - Skip a mapped subsystem boundary and jump directly into a deep internal child just because structural tracing identified that child as an owner.
 - Treat a subsystem wrapper as "transparent" and use that as a reason to skip subsystem ingress classification.
+- Take any deeper step below a mapped subsystem boundary before the subsystem-boundary evidence table is complete for the same harmful timepoint, harmful path, and controlling context.
 - In a generated / HLS child, start representative-bit tracing before ingress input groups were classified.
 - Report a pipe/skid register assignment that merely latched an already-bad payload as the root cause.
 - Report a FIFO RAM entry or storage flop write as the root cause when the incoming data is already harmful `X`.
@@ -332,6 +370,7 @@ After each hierarchy step, summarize only:
 
 - current instance
 - current mapped subsystem boundary, if any
+- subsystem-boundary evidence table complete or incomplete
 - harmful suspicious `X` outputs observed
 - harmful suspicious `X` inputs observed or not observed
 - relevant `valid` / enable context
