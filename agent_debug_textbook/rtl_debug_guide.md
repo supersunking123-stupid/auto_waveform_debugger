@@ -161,11 +161,12 @@ After the crawl:
 The default method is:
 
 - verify the observed `X` is harmful by checking the corresponding `valid` / enable / select context
-- search backward to the earliest time that same `X` first becomes harmful
-- move upward through father and grandfather instance input ports
+- if the observed harmful `X` is on an internal net, lift the frontier first to the nearest meaningful egress boundary of the current instance or mapped subsystem
+- search backward to determine the current harmful interval, usually from the edge that activates the path through the earliest harmful `X` observation; use `get_transitions`, `find_value_intervals`, and when helpful `find_edge` on the relevant `valid` / enable / select signal instead of relying on one timepoint
+- move upward through father and grandfather instance input ports, auditing over that interval rather than at a single sample
 - if an ancestor has harmful `X` outputs but no harmful suspicious `X` inputs, treat it only as a creator candidate and prove whether the owner is a child instance, local logic, parent-level glue, or top-level
 - if a child instance owns that harmful boundary, move the frontier into the child rather than stopping at the parent wrapper, unless the harmful boundary has crossed into a mapped subsystem and the subsystem-boundary gate applies first
-- if a child instance owns that harmful boundary, restart from the child's ingress input groups before tracing any child output bit or child internal net
+- if a child instance owns that harmful boundary, re-seek the child's harmful interval and restart from the child's ingress input groups before tracing any child output bit or child internal net
 - if ownership resolves to parent-level glue or top-level connectivity, keep following the owning net at that level rather than pretending there is another instance port list to inspect
 - otherwise identify the same-level sibling instance or parent-level glue that drives the bad input
 - repeat until you find the first boundary with harmful suspicious `X` outputs, no harmful suspicious `X` inputs, and ownership resolved to local logic, or until you prove the source is outside the traced design boundary
@@ -179,13 +180,17 @@ At a subsystem boundary:
 
 - classify the subsystem egress harmful boundary
 - classify the relevant subsystem ingress data / handshake / mode groups
-- record a compact subsystem-boundary evidence table for the current harmful timepoint, harmful path, and controlling context:
+- record a compact subsystem-boundary evidence table for the current harmful interval, harmful path, and controlling context:
+  - audit interval and activation edge used for the audit
   - harmful egress signal(s) checked and active-path proof
   - relevant ingress groups checked
+  - matching `valid` / ready / enable / select groups
+  - active mode / config / state groups that control the harmful path
   - per-group classification: harmful `X` / clean / gated off
+  - reason for every `gated off` classification
   - decision: stay at the higher layer or descend inside the subsystem
 - for harmful `X` tracing, this subsystem-boundary stop overrides the generic child-owner shortcut: even if structural tracing already names a deeper child owner, and even if the subsystem wrapper looks like pass-through wiring on the current path, you must complete the subsystem-boundary audit and its evidence table first
-- once that same subsystem boundary has already been audited at the same harmful timepoint for the same harmful path and controlling context, reuse the existing subsystem evidence table instead of bouncing back to the subsystem wrapper
+- once that same subsystem boundary has already been audited for the same harmful interval, harmful path, and controlling context, reuse the existing subsystem evidence table instead of bouncing back to the subsystem wrapper
 - if subsystem ingress is already harmful, keep tracing at the higher hierarchy layer across subsystem interfaces
 - descend into subsystem internals only if the subsystem egress is harmful while the relevant subsystem ingress groups are clean or gated off
 - if that compact subsystem-boundary evidence table is missing or incomplete, deeper descent is not allowed yet; finish the subsystem-boundary audit first
@@ -202,34 +207,40 @@ For harmful `X` bugs, "find the exact RTL statement" means **find the exact RTL 
 Before any deep local source inspection, force a creator-block checkpoint:
 
 - current block
+- current harmful interval and activation edge, if known
 - harmful `X` outputs present: yes / no
 - harmful `X` inputs present: yes / no
 - ownership of the bad boundary: child-instance / sibling / parent-glue / local logic / top-level
 - decision: keep climbing or descend locally
 - boundary evidence table:
+  - audit interval and activation edge used for the audit
   - harmful output signal(s) checked
   - active handshake / enable context
   - relevant input groups checked
+  - matching `valid` / ready / enable / select groups
+  - active mode / config / state groups that control the harmful path
   - per-input classification: harmful `X` / clean / gated off
   - reason for every `gated off` classification
 
-If harmful `X` inputs are still present, keep climbing. If a child instance owns the harmful boundary, move into that child, reset to the child's ingress boundary, and keep the hierarchy-first walk going. For harmful `X` bugs, child-output bit tracing is not allowed until the child ingress groups were classified. If that child sits inside a mapped subsystem, the subsystem ingress/egress audit and evidence table must be completed before any deeper child descent, even if the subsystem wrapper appears transparent on the current path. Only descend when harmful `X` outputs are present, harmful `X` inputs are absent, and structural tracing proves the current block's local logic is the owner.
+If harmful `X` inputs are still present, keep climbing. If a child instance owns the harmful boundary, move into that child, re-seek the child's harmful interval, reset to the child's ingress boundary, and keep the hierarchy-first walk going. For harmful `X` bugs, child-output bit tracing is not allowed until the child ingress groups were classified. If that child sits inside a mapped subsystem, the subsystem ingress/egress audit and evidence table must be completed before any deeper child descent, even if the subsystem wrapper appears transparent on the current path. Only descend when harmful `X` outputs are present, harmful `X` inputs are absent, and structural tracing proves the current block's local logic is the owner.
 
-If the child or owner sits inside a mapped subsystem, stop at the subsystem boundary first and complete the same ingress/egress audit there before diving into internal child blocks. Do not treat "wrapper looks transparent" as a valid reason to skip this subsystem-boundary audit. But if that subsystem boundary was already audited at the same harmful timepoint for the same harmful path and controlling context, reuse the existing subsystem evidence table instead of repeating the same audit.
+If the child or owner sits inside a mapped subsystem, stop at the subsystem boundary first and complete the same ingress/egress audit there before diving into internal child blocks. Do not treat "wrapper looks transparent" as a valid reason to skip this subsystem-boundary audit. But if that subsystem boundary was already audited for the same harmful interval, harmful path, and controlling context, reuse the existing subsystem evidence table instead of repeating the same audit.
 
-After Playbook 09 isolates the likely creator block, carry its creator-block / subsystem-boundary evidence tables into Playbook 04 and reuse them. Do not restart the same boundary audit unless the harmful timepoint, active path, controlling context, creator candidate, or audited subsystem boundary changed, or the earlier table was incomplete.
+After Playbook 09 isolates the likely creator block, carry its creator-block / subsystem-boundary evidence tables into Playbook 04 and reuse them. Do not restart the same boundary audit unless the harmful interval, active path, controlling context, creator candidate, or audited subsystem boundary changed, or the earlier table was incomplete.
 
-Do **not** treat a partial snapshot or a quick wrapper/source skim as enough evidence for "inputs are clean or gated off", especially in large generated or HLS blocks. If the relevant input groups were not explicitly classified, the creator-block proof is incomplete and you must either classify the boundary yourself in bounded batches, delegate the boundary scan if delegation is explicitly authorized, or keep climbing.
+Do **not** treat a partial snapshot or a quick wrapper/source skim as enough evidence for "inputs are clean or gated off", especially in large generated or HLS blocks. If the relevant input groups were not explicitly classified over the relevant harmful interval, the creator-block proof is incomplete and you must either classify the boundary yourself in bounded batches, delegate the boundary scan if delegation is explicitly authorized, or keep climbing.
 
 If the instance boundary has too many input ports to inspect comfortably, and delegation is explicitly authorized, delegate the port scan to a subagent and ask it to return only:
 
+- audit interval and activation edge used
+- harmful boundary output(s) checked and active-path proof summary
 - harmful suspicious `X` inputs
-- inactive / ignorable `X` inputs
+- gated-off relevant inputs, with the gating reason for each one
 - clean relevant inputs
 
 When you do this, use a **minimal-context helper**, not a full-history fork:
 
-- pass only the instance path, failure time/bookmark, harmful boundary signal, and relevant valid/enable/select context
+- pass only the instance path, the current harmful interval expressed as explicit `start_time` / `end_time` values or a start-bookmark / end-bookmark pair, the harmful boundary signal, and the relevant valid/enable/select plus mode/config/state context
 - do not ask the helper to own the debug narrative
 - do not override model or agent settings on a forked child
 
