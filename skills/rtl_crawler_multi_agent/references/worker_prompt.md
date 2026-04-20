@@ -150,8 +150,29 @@ these are true:
 **If it IS a wrapper → ESCALATE.**  Do not try to deep-crawl all
 sub-subsystems yourself.  Instead:
 
-1. Write a brief wrapper doc (see wrapper doc template below).
-2. Return an ESCALATION response (see Step 5b) with the list of
+1. Run a **bounded wrapper-characterization pass** before writing the
+   doc.  Collect enough evidence to populate the wrapper template, but
+   do not deep-crawl the child subsystems:
+   - Run `hier --root {subsystem_instance} --depth 2 --format json --show-source`
+     to capture the wrapper, its immediate children, and any obvious
+     wrapper-owned glue blocks.
+   - Reuse the Step 0 wrapper-detection probes plus the Step 2
+     clock/reset/interface probes, but keep them scoped to the wrapper
+     boundary and wrapper-owned shared buses.
+   - Identify wrapper-owned shared infrastructure only: reset/clock
+     generation, arbiters, decoders, crossbars, retiming, interrupt
+     muxes, or simple glue.  Do not deep-crawl inside the major child
+     subsystems.
+   - If needed, run one or two targeted `trace` queries on a
+     wrapper-owned boundary signal to resolve an ambiguous peer or
+     wrapper-level shared bus.
+2. Write a full architecture-style wrapper doc (see wrapper doc
+   template below).  Wrapper docs must include the same core sections as
+   subsystem docs: clock domains, resets, external interfaces, internal
+   hierarchy, and notes for debugging agents.  The difference is that
+   the wrapper doc focuses on wrapper-owned glue logic and summarizes
+   child subsystems rather than deep-crawling them.
+3. Return an ESCALATION response (see Step 5b) with the list of
    sub-subsystems.  The orchestrator will spawn dedicated workers
    for each one.
 
@@ -280,11 +301,11 @@ rtl_trace_serve_query("{session_id}",
 
 Where `{sibling_regex}` is built from the sibling subsystems list.
 
-## Step 4 — Write the subsystem doc
+## Step 4 — Write the architecture doc
 
 Write the markdown file to `{output_dir}/{output_filename}`.
 
-Use this exact template:
+Use this exact template for normal subsystem completion:
 
 ```markdown
 # {Subsystem Name} — Architecture
@@ -345,6 +366,33 @@ gates, and standard cells.}
 - {Cross-references to related subsystem docs}
 ```
 
+If Step 0 determined the assigned block is a wrapper, still write an
+architecture doc with the same core sections.  Adapt the content like
+this:
+
+- `## Role in the system`: describe the wrapper's coordination role and
+  what major child subsystems it groups.
+- `## External interfaces`: include only interfaces owned at the wrapper
+  boundary or wrapper-level shared buses.  Do not duplicate every child
+  subsystem interface.
+- `## Internal hierarchy`: show the wrapper, its major child
+  subsystems, and any wrapper-owned glue / reset / clock / retiming
+  blocks.  Mark pure utility blocks as `[leaf IP]`.
+- `## Key internal blocks`: include wrapper-owned logic only.  Typical
+  entries are reset generators, shared arbiters, address decoders,
+  crossbars, retiming clusters, interrupt muxes, or shared clock/reset
+  infrastructure.  If the wrapper is nearly pure hierarchy, say so
+  explicitly and keep this section short.
+- `## Notes for debugging agents`: explain whether debug should start at
+  the wrapper boundary, in shared infrastructure, or immediately inside
+  one of the child subsystems.
+- Add a wrapper-specific `## Contents` table after `## Role in the
+  system`, listing the child subsystems and linking to their docs.
+- Every field in the wrapper doc must come from the bounded
+  wrapper-characterization pass above.  If a wrapper-owned external
+  interface or shared block was not observed, say so explicitly instead
+  of inferring it from child docs.
+
 ## Step 5 — Return your result
 
 At the very end of your response, output exactly ONE of the following
@@ -389,17 +437,26 @@ debugging_notes:
 
 Use this ONLY if Step 0 determined the block is a wrapper.
 
-Write a brief wrapper doc first:
+Write a full architecture-style wrapper doc first, using data from the
+bounded wrapper-characterization pass:
 
 ```markdown
-# {Wrapper Name} — Hierarchy
+# {Wrapper Name} — Architecture
 
 ## Overview
 
 - **Instance:** `{subsystem_instance}`
 - **Module:** `{module_type}`
 - **Source:** `{source_file}`
-- **Role:** Hierarchical container for the following subsystems.
+- **Clock domain(s):** {comma-separated list, or "inherits from children / none observed"}
+- **Reset(s):** {comma-separated list with polarity, or "inherits from children / none observed"}
+- **Parent:** `{parent_wrapper}` (or top-level)
+
+## Role in the system
+
+{1-3 sentences describing what this wrapper groups together and any
+wrapper-owned coordination logic.  If it is almost pure hierarchy, say
+"mostly hierarchical wrapper; minimal local logic observed."}
 
 ## Contents
 
@@ -408,13 +465,47 @@ Write a brief wrapper doc first:
 | `{child_1}` | `{module_1}` | [{child_1_slug}__{module_1_slug}_architecture.md](./{child_1_slug}__{module_1_slug}_architecture.md) |
 | `{child_2}` | `{module_2}` | [{child_2_slug}__{module_2_slug}_architecture.md](./{child_2_slug}__{module_2_slug}_architecture.md) |
 
-## Shared infrastructure
+## External interfaces
 
-{List any clock/reset generation, shared buses, or glue logic that
-lives at the wrapper level.  If none: "None — pure hierarchical wrapper."}
+| Direction | Protocol | Connected to | Key signals |
+|-----------|----------|--------------|-------------|
+| {Master/Slave} | {AXI/AHB/APB/custom} | `{peer_instance}` | {summary} |
+
+If the wrapper has no meaningful wrapper-owned boundary interfaces,
+write: "No distinct wrapper-owned external interfaces observed beyond
+child subsystem boundaries."
+
+## Internal hierarchy
+
+    {subsystem_root}
+    ├── {child_subsystem_1} ({module_1}) — Major child subsystem
+    ├── {child_subsystem_2} ({module_2}) — Major child subsystem
+    └── {shared_glue} ({glue_module}) — Shared wrapper infrastructure [leaf IP]
+
+## Key internal blocks
+
+### {shared_block_name} ({shared_block_module})
+
+- **Source:** `{source_file}:{line}`
+- **Purpose:** {1-2 sentences about wrapper-owned glue logic}
+- **Clock:** `{clk}` | **Reset:** `{rst}`
+- **Key signals:** `{sig1}`, `{sig2}`, `{sig3}`
+- **Interfaces:** {child-to-child or wrapper-boundary connections mediated by this block}
+
+If the wrapper is nearly pure hierarchy, write one short subsection
+stating that no substantial wrapper-owned logic was found beyond reset,
+clock, retiming, or simple interconnect glue.
+
+## Notes for debugging agents
+
+- {Where to start for wrapper-level traffic steering or reset/clock issues}
+- {Which wrapper-owned signals or blocks separate child subsystems}
+- {Cross-references to the main child subsystem docs}
 ```
 
-Then output the escalation block:
+Then output the escalation block.  Its metadata fields are parsed and
+preserved by the orchestrator like a wrapper summary, so populate them
+from the wrapper-characterization pass, not from child-doc guesses:
 
 ```
 === WORKER ESCALATION ===
@@ -422,6 +513,29 @@ subsystem_instance: {subsystem_instance}
 module_type: {module_type}
 reason: "{brief explanation of why this is a wrapper}"
 wrapper_doc: {output_filename}
+
+clock_domains:
+  - {clk_1}
+  - {clk_2}
+
+resets:
+  - {rst_1} ({polarity}, {sync/async})
+
+external_interfaces:
+  - direction: {master/slave}
+    protocol: {AXI/AHB/APB/custom}
+    peer: {peer_instance_path}
+    probe_signal: {resolved_signal_path}
+    key_signals: {summary}
+
+top_level_children:
+  - {inst} ({module}) — {short description}
+  - {inst}[0..N] ({module}) — {description} ×{count}
+  - {inst} ({module}) — {description} [leaf IP]
+
+debugging_notes:
+  - {note 1}
+  - {note 2}
 
 sub_manifest:
   - subsystem: {child_1_path}  module: {child_1_module}

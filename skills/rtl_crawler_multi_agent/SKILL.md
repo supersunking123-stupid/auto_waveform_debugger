@@ -156,9 +156,11 @@ signals** matching those probes, it is likely a wrapper.
 
 When you identify a wrapper:
 - Add it to the discovery queue so its children get classified.
-- Record it in the manifest as `wrapper` — it will get a brief wrapper
-  doc (not a full architecture doc) and workers' docs will be organized
-  under it.
+- Record it in the manifest as `wrapper` — it will get a full
+  architecture-style wrapper doc, with the same core sections expected
+  for subsystem docs (clock domains, resets, external interfaces,
+  internal hierarchy, and debugging notes), and workers' docs will be
+  organized under it.
 
 If you are unsure whether a block is a wrapper or a subsystem, choose
 `subsystem`.  False wrapper classifications are more damaging than
@@ -295,14 +297,6 @@ serve session.
 **Optional: parallel.** If the user asks and the serve backend handles
 concurrent queries, spawn all workers at once.
 
-**Model selection for workers.** Workers execute a well-scoped,
-prompt-driven task (expand hierarchy, detect interfaces, trace
-connections, write a markdown doc). They do not need the most capable
-model. Spawn workers with a cost-effective model such as `haiku` or
-`chatgpt-5.4-mini` to reduce token spend without sacrificing doc
-quality. The orchestrator itself should continue using the default
-model since it handles classification, dedup, and escalation decisions.
-
 ### Handling worker escalations
 
 A worker may return an `ESCALATION` **instead of** a normal summary.
@@ -314,13 +308,24 @@ When you receive an escalation:
 1. Rewrite the original manifest entry from `subsystem` /
    `instance_array` to `wrapper`, preserving its parent pointer.
 2. Attach the returned wrapper doc filename to that manifest entry.
-3. Read the sub-manifest from the escalation block and insert those
+3. Preserve the wrapper summary fields from the escalation block on that
+   manifest entry:
+   - `clock_domains`
+   - `resets`
+   - `external_interfaces`
+   - `top_level_children`
+   - `debugging_notes`
+4. Read the sub-manifest from the escalation block and insert those
    child entries under the wrapper, keyed by full instance path so you
    cannot create duplicates.
-4. Recompute `sibling_subsystems` and the coverage dedup map for any
+5. Treat those preserved wrapper fields exactly like a worker summary in
+   later phases: include wrapper-owned `external_interfaces` in Phase 4
+   connectivity mapping, and include wrapper `clock_domains` / `resets`
+   in the final index summaries.
+6. Recompute `sibling_subsystems` and the coverage dedup map for any
    newly spawned workers that were not already completed.
-5. Spawn a new worker for each sub-subsystem listed.
-6. Build the final index from the **updated manifest**, not from the
+7. Spawn a new worker for each sub-subsystem listed.
+8. Build the final index from the **updated manifest**, not from the
    pre-escalation plan.
 
 This is a safety net — the recursive discovery in Phase 2 should catch
@@ -382,6 +387,28 @@ module_type: io_die_top
 reason: "Assigned block is a wrapper containing 3 major sub-subsystems."
 wrapper_doc: top_io_die__io_die_top_architecture.md
 
+clock_domains:
+  - io_clk
+
+resets:
+  - io_rst_n (active low, async)
+
+external_interfaces:
+  - direction: slave
+    protocol: AXI
+    peer: top.noc
+    key_signals: aw/ar/w/r/b
+    probe_signal: top.io_die.s_axi.aw.valid
+
+top_level_children:
+  - d2d_subsys[0..3] (d2d_subsystem) — die-to-die links ×4
+  - pcie_subsys (pcie_complex) — PCIe controller complex
+  - mem_if_subsys (mem_interface) — memory interface complex
+
+debugging_notes:
+  - Wrapper-level debug starts at the shared ingress ports and child-boundary handshakes.
+  - Check wrapper-owned reset, clock, and arbitration logic before diving into child subsystems.
+
 sub_manifest:
   - instance_array: top.io_die.d2d_subsys[0]  module: d2d_subsystem  count: 4
   - subsystem: top.io_die.pcie_subsys        module: pcie_complex
@@ -396,10 +423,12 @@ sub_manifest:
 After all workers (including any spawned from escalations) have returned,
 build the connectivity map.
 
-Match up `external_interfaces` from worker summaries.  For ambiguous or
-leaf-IP connections, trace explicitly using the worker-provided
-`probe_signal` field, which is the exact resolved signal path the worker
-already used to identify that interface:
+Match up `external_interfaces` from worker summaries **and from wrapper
+metadata recorded on manifest entries** (including metadata preserved
+from escalation blocks).  For ambiguous or leaf-IP connections, trace
+explicitly using the worker-provided `probe_signal` field, which is the
+exact resolved signal path the worker already used to identify that
+interface:
 
 ```python
 rtl_trace_serve_query(session_id,
@@ -432,8 +461,10 @@ Write `design_index.md` in `{output_dir}`.  Contents:
   ```
 
 - System interconnect (connectivity table from Phase 4)
-- Clock domains summary (merged from all worker summaries)
-- Reset tree summary (merged from all worker summaries)
+- Clock domains summary (merged from all worker summaries and wrapper
+  metadata recorded on manifest entries)
+- Reset tree summary (merged from all worker summaries and wrapper
+  metadata recorded on manifest entries)
 
 Read `references/templates.md` for the exact template format.  Follow
 that file literally; it includes the wrapper-aware hierarchy tree.
@@ -448,32 +479,28 @@ rtl_trace_serve_stop(session_id)
 
 ## Wrapper docs
 
-For each `wrapper` in the manifest, write a brief doc — NOT a full
-architecture doc:
+For each `wrapper` in the manifest, ensure there is a **full
+architecture-style wrapper doc**, not a brief hierarchy note.
 
-```markdown
-# {Wrapper Name} — Hierarchy
-
-## Overview
-
-- **Instance:** `{instance_path}`
-- **Module:** `{module_type}`
-- **Source:** `{source_file}`
-- **Role:** Hierarchical container for the following subsystems.
-
-## Contents
-
-| Instance | Module | Doc |
-|----------|--------|-----|
-| `{child_1}` | `{module_1}` | [{child_1_slug}__{module_1_slug}_architecture.md](./{child_1_slug}__{module_1_slug}_architecture.md) |
-| `{child_2}` | `{module_2}` | [{child_2_slug}__{module_2_slug}_architecture.md](./{child_2_slug}__{module_2_slug}_architecture.md) |
-
-## Shared infrastructure
-
-{List any clock/reset generation, shared buses, or glue logic that
-lives at the wrapper level rather than inside a subsystem.  If none,
-write "None — pure hierarchical wrapper."}
-```
+- If the wrapper came from a worker escalation, **reuse** the returned
+  wrapper doc and preserved wrapper metadata.  Do not overwrite it with
+  a shorter format.
+- If the wrapper was discovered directly by the orchestrator, write a
+  wrapper doc using the same core sections required in
+  `references/worker_prompt.md` Step 5b:
+  - `## Overview`
+  - `## Role in the system`
+  - `## Contents`
+  - `## External interfaces`
+  - `## Internal hierarchy`
+  - `## Key internal blocks`
+  - `## Notes for debugging agents`
+- When the orchestrator writes a wrapper doc directly, record the same
+  metadata fields on the manifest entry that an escalation would carry:
+  `clock_domains`, `resets`, `external_interfaces`,
+  `top_level_children`, and `debugging_notes`.
+- Wrapper docs focus on wrapper-owned glue logic and summarize child
+  subsystems.  They should not deep-crawl the children themselves.
 
 ---
 
