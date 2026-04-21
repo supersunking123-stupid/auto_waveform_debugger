@@ -4,7 +4,7 @@
 
 **When to use:** The model executing the debug is prone to drifting from playbooks, making tool calls that don't match stated intent, or drawing conclusions from unverified assumptions. If a single-agent debug session has already failed, or the debug is especially high-risk/ambiguous, retry with this two-agent setup. Do not use supervised mode by default for every short, routine debug.
 
-**Prerequisites:** Same as Playbook 04 — a compiled structural database, a waveform file, and a sufficient architecture document for the relevant design or subsystem. If that document does not already exist, Phase 0 must route through `08_DESIGN_MAPPING.md` before active debugging. If the failure involves architecturally relevant unknown (`X`) values, supervised debug must route through `09_X_TRACING.md` before ordinary Playbook 04 phase work begins. The Supervisor does not call MCP tools directly; it operates by reviewing the Debugger's actions and steering via structured feedback.
+**Prerequisites:** Same prerequisites and entry gates as Playbook 04: a compiled structural database, a waveform file, and sufficient architecture context for the active debug scope. If Playbook 04 would route the case through `08_DESIGN_MAPPING.md` for Phase 0 or through `09_X_TRACING.md` for harmful-`X` tracing, supervised mode must do the same before ordinary RCA begins. The Supervisor does not call MCP tools directly; it operates by reviewing the Debugger's actions and steering via structured feedback.
 
 ---
 
@@ -293,7 +293,6 @@ Quick reference for the Supervisor's most common interventions:
 | Debugger concludes root cause but hasn't checked all RHS drivers | Block conclusion, list unchecked drivers, require verification |
 | Debugger questions an EDA-vendor VIP, or treats a home-grown model as golden | Redirect: "Trust the vendor VIP. Trace the immediate driver of the flagged signal; the source may be DUT RTL or home-grown testbench RTL." |
 | Debugger is processing >20 transitions by inspection | Instruct: "Write a Python script to process this data. I will review it." |
-| Debugger skipped Phase 0 design-map check or is looping in an undocumented subsystem | Block and redirect: "Run Playbook 08 using the design top module, then read the relevant subsystem doc before more tracing." |
 | Debugger is stuck after two attempts on the same branch | Instruct: "Return to error_scenario session. Pick a different signal to trace." |
 | Debugger's conclusion doesn't explain the error-scenario snapshot | Block conclusion: "Your root cause must explain why <signal> was <value> at the error point. It currently doesn't." |
 | Debugger skips a playbook phase | Block: "You skipped Phase N. Go back and complete it." |
@@ -385,7 +384,6 @@ SELF-REVIEW CHECKPOINT — Phase N complete
 
 - **Use supervised mode selectively.** It reduces false starts, but it adds review latency. Prefer it after a failed single-agent pass or when the session is large, ambiguous, or high-risk.
 - **Keep Supervisor prompts short and rule-based.** The Supervisor's effectiveness comes from mechanical checks, not from being a better debugger. A checklist is more reliable than open-ended reasoning.
-- **Phase 0 is mandatory here too.** Supervised mode does not excuse missing design context. If the subsystem is undocumented, map it before approving more tracing.
 - **The error-scenario session is non-negotiable.** Every investigation branch must start from and reconnect to the error scenario. If the Debugger cannot explain the error snapshot, the investigation is incomplete.
 - **Python scripts are for data processing, not for tool calls.** The script processes data already returned by MCP tools. It does not replace the tools — it supplements them for tasks where humans would use a spreadsheet or a short script.
 - **Backtracking is not failure.** In a complex design, the first branch often leads to a correct signal (dead end). Returning to the error scenario and trying the next suspect is the designed workflow, not an admission of failure.

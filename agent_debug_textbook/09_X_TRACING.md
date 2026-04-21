@@ -72,30 +72,7 @@ Prefer these in order:
 
 Do **not** start by tracing deep internal combinational cones unless the hierarchy-first steps have already isolated the creator block.
 
-Before any deep local tracing or source-file inspection, complete the **creator-block gate**:
-
-- harmful `X` outputs present at the current block boundary: yes / no
-- harmful `X` inputs present at the current block boundary: yes / no
-- if harmful `X` inputs are present, continue upward or sideways to the structural owner
-- if harmful `X` outputs are present and harmful `X` inputs are absent, this is only a creator candidate; prove whether the owner is a child instance, local logic, parent-glue, or top-level before descending
-- if a child instance owns the harmful boundary, move the frontier into that child instead of stopping at the parent wrapper, unless the boundary has crossed into a mapped subsystem and the subsystem-boundary gate below applies first
-- if ownership resolves to a child instance, **reset the frontier to that child's ingress boundary first**; do not continue from the child's bad output bit or child output bus yet
-- if the boundary driver is not a sibling instance, use `rtl_trace trace` to determine whether the owner is a child instance, parent-level glue, top-level connectivity, or local logic before descending
-- if the harmful boundary crosses a **mapped subsystem boundary** (for example a major child block from the architecture doc such as a top-level partition), stop at that subsystem instance first; do not jump directly to a deep leaf returned by structural trace
-- at a subsystem boundary, produce a **subsystem-boundary evidence table** before descending inside the subsystem
-- the subsystem-boundary evidence table must include:
-  - audit interval and activation edge used for the audit
-  - harmful egress signal(s) checked and the active-path proof for each one
-  - relevant ingress data groups
-  - matching `valid` / ready / enable / select groups
-  - active mode / config / state groups that control the harmful path
-  - per-group classification: `harmful X` / `clean` / `gated off`
-  - reason for every `gated off` classification
-  - decision: keep tracing at the higher layer or descend into subsystem internals
-- the subsystem-boundary stop overrides the generic child-owner shortcut for harmful `X` tracing: even if structural trace already names a deeper child owner, and even if the subsystem wrapper appears to be simple pass-through wiring on this path, you must complete the subsystem-boundary audit and evidence table first
-- once a mapped subsystem boundary has already been audited for the same harmful interval, harmful path, and controlling context, reuse that evidence table instead of bouncing back to the subsystem wrapper again
-- descend into subsystem internals only if the subsystem egress is harmfully `X` while the relevant subsystem ingress groups are `clean` or `gated off`; if subsystem ingress is already harmful, keep tracing at the higher hierarchy layer instead of diving into the subsystem
-- if the subsystem-boundary evidence table does not yet exist for the current harmful interval, harmful path, and controlling context, descent below that boundary is **forbidden**
+The Phase 1–5 workflow below is the authoritative procedure for creator-block checks, subsystem-boundary evidence tables, and the handoff back to ordinary RCA.
 
 ---
 
@@ -257,45 +234,11 @@ Playbook 04 should **reuse** these tables instead of restarting the same creator
 
 ### Boundary-proof rule
 
-The creator-block gate is satisfied only by **explicit boundary evidence**, not by a narrative impression.
+The boundary evidence tables required in Phases 3–5 are the proof artifacts for harmful-`X` tracing. Do not replace them with narrative impressions, output-side bit tracing, or partial snapshots.
 
-Do **not** claim "the inputs are clean or gated off" unless you can name the input groups you checked and classify each one.
-
-For harmful `X` tracing, "input groups" means the ingress-side groups that can actually feed the harmful path:
-
-- data ingress groups
-- matching `valid` / ready / enable / select groups
-- active config / mode / state groups
-
-For **mapped subsystem boundaries**, apply the same rule at subsystem scope:
-
-- audit interval and activation edge for that subsystem boundary
-- relevant subsystem ingress data groups
-- matching subsystem ingress `valid` / ready / enable / select groups
-- active subsystem mode / config / state groups that control the harmful path
-- harmful subsystem egress signal(s) and their active-path proof
-- the explicit decision: keep tracing at the higher layer or descend internally
-
-The subsystem-boundary evidence table is mandatory whenever the harmful frontier crosses a mapped subsystem boundary. Without that table, the proof is incomplete and descent below that boundary is forbidden.
-
-Do not skip the subsystem boundary just because structural tracing names a deeper internal child as the owner of the current harmful output.
-
-Do not re-open an already completed subsystem-boundary audit at the same harmful interval unless the harmful path or controlling context changed.
-
-Do not replace ingress classification with output-side bit tracing.
-
-For every relevant boundary input group, record one of:
-
-- `harmful X` — the signal is `X` on an active path and can influence the bad output during the audited interval
-- `clean` — the signal is not `X` during the audited interval where it could influence the bad output
-- `gated off` — the signal may be `X`, but its corresponding valid / enable / select / load condition is inactive during the audited interval; record the gating reason
-
-If you cannot produce this table, the boundary proof is incomplete and you must keep climbing, classify the boundary yourself in bounded batches, or delegate the classification if delegation is explicitly authorized.
-
-Missing-table rule:
-
-- If the next intended move would cross below a mapped subsystem boundary and the subsystem-boundary evidence table for the current harmful interval, harmful path, and controlling context is missing or incomplete, that move is invalid.
-- The correct next action is to return to that boundary and finish the audit, not to choose a deeper child or representative output bit.
+- Do **not** claim "inputs are clean or gated off" unless the relevant ingress groups were explicitly classified over the audited interval.
+- Do **not** descend below a mapped subsystem boundary until the required subsystem-boundary evidence table exists and is complete.
+- Do **not** reopen a completed creator-block or subsystem-boundary audit unless the harmful interval, active path, controlling context, creator candidate, or audited subsystem boundary changed.
 
 ### Generated-block rule
 
@@ -389,12 +332,6 @@ Do not do these:
 - Trace stage-by-stage through long repeated pipelines when the first harmful `X` might already be visible at a higher boundary.
 - Dump every input port of a large instance into the main context instead of filtering for suspicious harmful ports.
 - Declare victory at the first explicit RTL `X` assignment if harmful suspicious `X` inputs are still present upstream.
-- After resolving ownership to a child instance, continue from the child's bad output instead of resetting to the child's ingress boundary.
-- Skip a mapped subsystem boundary and jump directly into a deep internal child just because structural tracing identified that child as an owner.
-- Treat a subsystem wrapper as "transparent" and use that as a reason to skip subsystem ingress classification.
-- Take any deeper step below a mapped subsystem boundary before the subsystem-boundary evidence table is complete for the same harmful interval, harmful path, and controlling context.
-- Reuse a downstream harmful timestamp on a new owner boundary without re-checking whether the harmful interval moved earlier because of latency or storage.
-- In a generated / HLS child, start representative-bit tracing before ingress input groups were classified.
 - Report a pipe/skid register assignment that merely latched an already-bad payload as the root cause.
 - Report a FIFO RAM entry or storage flop write as the root cause when the incoming data is already harmful `X`.
 - Report a concat or pack statement as the root cause when one of its active inputs is already harmful `X`.
