@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -539,6 +540,53 @@ class CrossLinkingTests(unittest.TestCase):
         self.assertEqual(len(mcp_mod.rtl_serve_sessions), 1)
         self.assertEqual(len(mcp_mod.rtl_session_ids_by_key), 1)
 
+    def test_rtl_serve_queries_are_serialized_per_session(self):
+        active_writes = 0
+        max_active_writes = 0
+        counter_lock = threading.Lock()
+
+        class FakeStream:
+            pass
+
+        class FakeStdin:
+            def write(self, line):
+                nonlocal active_writes, max_active_writes
+                with counter_lock:
+                    active_writes += 1
+                    max_active_writes = max(max_active_writes, active_writes)
+                time.sleep(0.02)
+                with counter_lock:
+                    active_writes -= 1
+
+            def flush(self):
+                return None
+
+        class FakeProcess:
+            stdin = FakeStdin()
+            stdout = FakeStream()
+            stderr = FakeStream()
+
+            def poll(self):
+                return None
+
+        session = object.__new__(mcp_mod.RtlTraceServeSession)
+        session.bin_path = "/tmp/fake_rtl_trace"
+        session.serve_args = []
+        session._query_lock = threading.RLock()
+        session.process = FakeProcess()
+
+        def fake_read_until_end():
+            time.sleep(0.01)
+            return {"status": "success"}
+
+        session._read_until_end = fake_read_until_end
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(lambda i: session.query(f"find --query sig{i}"), range(4)))
+
+        self.assertTrue(all(item["status"] == "success" for item in results))
+        self.assertEqual(max_active_writes, 1)
+
     def test_concurrent_wave_daemon_lookup_reuses_single_daemon(self):
         created = []
 
@@ -566,6 +614,85 @@ class CrossLinkingTests(unittest.TestCase):
         self.assertEqual(len(created), 1)
         self.assertIs(daemons[0], daemons[1])
         self.assertEqual(len(mcp_mod.wave_daemons), 1)
+
+    def test_waveform_daemon_queries_are_serialized_per_daemon(self):
+        active_writes = 0
+        max_active_writes = 0
+        counter_lock = threading.Lock()
+
+        class FakeStdin:
+            def write(self, line):
+                nonlocal active_writes, max_active_writes
+                with counter_lock:
+                    active_writes += 1
+                    max_active_writes = max(max_active_writes, active_writes)
+                time.sleep(0.02)
+                with counter_lock:
+                    active_writes -= 1
+
+            def flush(self):
+                return None
+
+        class FakeStdout:
+            def readline(self):
+                time.sleep(0.01)
+                return '{"status":"success"}\n'
+
+        class FakeStderr:
+            def read(self):
+                return ""
+
+        class FakeProcess:
+            stdin = FakeStdin()
+            stdout = FakeStdout()
+            stderr = FakeStderr()
+
+            def poll(self):
+                return None
+
+        daemon = object.__new__(mcp_mod.WaveformDaemon)
+        daemon.waveform_path = "/tmp/shared.vcd"
+        daemon._query_lock = threading.RLock()
+        daemon.process = FakeProcess()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(lambda i: daemon.query("get_signal_info", {"path": f"sig{i}"}), range(4)))
+
+        self.assertTrue(all(item["status"] == "success" for item in results))
+        self.assertEqual(max_active_writes, 1)
+
+    def test_concurrent_json_writes_use_distinct_temp_files(self):
+        path = mcp_mod.SESSION_STORE_DIR / "concurrent_write_test.json"
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(lambda i: mcp_mod._write_json_file(path, {"value": i}), range(16)))
+
+        payload = mcp_mod._read_json_file(path)
+        self.assertIn("value", payload)
+        self.assertEqual(list(mcp_mod.SESSION_STORE_DIR.glob("concurrent_write_test.json.*.tmp")), [])
+
+    def test_concurrent_same_session_bookmark_updates_are_merged(self):
+        created = mcp_mod.create_session(self.waveform_path, "shared_debug")
+        self.assertEqual(created["status"], "success")
+
+        def create_bookmark(i):
+            return mcp_mod.create_bookmark(
+                f"bm_{i}",
+                i,
+                waveform_path=self.waveform_path,
+                session_name="shared_debug",
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(create_bookmark, range(24)))
+
+        self.assertTrue(all(item["status"] == "success" for item in results))
+        bookmarks = mcp_mod.list_bookmarks(
+            waveform_path=self.waveform_path,
+            session_name="shared_debug",
+        )
+        self.assertEqual(bookmarks["status"], "success")
+        self.assertEqual({item["bookmark_name"] for item in bookmarks["data"]}, {f"bm_{i}" for i in range(24)})
 
     def test_non_fsdb_signal_cache_requests_full_namespace(self):
         calls = []

@@ -113,6 +113,7 @@ class RtlTraceServeSession:
     def __init__(self, bin_path: str, serve_args: List[str]):
         self.bin_path = bin_path
         self.serve_args = serve_args
+        self._query_lock = threading.RLock()
         self.process = subprocess.Popen(
             [bin_path, "serve"] + serve_args,
             stdin=subprocess.PIPE,
@@ -151,24 +152,26 @@ class RtlTraceServeSession:
         return {"status": "success", "stdout": "".join(out_lines)}
 
     def query(self, line: str) -> Dict[str, Any]:
-        if self.process.poll() is not None:
-            err = self.process.stderr.read() if self.process.stderr else ""
-            return {"status": "error", "message": "rtl_trace serve exited", "stderr": err}
+        with self._query_lock:
+            if self.process.poll() is not None:
+                err = self.process.stderr.read() if self.process.stderr else ""
+                return {"status": "error", "message": "rtl_trace serve exited", "stderr": err}
 
-        try:
-            if self.process.stdin is None or self.process.stdout is None:
-                return {"status": "error", "message": "rtl_trace serve pipes are unavailable"}
-            self.process.stdin.write(line + "\n")
-            self.process.stdin.flush()
-            return self._read_until_end()
-        except TimeoutError as e:
-            self.stop()
-            return {"status": "error", "message": str(e)}
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
+            try:
+                if self.process.stdin is None or self.process.stdout is None:
+                    return {"status": "error", "message": "rtl_trace serve pipes are unavailable"}
+                self.process.stdin.write(line + "\n")
+                self.process.stdin.flush()
+                return self._read_until_end()
+            except TimeoutError as e:
+                self.stop()
+                return {"status": "error", "message": str(e)}
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
 
     def stop(self) -> Dict[str, Any]:
-        _stop_process(self.process)
+        with self._query_lock:
+            _stop_process(self.process)
         return {"status": "success"}
 
 
@@ -270,6 +273,7 @@ def _rtl_trace_json(
 class WaveformDaemon:
     def __init__(self, wave_cli_path: str, waveform_path: str):
         self.waveform_path = waveform_path
+        self._query_lock = threading.RLock()
         self.process = subprocess.Popen(
             [wave_cli_path, waveform_path],
             stdin=subprocess.PIPE,
@@ -280,26 +284,28 @@ class WaveformDaemon:
         )
 
     def query(self, cmd: str, args: Optional[dict] = None) -> dict:
-        query_obj = {"cmd": cmd, "args": args or {}}
-        query_str = json.dumps(query_obj)
-        try:
-            if self.process.stdin is None or self.process.stdout is None:
-                return {"status": "error", "message": "wave_agent_cli daemon pipes are unavailable"}
-            self.process.stdin.write(query_str + "\n")
-            self.process.stdin.flush()
-            line = _read_line_with_timeout(self.process.stdout, DEFAULT_BACKEND_READ_TIMEOUT_SEC)
-            if not line:
-                err = self.process.stderr.read() if self.process.stderr else ""
-                return {"status": "error", "message": f"wave_agent_cli daemon crashed: {err}"}
-            return json.loads(line)
-        except TimeoutError as e:
-            self.stop()
-            return {"status": "error", "message": str(e)}
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
+        with self._query_lock:
+            query_obj = {"cmd": cmd, "args": args or {}}
+            query_str = json.dumps(query_obj)
+            try:
+                if self.process.stdin is None or self.process.stdout is None:
+                    return {"status": "error", "message": "wave_agent_cli daemon pipes are unavailable"}
+                self.process.stdin.write(query_str + "\n")
+                self.process.stdin.flush()
+                line = _read_line_with_timeout(self.process.stdout, DEFAULT_BACKEND_READ_TIMEOUT_SEC)
+                if not line:
+                    err = self.process.stderr.read() if self.process.stderr else ""
+                    return {"status": "error", "message": f"wave_agent_cli daemon crashed: {err}"}
+                return json.loads(line)
+            except TimeoutError as e:
+                self.stop()
+                return {"status": "error", "message": str(e)}
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
 
     def stop(self):
-        _stop_process(self.process)
+        with self._query_lock:
+            _stop_process(self.process)
 
 
 # Module-level state for wave daemons

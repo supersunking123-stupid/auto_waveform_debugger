@@ -142,10 +142,19 @@ class ScopedFileLock {
   ~ScopedFileLock() { Release(); }
 
   bool Acquire(const std::string &path) {
+    return AcquireImpl(path, O_RDWR | O_CREAT, LOCK_EX);
+  }
+
+  bool AcquireShared(const std::string &path) {
+    return AcquireImpl(path, O_RDONLY, LOCK_SH);
+  }
+
+ private:
+  bool AcquireImpl(const std::string &path, int open_flags, int lock_operation) {
     Release();
-    fd_ = ::open(path.c_str(), O_RDWR | O_CREAT, 0666);
+    fd_ = ::open(path.c_str(), open_flags, 0666);
     if (fd_ < 0) return false;
-    if (::flock(fd_, LOCK_EX) != 0) {
+    if (::flock(fd_, lock_operation) != 0) {
       Release();
       return false;
     }
@@ -160,7 +169,6 @@ class ScopedFileLock {
     }
   }
 
- private:
   int fd_ = -1;
 };
 
@@ -2427,6 +2435,9 @@ bool ValidateGraphDb(const GraphDb &graph) {
 }
 
 bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db) {
+  ScopedFileLock db_lock;
+  if (!db_lock.AcquireShared(db_path)) return false;
+
   std::ifstream in(db_path, std::ios::binary);
   if (!in.is_open()) return false;
 

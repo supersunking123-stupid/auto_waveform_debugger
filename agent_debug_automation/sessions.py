@@ -1,11 +1,15 @@
 """Session, Cursor, Bookmark, SignalGroup persistence."""
 
+import fcntl
 import hashlib
 import json
+import os
 import re
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from .models import (
     ACTIVE_SESSION_FILE,
@@ -14,6 +18,10 @@ from .models import (
     TimeReference,
 )
 from .mapping import _normalize_waveform_path
+
+
+_session_store_lock = threading.RLock()
+_session_store_lock_state = threading.local()
 
 
 def _utc_now_iso() -> str:
@@ -44,12 +52,47 @@ def _read_json_file(path: Path) -> Dict[str, Any]:
         return json.load(f)
 
 
+@contextmanager
+def _locked_session_store():
+    _ensure_session_store()
+    depth = int(getattr(_session_store_lock_state, "depth", 0))
+    if depth > 0:
+        _session_store_lock_state.depth = depth + 1
+        try:
+            yield
+        finally:
+            _session_store_lock_state.depth = depth
+        return
+
+    with _session_store_lock:
+        lock_path = SESSION_STORE_DIR / ".lock"
+        with lock_path.open("a", encoding="utf-8") as lock_file:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            _session_store_lock_state.depth = 1
+            try:
+                yield
+            finally:
+                try:
+                    _session_store_lock_state.depth = 0
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _write_json_file_unlocked(path: Path, payload: Dict[str, Any]) -> None:
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        with tmp_path.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, sort_keys=True, ensure_ascii=False)
+            f.write("\n")
+        tmp_path.replace(path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
 def _write_json_file(path: Path, payload: Dict[str, Any]) -> None:
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, sort_keys=True, ensure_ascii=False)
-        f.write("\n")
-    tmp_path.replace(path)
+    with _locked_session_store():
+        _write_json_file_unlocked(path, payload)
 
 
 def _validate_session_name(session_name: str) -> str:
@@ -102,13 +145,18 @@ def _normalize_session_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return normalized
 
 
-def _save_session_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _save_session_payload_unlocked(payload: Dict[str, Any]) -> Dict[str, Any]:
     _ensure_session_store()
     normalized = _normalize_session_payload(payload)
     normalized["updated_at"] = _utc_now_iso()
     path = _session_file_path(normalized["waveform_path"], normalized["session_name"])
-    _write_json_file(path, normalized)
+    _write_json_file_unlocked(path, normalized)
     return normalized
+
+
+def _save_session_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    with _locked_session_store():
+        return _save_session_payload_unlocked(payload)
 
 
 def _load_session_payload(waveform_path: str, session_name: str) -> Optional[Dict[str, Any]]:
@@ -116,6 +164,38 @@ def _load_session_payload(waveform_path: str, session_name: str) -> Optional[Dic
     if not path.exists():
         return None
     return _normalize_session_payload(_read_json_file(path))
+
+
+def _create_session_payload(
+    waveform_path: str,
+    session_name: str,
+    description: str = "",
+) -> Dict[str, Any]:
+    with _locked_session_store():
+        existing = _load_session_payload(waveform_path, session_name)
+        if existing is not None:
+            raise ValueError(f"session already exists: {session_name}")
+        return _save_session_payload_unlocked(
+            _default_session_payload(
+                waveform_path,
+                session_name=session_name,
+                description=description,
+            )
+        )
+
+
+def _mutate_session_payload(
+    waveform_path: str,
+    session_name: str,
+    mutate: Callable[[Dict[str, Any]], Optional[Dict[str, Any]]],
+) -> Dict[str, Any]:
+    """Atomically reload, mutate, and save one session payload."""
+    with _locked_session_store():
+        payload = _load_session_payload(waveform_path, session_name)
+        if payload is None:
+            raise ValueError(f"session not found: {session_name}")
+        mutated = mutate(payload)
+        return _save_session_payload_unlocked(payload if mutated is None else mutated)
 
 
 def _list_session_payloads(
@@ -262,27 +342,35 @@ def _resolve_time_reference(
     session_name: Optional[str] = None,
 ) -> Tuple[int, Dict[str, Any], Dict[str, Any]]:
     session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+    resolved, info = _resolve_time_reference_in_session(time_value, session)
+    return resolved, info, session
+
+
+def _resolve_time_reference_in_session(
+    time_value: TimeReference,
+    session: Dict[str, Any],
+) -> Tuple[int, Dict[str, Any]]:
     if isinstance(time_value, int):
-        return int(time_value), _time_resolution_info(time_value, int(time_value), session), session
+        return int(time_value), _time_resolution_info(time_value, int(time_value), session)
 
     raw = str(time_value).strip()
     if not raw:
         raise ValueError("time reference must not be empty")
     if raw == "Cursor":
         resolved = int(session["cursor_time"])
-        return resolved, _time_resolution_info(raw, resolved, session), session
+        return resolved, _time_resolution_info(raw, resolved, session)
     if raw.startswith("BM_"):
         bookmark_name = raw[3:]
         bookmark = session["bookmarks"].get(bookmark_name)
         if bookmark is None:
             raise ValueError(f"bookmark not found: {bookmark_name}")
         resolved = int(bookmark["time"])
-        return resolved, _time_resolution_info(raw, resolved, session), session
+        return resolved, _time_resolution_info(raw, resolved, session)
     try:
         resolved = int(raw)
     except ValueError as exc:
         raise ValueError(f"unsupported time reference: {time_value}") from exc
-    return resolved, _time_resolution_info(raw, resolved, session), session
+    return resolved, _time_resolution_info(raw, resolved, session)
 
 
 def _resolve_time_range_reference(

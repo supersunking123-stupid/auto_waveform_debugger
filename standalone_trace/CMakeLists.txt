@@ -51,5 +51,9 @@ add_test(
           --rtl-trace $<TARGET_FILE:rtl_trace>
           --source-dir ${CMAKE_CURRENT_SOURCE_DIR}
 )
+set_tests_properties(
+  rtl_trace_semantic_regression
+  PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/..
+)
 
 add_test(NAME assignment_utils_test COMMAND assignment_utils_test)

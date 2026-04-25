@@ -56,22 +56,22 @@ from .ranking import (
 )
 from .virtual_signals import vs_service
 from .sessions import (
-    _default_session_payload,
+    _create_session_payload,
     _expand_signal_groups,
     _get_active_session_ref,
     _get_or_create_session,
     _list_session_payloads,
-    _load_session_payload,
     _resolve_session,
     _resolve_time_range_reference,
     _resolve_time_reference,
+    _resolve_time_reference_in_session,
     _require_waveform_path_from_session,
-    _save_session_payload,
     _session_file_path,
     _session_summary,
     _set_active_session_ref,
     _time_resolution_info,
     _validate_named_entity,
+    _mutate_session_payload,
     _with_session_metadata,
 )
 
@@ -1627,10 +1627,7 @@ def create_session(waveform_path: str, session_name: str, description: str = "")
     The active Session is used when session-aware waveform tools omit vcd_path.
     """
     try:
-        payload = _load_session_payload(waveform_path, session_name)
-        if payload is not None:
-            return {"status": "error", "message": f"session already exists: {session_name}"}
-        payload = _save_session_payload(_default_session_payload(waveform_path, session_name=session_name, description=description))
+        payload = _create_session_payload(waveform_path, session_name, description=description)
         return _with_session_metadata({"status": "success", "data": _session_summary(payload)}, payload)
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -1702,9 +1699,16 @@ def set_cursor(time: TimeReference, waveform_path: Optional[str] = None, session
     refer to it by passing time="Cursor" instead of an integer timestamp.
     """
     try:
-        resolved_time, time_info, session = _resolve_time_reference(time, waveform_path=waveform_path, session_name=session_name)
-        session["cursor_time"] = max(0, int(resolved_time))
-        session = _save_session_payload(session)
+        session_ref = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+        time_info: Dict[str, Any] = {}
+
+        def mutate(session: Dict[str, Any]) -> Dict[str, Any]:
+            resolved_time, resolved_info = _resolve_time_reference_in_session(time, session)
+            time_info.update(resolved_info)
+            session["cursor_time"] = max(0, int(resolved_time))
+            return session
+
+        session = _mutate_session_payload(session_ref["waveform_path"], session_ref["session_name"], mutate)
         return _with_session_metadata({"status": "success", "data": {"cursor_time": session["cursor_time"]}}, session, time_info)
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -1714,9 +1718,13 @@ def set_cursor(time: TimeReference, waveform_path: Optional[str] = None, session
 def move_cursor(delta: int, waveform_path: Optional[str] = None, session_name: Optional[str] = None):
     """Move the Session Cursor by a signed time delta."""
     try:
-        session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
-        session["cursor_time"] = max(0, int(session["cursor_time"]) + int(delta))
-        session = _save_session_payload(session)
+        session_ref = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+
+        def mutate(session: Dict[str, Any]) -> Dict[str, Any]:
+            session["cursor_time"] = max(0, int(session["cursor_time"]) + int(delta))
+            return session
+
+        session = _mutate_session_payload(session_ref["waveform_path"], session_ref["session_name"], mutate)
         return _with_session_metadata(
             {"status": "success", "data": {"cursor_time": session["cursor_time"], "delta": int(delta)}},
             session,
@@ -1754,10 +1762,17 @@ def create_bookmark(
     passing time="BM_<bookmark_name>" instead of an integer timestamp.
     """
     try:
-        resolved_time, time_info, session = _resolve_time_reference(time, waveform_path=waveform_path, session_name=session_name)
+        session_ref = _resolve_session(waveform_path=waveform_path, session_name=session_name)
         key = _validate_named_entity(bookmark_name, "bookmark_name")
-        session["bookmarks"][key] = {"time": int(resolved_time), "description": description}
-        session = _save_session_payload(session)
+        time_info: Dict[str, Any] = {}
+
+        def mutate(session: Dict[str, Any]) -> Dict[str, Any]:
+            resolved_time, resolved_info = _resolve_time_reference_in_session(time, session)
+            time_info.update(resolved_info)
+            session["bookmarks"][key] = {"time": int(resolved_time), "description": description}
+            return session
+
+        session = _mutate_session_payload(session_ref["waveform_path"], session_ref["session_name"], mutate)
         return _with_session_metadata({"status": "success", "data": {"bookmark_name": key, **session["bookmarks"][key]}}, session, time_info)
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -1767,12 +1782,17 @@ def create_bookmark(
 def delete_bookmark(bookmark_name: str, waveform_path: Optional[str] = None, session_name: Optional[str] = None):
     """Delete a Bookmark from the selected Session."""
     try:
-        session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+        session_ref = _resolve_session(waveform_path=waveform_path, session_name=session_name)
         key = _validate_named_entity(bookmark_name, "bookmark_name")
-        if key not in session["bookmarks"]:
-            return {"status": "error", "message": f"bookmark not found: {key}"}
-        deleted = session["bookmarks"].pop(key)
-        session = _save_session_payload(session)
+        deleted: Dict[str, Any] = {}
+
+        def mutate(session: Dict[str, Any]) -> Dict[str, Any]:
+            if key not in session["bookmarks"]:
+                raise ValueError(f"bookmark not found: {key}")
+            deleted.update(session["bookmarks"].pop(key))
+            return session
+
+        session = _mutate_session_payload(session_ref["waveform_path"], session_ref["session_name"], mutate)
         return _with_session_metadata({"status": "success", "data": {"bookmark_name": key, **deleted}}, session)
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -1806,11 +1826,15 @@ def create_signal_group(
     tools can expand groups by passing signals_are_groups=True.
     """
     try:
-        session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+        session_ref = _resolve_session(waveform_path=waveform_path, session_name=session_name)
         key = _validate_named_entity(group_name, "group_name")
         ordered = list(dict.fromkeys(signals))
-        session["signal_groups"][key] = {"signals": ordered, "description": description}
-        session = _save_session_payload(session)
+
+        def mutate(session: Dict[str, Any]) -> Dict[str, Any]:
+            session["signal_groups"][key] = {"signals": ordered, "description": description}
+            return session
+
+        session = _mutate_session_payload(session_ref["waveform_path"], session_ref["session_name"], mutate)
         return _with_session_metadata({"status": "success", "data": {"group_name": key, **session["signal_groups"][key]}}, session)
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -1826,18 +1850,24 @@ def update_signal_group(
 ):
     """Update a named Signal Group in the selected Session."""
     try:
-        session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+        session_ref = _resolve_session(waveform_path=waveform_path, session_name=session_name)
         key = _validate_named_entity(group_name, "group_name")
-        group = session["signal_groups"].get(key)
-        if group is None:
-            return {"status": "error", "message": f"signal group not found: {key}"}
-        if signals is not None:
-            group["signals"] = list(dict.fromkeys(signals))
-        if description is not None:
-            group["description"] = description
-        session["signal_groups"][key] = group
-        session = _save_session_payload(session)
-        return _with_session_metadata({"status": "success", "data": {"group_name": key, **group}}, session)
+        updated_group: Dict[str, Any] = {}
+
+        def mutate(session: Dict[str, Any]) -> Dict[str, Any]:
+            group = session["signal_groups"].get(key)
+            if group is None:
+                raise ValueError(f"signal group not found: {key}")
+            if signals is not None:
+                group["signals"] = list(dict.fromkeys(signals))
+            if description is not None:
+                group["description"] = description
+            session["signal_groups"][key] = group
+            updated_group.update(group)
+            return session
+
+        session = _mutate_session_payload(session_ref["waveform_path"], session_ref["session_name"], mutate)
+        return _with_session_metadata({"status": "success", "data": {"group_name": key, **updated_group}}, session)
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -1846,12 +1876,17 @@ def update_signal_group(
 def delete_signal_group(group_name: str, waveform_path: Optional[str] = None, session_name: Optional[str] = None):
     """Delete a named Signal Group from the selected Session."""
     try:
-        session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+        session_ref = _resolve_session(waveform_path=waveform_path, session_name=session_name)
         key = _validate_named_entity(group_name, "group_name")
-        if key not in session["signal_groups"]:
-            return {"status": "error", "message": f"signal group not found: {key}"}
-        deleted = session["signal_groups"].pop(key)
-        session = _save_session_payload(session)
+        deleted: Dict[str, Any] = {}
+
+        def mutate(session: Dict[str, Any]) -> Dict[str, Any]:
+            if key not in session["signal_groups"]:
+                raise ValueError(f"signal group not found: {key}")
+            deleted.update(session["signal_groups"].pop(key))
+            return session
+
+        session = _mutate_session_payload(session_ref["waveform_path"], session_ref["session_name"], mutate)
         return _with_session_metadata({"status": "success", "data": {"group_name": key, **deleted}}, session)
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -1885,14 +1920,20 @@ def create_bus_concat(
 ):
     """Create a new bus by concatenating real or created signals."""
     try:
-        session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
-        session = vs_service.create_concat(
-            session,
-            signal_name=signal_name,
-            source_signals=source_signals,
-            description=description,
-        )
-        info = vs_service.get_info(signal_name, session)
+        session_ref = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+        info: Dict[str, Any] = {}
+
+        def mutate(session: Dict[str, Any]) -> Dict[str, Any]:
+            updated = vs_service.create_concat(
+                session,
+                signal_name=signal_name,
+                source_signals=source_signals,
+                description=description,
+            )
+            info.update(vs_service.get_info(signal_name, updated))
+            return updated
+
+        session = _mutate_session_payload(session_ref["waveform_path"], session_ref["session_name"], mutate)
         return _with_session_metadata({"status": "success", "data": info}, session)
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -1909,14 +1950,21 @@ def create_bus_slices(
 ):
     """Expand one bus into equal-width sub-buses in MSB-first order."""
     try:
-        session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
-        session, infos = vs_service.create_slices(
-            session,
-            signal_name_prefix=signal_name_prefix,
-            source_signal=source_signal,
-            slice_width=slice_width,
-            description=description,
-        )
+        session_ref = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+        infos: List[Dict[str, Any]] = []
+
+        def mutate(session: Dict[str, Any]) -> Dict[str, Any]:
+            updated, created_infos = vs_service.create_slices(
+                session,
+                signal_name_prefix=signal_name_prefix,
+                source_signal=source_signal,
+                slice_width=slice_width,
+                description=description,
+            )
+            infos.extend(created_infos)
+            return updated
+
+        session = _mutate_session_payload(session_ref["waveform_path"], session_ref["session_name"], mutate)
         return _with_session_metadata({"status": "success", "data": infos}, session)
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -1932,14 +1980,20 @@ def create_reversed_bus(
 ):
     """Create a new bus by reversing the bit order of an existing bus."""
     try:
-        session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
-        session = vs_service.create_reverse(
-            session,
-            signal_name=signal_name,
-            source_signal=source_signal,
-            description=description,
-        )
-        info = vs_service.get_info(signal_name, session)
+        session_ref = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+        info: Dict[str, Any] = {}
+
+        def mutate(session: Dict[str, Any]) -> Dict[str, Any]:
+            updated = vs_service.create_reverse(
+                session,
+                signal_name=signal_name,
+                source_signal=source_signal,
+                description=description,
+            )
+            info.update(vs_service.get_info(signal_name, updated))
+            return updated
+
+        session = _mutate_session_payload(session_ref["waveform_path"], session_ref["session_name"], mutate)
         return _with_session_metadata({"status": "success", "data": info}, session)
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -1957,16 +2011,22 @@ def create_bus_slice(
 ):
     """Create a new bus from an inclusive range of an existing bus."""
     try:
-        session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
-        session = vs_service.create_slice(
-            session,
-            signal_name=signal_name,
-            source_signal=source_signal,
-            msb=msb,
-            lsb=lsb,
-            description=description,
-        )
-        info = vs_service.get_info(signal_name, session)
+        session_ref = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+        info: Dict[str, Any] = {}
+
+        def mutate(session: Dict[str, Any]) -> Dict[str, Any]:
+            updated = vs_service.create_slice(
+                session,
+                signal_name=signal_name,
+                source_signal=source_signal,
+                msb=msb,
+                lsb=lsb,
+                description=description,
+            )
+            info.update(vs_service.get_info(signal_name, updated))
+            return updated
+
+        session = _mutate_session_payload(session_ref["waveform_path"], session_ref["session_name"], mutate)
         return _with_session_metadata({"status": "success", "data": info}, session)
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -2001,9 +2061,15 @@ def create_signal_expression(
       create_signal_expression("bus_sum", "bus_a + bus_b")
     """
     try:
-        session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
-        session = vs_service.create(session, signal_name, expression, description)
-        info = vs_service.get_info(signal_name, session)
+        session_ref = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+        info: Dict[str, Any] = {}
+
+        def mutate(session: Dict[str, Any]) -> Dict[str, Any]:
+            updated = vs_service.create(session, signal_name, expression, description)
+            info.update(vs_service.get_info(signal_name, updated))
+            return updated
+
+        session = _mutate_session_payload(session_ref["waveform_path"], session_ref["session_name"], mutate)
         return _with_session_metadata({"status": "success", "data": info}, session)
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -2019,9 +2085,15 @@ def update_signal_expression(
 ):
     """Update the expression or description of an existing virtual signal."""
     try:
-        session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
-        session = vs_service.update(session, signal_name, expression=expression, description=description)
-        info = vs_service.get_info(signal_name, session)
+        session_ref = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+        info: Dict[str, Any] = {}
+
+        def mutate(session: Dict[str, Any]) -> Dict[str, Any]:
+            updated = vs_service.update(session, signal_name, expression=expression, description=description)
+            info.update(vs_service.get_info(signal_name, updated))
+            return updated
+
+        session = _mutate_session_payload(session_ref["waveform_path"], session_ref["session_name"], mutate)
         return _with_session_metadata({"status": "success", "data": info}, session)
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -2035,8 +2107,12 @@ def delete_signal_expression(
 ):
     """Delete a virtual signal from the session."""
     try:
-        session = _resolve_session(waveform_path=waveform_path, session_name=session_name)
-        session = vs_service.delete(session, signal_name)
+        session_ref = _resolve_session(waveform_path=waveform_path, session_name=session_name)
+
+        def mutate(session: Dict[str, Any]) -> Dict[str, Any]:
+            return vs_service.delete(session, signal_name)
+
+        session = _mutate_session_payload(session_ref["waveform_path"], session_ref["session_name"], mutate)
         return _with_session_metadata({"status": "success", "data": {"deleted": signal_name}}, session)
     except Exception as e:
         return {"status": "error", "message": str(e)}
