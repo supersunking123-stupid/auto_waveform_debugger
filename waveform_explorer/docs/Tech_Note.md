@@ -98,6 +98,7 @@ Working flow:
 - Dispatch by `cmd` string and print one JSON response per request.
 
 The process model is intentionally simple: one process owns one loaded waveform.
+The daemon protocol itself is a single stdin/stdout stream: one JSON request line in, one JSON response line out. It does not include request IDs or out-of-order response handling, so callers that share one daemon process must serialize access around the full write/read transaction. The merged `agent_debug_automation` MCP layer does this with a per-daemon lock.
 
 ### 2. Waveform loading
 
@@ -271,6 +272,8 @@ Important constraint:
 ### One process owns one waveform
 
 The process model is not a general multi-waveform service. Each `wave_agent_cli` instance loads one waveform and answers repeated queries on it. This is what makes the daemon mode effective.
+
+The process is also not an internally concurrent multi-client server. Parallel agents can share the same loaded waveform through `agent_debug_automation`, but the wrapper serializes daemon requests because the underlying protocol is line-oriented and response order is implicit.
 
 ### FSDB is not treated like VCD/FST anymore
 

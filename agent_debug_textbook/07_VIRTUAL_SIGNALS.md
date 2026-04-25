@@ -15,7 +15,7 @@
 | `create_signal_expression` | Create a virtual signal by a Verilog-like expression over real or virtual signals |
 | `update_signal_expression` | Change the expression or description of an existing virtual signal |
 | `delete_signal_expression` | Remove a virtual signal |
-| `list_signal_expressions` | List all virtual signals in the active session |
+| `list_signal_expressions` | List all virtual signals in the selected session |
 
 ### Bus construction helpers
 
@@ -35,7 +35,7 @@ Once created, a virtual signal behaves like a real signal in:
 
 ## Key concepts
 
-**Virtual signals are session-persistent.**  They are stored in the active session and survive across tool calls in the same conversation. Listing them with `list_signal_expressions` shows all created signals, including bus-construction results.
+**Virtual signals are session-persistent.**  They are stored in the selected session and survive across tool calls. Listing them with `list_signal_expressions` shows all created signals, including bus-construction results. In multi-agent workflows, pass explicit `waveform_path` and `session_name` so virtual signals are created in the intended workspace.
 
 **Evaluation is event-driven and cached.**  A virtual signal is computed only at timestamps where at least one of its operands changes. The result is cached; subsequent queries for the same virtual signal reuse the cache. Cache is automatically invalidated when the expression or any dependency is updated or deleted.
 
@@ -273,13 +273,15 @@ Maximum chain depth is 16 levels. Circular dependencies (e.g., `v1 = v1 | top.c`
 ### Sequence E — Lifecycle management
 
 ```python
-# See all virtual signals in the active session
-list_signal_expressions()
+# See all virtual signals in the selected session
+list_signal_expressions(waveform_path="wave.fsdb", session_name="debug_view")
 
 # Fix a typo in an expression
 update_signal_expression(
     signal_name="aw_sent",
-    expression="top.u_axi.awvalid & top.u_axi.awready"
+    expression="top.u_axi.awvalid & top.u_axi.awready",
+    waveform_path="wave.fsdb",
+    session_name="debug_view"
 )
 
 # Remove a signal that is no longer needed

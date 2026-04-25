@@ -296,10 +296,16 @@ create_session(
     description="Targeted test: FIFO overflow corner case"
 )
 
-set_cursor(time=<failure_time>)
-create_bookmark(bookmark_name="overflow", time=<failure_time>)
+set_cursor(time=<failure_time>,
+           waveform_path="/home/qsun/agent_scratch/20260330_143012_fifo_overflow/wave.vcd",
+           session_name="fifo_overflow_isolated")
+create_bookmark(bookmark_name="overflow", time=<failure_time>,
+                waveform_path="/home/qsun/agent_scratch/20260330_143012_fifo_overflow/wave.vcd",
+                session_name="fifo_overflow_isolated")
 
 get_snapshot(
+    vcd_path="/home/qsun/agent_scratch/20260330_143012_fifo_overflow/wave.vcd",
+    session_name="fifo_overflow_isolated",
     signals=["tb_top.dut.wr_en", "tb_top.dut.full", "tb_top.dut.count"],
     time="BM_overflow"
 )

@@ -1,6 +1,6 @@
 # MCP Signatures
 
-This file lists the MCP tool signatures exposed by the local servers in this repo as of April 3, 2026.
+This file lists the MCP tool signatures exposed by the local servers in this repo as of April 25, 2026.
 
 ## Main Agent MCP
 
@@ -33,6 +33,9 @@ Default behavior:
 - Each waveform gets a `Default_Session` on first session-aware use.
 - If a session-aware waveform tool omits `vcd_path`, the active Session selects the waveform file.
 - The active Session is global, but each saved Session is waveform-bound.
+- For multi-agent use, callers should pass explicit `vcd_path` / `waveform_path` and `session_name` instead of relying on the global active Session.
+- Session mutations are serialized through a file lock and use atomic reload-mutate-save behavior, so same-session cursor, bookmark, signal-group, and created-signal updates do not lose concurrent changes.
+- Shared backend daemons are request-serialized by the MCP layer. One `rtl_trace serve` process may be reused for a DB path and one `wave_agent_cli` daemon may be reused for a waveform path, but each stdin/stdout transaction is protected by a per-backend lock.
 
 ### RTL trace tools
 
@@ -256,6 +259,11 @@ update_signal_group(group_name: str, signals: Optional[List[str]] = None, descri
 delete_signal_group(group_name: str, waveform_path: Optional[str] = None, session_name: Optional[str] = None)
 list_signal_groups(waveform_path: Optional[str] = None, session_name: Optional[str] = None)
 ```
+
+Concurrency behavior:
+- `create_session` rejects duplicate session names atomically for a waveform.
+- `set_cursor`, `move_cursor`, bookmark tools, signal-group tools, and created-signal tools reload the latest saved Session while holding the session-store lock before writing.
+- `switch_session` still updates one global active-session pointer; avoid it for independent multi-agent workflows unless changing the shared active context is intended.
 
 ### Virtual bus construction and expression tools
 

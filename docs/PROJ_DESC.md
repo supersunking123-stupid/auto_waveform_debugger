@@ -106,8 +106,17 @@ cd standalone_trace && ctest --test-dir build --output-on-failure
 ## Core Concepts
 
 - **Graph DB** (`rtl_trace.db`): Binary connectivity database built from RTL. Stores drivers, loads, hierarchy, and assignment reverse references.
-- **Waveform Daemon**: Long-lived `wave_agent_cli` process for one waveform; JSON query per line.
-- **Session**: Persisted waveform view (cursor, bookmarks, signal groups) bound to one waveform file.
+- **Waveform Daemon**: Long-lived `wave_agent_cli` process for one waveform; JSON query per line. The merged MCP layer serializes access to a shared daemon so multiple agents cannot interleave stdin/stdout protocol messages.
+- **Session**: Persisted waveform view (cursor, bookmarks, signal groups) bound to one waveform file. Session create/update/delete operations are protected by a file lock and same-session mutations use atomic reload-mutate-save transactions.
 - **Cross-link tools**: `trace_with_snapshot`, `explain_signal_at_time`, `rank_cone_by_time`, `explain_edge_cause` — combine structural trace with waveform evidence at a specific time.
 - **Signal mapping**: Structural paths (from graph DB) are mapped to waveform paths via exact match, `TOP.` variant, FSDB prefix-scoped page search, or packed-vector fallback.
 - **Ranking**: Heuristic scoring by closeness-to-T, activity, and stuckness. Not symbolic Boolean solving.
+
+## Multi-Agent Concurrency Model
+
+- Multiple agents may debug against the same read-only RTL graph DB and waveform through one MCP service.
+- The MCP layer reuses one `rtl_trace serve` process per `(binary, db_path)` and one `wave_agent_cli` daemon per waveform path, with per-backend locks around each request/response transaction.
+- Structural DB writes take an exclusive advisory lock, and DB reads take a shared advisory lock, so rebuilds and new readers do not overlap on a partially-written DB.
+- Session state is persisted under `agent_debug_automation/.session_store`; writes use a process/thread lock, `flock`, and unique temporary files. Cursor, bookmark, signal-group, and created-signal mutations reload the latest session while holding the lock before saving.
+- The active Session pointer remains global for backwards compatibility. For independent agents, pass explicit `waveform_path` and `session_name`; for collaboration, agents can intentionally share the same `session_name`.
+- `agent_debug_textbook/10_PARALLEL_DEBUG_ORCHESTRATION.md` defines the recommended multi-agent workflow: launch independent Debugger agents, wait for all conclusions or a default 20-minute timeout, then have an Orchestrator review every conclusion and generate a final report.

@@ -169,6 +169,18 @@ Use Playbook 09 as the authoritative procedure. At guide level, remember only th
 
 Playbook 09 defines the detailed creator-block checkpoints, subsystem-boundary evidence table, helper handoff, and stop criteria. Do not restate or improvise that workflow here.
 
+### Rule 3C - Use parallel multi-agent debug for high-value ambiguous failures
+
+When success rate matters more than minimizing compute, use the independent parallel flow in `10_PARALLEL_DEBUG_ORCHESTRATION.md`. This is different from supervised mode: supervised mode improves one investigation through continuous review, while parallel mode launches several independent Debugger agents and lets an Orchestrator compare their final conclusions.
+
+Use parallel mode when:
+
+- The bug is high value, ambiguous, or has several plausible root-cause regions.
+- A prior single-agent or supervised attempt reached a weak, low-confidence, or conflicting conclusion.
+- You want multiple independent investigations before deciding whether to patch RTL or testbench code.
+
+Default parallel mode launches 3 Debugger agents and uses a 20-minute wall-clock timeout. Each agent must follow the router and applicable playbooks, use an explicit per-agent `session_name`, and avoid reading other agents' intermediate work. The Orchestrator finishes when all agents return conclusions or the timeout expires, then writes a report that lists every agent's conclusion, including inconclusive, blocked, and timed-out runs.
+
 ### Rule 4 — Escalate in two steps: crawl first, simulate second
 
 If a component is suspicious and waveform debugging is proving difficult, do **not** jump directly from passive tracing to local simulation. First build the subsystem map; then, if the bug is still opaque, isolate the block in a local testbench.
@@ -462,9 +474,11 @@ If you have exhausted your hypothesis checklist and still cannot find the root c
 
 6. **Question the testbench (with caution — see Rule 14).** The testbench itself may be incorrect — wrong expected values, wrong timing constraints, or wrong stimulus. Rule 14 still applies: trust EDA-vendor VIP protocol checkers, but do not automatically treat home-grown models, assertions, or scoreboards as golden. Use the driver trace and waveform to decide whether the source is DUT RTL or testbench RTL.
 
-7. **Spawn a subagent for local verification (Rule 4).** Isolate the suspicious block and test it independently. Use this after the crawler pass if the system-level waveform is still too complex to debug efficiently.
+7. **Use parallel multi-agent debug when independent attempts are valuable.** If the bug is high value or several plausible root-cause regions remain, route to `10_PARALLEL_DEBUG_ORCHESTRATION.md` so multiple agents can investigate independently and an Orchestrator can aggregate the conclusions.
 
-8. **Ask for help.** If you have spent significant effort and are not making progress, summarize your findings and present them. A clear summary of what you have checked and eliminated is valuable even without a final answer.
+8. **Spawn a subagent for local verification (Rule 4).** Isolate the suspicious block and test it independently. Use this after the crawler pass if the system-level waveform is still too complex to debug efficiently.
+
+9. **Ask for help.** If you have spent significant effort and are not making progress, summarize your findings and present them. A clear summary of what you have checked and eliminated is valuable even without a final answer.
 
 ---
 

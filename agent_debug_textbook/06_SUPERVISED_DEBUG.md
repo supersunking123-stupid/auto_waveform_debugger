@@ -152,25 +152,27 @@ The first session the Debugger creates should capture the complete error scenari
 ```python
 # 1. Create the anchor session
 create_session(waveform_path="wave.fsdb", session_name="error_scenario")
-switch_session(session_name="error_scenario", waveform_path="wave.fsdb")
 
 # 2. Bookmark the failure time
-set_cursor(time=T_fail)
+set_cursor(time=T_fail, waveform_path="wave.fsdb", session_name="error_scenario")
 create_bookmark(bookmark_name="error_point", time=T_fail,
+                waveform_path="wave.fsdb", session_name="error_scenario",
                 description="<failure description + time precision note>")
 
 # 3. Snapshot all signals mentioned in the error message
-get_snapshot(signals=[...all signals from the error report...],
+get_snapshot(vcd_path="wave.fsdb", session_name="error_scenario",
+             signals=[...all signals from the error report...],
              time="BM_error_point", radix="hex")
 
 # 4. Create a signal group for the error interface
 create_signal_group(group_name="error_interface",
-                    signals=[...the signals just snapshotted...])
+                    signals=[...the signals just snapshotted...],
+                    waveform_path="wave.fsdb", session_name="error_scenario")
 ```
 
 ### Using the anchor
 
-- **At any point during debugging**, the Debugger can call `switch_session(session_name="error_scenario")` to return to the error context.
+- **At any point during debugging**, the Debugger can return to the error context by passing `waveform_path="wave.fsdb"` and `session_name="error_scenario"` to session-aware tools.
 - **Before concluding**, the Debugger must verify: "Does my root cause explanation account for every signal value in the error-scenario snapshot?" If not, the explanation is incomplete.
 - **On dead end**, the Supervisor instructs the Debugger: "Return to the error-scenario session. You've exhausted the `<signal_name>` branch. Pick a different signal from the error interface and trace that instead."
 
@@ -180,7 +182,7 @@ When the Debugger hits a dead end (two consecutive phases with no progress, a br
 
 ```
 1. Supervisor: "Return to error_scenario session."
-2. Debugger: switch_session(session_name="error_scenario")
+2. Debugger: use `waveform_path="wave.fsdb", session_name="error_scenario"` on the next session-aware calls.
 3. Supervisor: "Is this a branch dead end, or are you missing subsystem context?"
 4. If subsystem context is missing:
    - Supervisor: "Pause tracing. Run Playbook 08 using the design top module, then read the doc for the current subsystem."

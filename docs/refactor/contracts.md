@@ -141,6 +141,11 @@ delete_signal_group(group_name, waveform_path=None, session_name=None)
 list_signal_groups(waveform_path=None, session_name=None)
 ```
 
+Session concurrency contract:
+- Session mutations are serialized through the session store lock and perform atomic reload-mutate-save updates.
+- Same-session cursor, bookmark, signal-group, and created-signal updates must preserve concurrent changes from other agents.
+- `switch_session` changes one global active-session pointer; multi-agent clients should pass explicit `waveform_path` and `session_name` when they need independent context.
+
 ### Cross-link tools
 ```
 trace_with_snapshot(db_path, waveform_path=None, signal="", time=0, mode="drivers", trace_options=None, sample_offsets=None, clock_path=None, cycle_offsets=None, rank_window_before=None, rank_window_after=None, rtl_trace_bin=None, wave_cli_bin=None, session_name=None)

@@ -57,6 +57,8 @@ Phase 0 is mandatory. Before tracing any signal, you must either have a sufficie
 
 **For failures involving unknown (`X`) values**, route through `agent_debug_textbook/09_X_TRACING.md` to isolate the likely creator block via hierarchy-boundary walking before applying the standard Phase 1–4 flow.
 
+**For explicitly authorized parallel debug runs**, use `agent_debug_textbook/10_PARALLEL_DEBUG_ORCHESTRATION.md`: launch independent Debugger agents with distinct explicit session names, wait for all conclusions or the configured timeout, and produce an Orchestrator report listing every agent's conclusion.
+
 Efficiency defaults:
 - If you expect 3+ structural queries on the same DB, use `rtl_trace_serve_start/query/stop`.
 - If you need values for several signals at one time, use `get_snapshot` or `trace_with_snapshot`, not repeated `get_value_at_time`.

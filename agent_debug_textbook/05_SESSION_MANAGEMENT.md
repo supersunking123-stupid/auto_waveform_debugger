@@ -53,6 +53,8 @@
 
 **Active session:** A global pointer. When session-aware tools omit `session_name`, the active session is used. When they also omit `vcd_path`, the active session also determines the waveform file.
 
+**Concurrency:** Session writes are transaction-safe. Cursor, bookmark, signal-group, and created-signal updates reload the latest session state while holding a file lock, then save. This prevents lost updates when several agents intentionally share one session. The active session pointer is still global, so independent agents should pass explicit `waveform_path` / `vcd_path` and `session_name` instead of relying on `switch_session`.
+
 ---
 
 ## Common sequences
@@ -67,22 +69,25 @@ create_session(
     description="Investigating FIFO overflow in test_fail"
 )
 
-# 1b. Activate it. create_session() does not switch the active session.
-switch_session(session_name="bug_123_investigation",
-               waveform_path="sim_results/test_fail.fsdb")
-
-# 2. Set the cursor to the region of interest
-set_cursor(time=320000)
+# 2. Set the cursor to the region of interest.
+# Pass waveform_path/session_name explicitly so this works in multi-agent runs.
+set_cursor(time=320000,
+           waveform_path="sim_results/test_fail.fsdb",
+           session_name="bug_123_investigation")
 
 # 3. Create signal groups for signals you'll check repeatedly
 create_signal_group(
     group_name="fifo_interface",
     signals=["top.u_fifo.wr_en", "top.u_fifo.rd_en", "top.u_fifo.data_in",
-             "top.u_fifo.data_out", "top.u_fifo.count", "top.u_fifo.overflow"]
+             "top.u_fifo.data_out", "top.u_fifo.count", "top.u_fifo.overflow"],
+    waveform_path="sim_results/test_fail.fsdb",
+    session_name="bug_123_investigation"
 )
 
 # 4. Bookmark the known failure point
 create_bookmark(bookmark_name="overflow_event", time=320000,
+                waveform_path="sim_results/test_fail.fsdb",
+                session_name="bug_123_investigation",
                 description="FIFO overflow asserted")
 ```
 
@@ -90,17 +95,27 @@ create_bookmark(bookmark_name="overflow_event", time=320000,
 
 ```python
 # Jump to a bookmark
-set_cursor(time="BM_overflow_event")
+set_cursor(time="BM_overflow_event",
+           waveform_path="sim_results/test_fail.fsdb",
+           session_name="bug_123_investigation")
 
 # Read values at the cursor
-get_snapshot(signals=["fifo_interface"], signals_are_groups=True, time="Cursor")
+get_snapshot(vcd_path="sim_results/test_fail.fsdb",
+             session_name="bug_123_investigation",
+             signals=["fifo_interface"], signals_are_groups=True, time="Cursor")
 
 # Move backward by 1000 time units to check earlier state
-move_cursor(delta=-1000)
-get_snapshot(signals=["fifo_interface"], signals_are_groups=True, time="Cursor")
+move_cursor(delta=-1000,
+            waveform_path="sim_results/test_fail.fsdb",
+            session_name="bug_123_investigation")
+get_snapshot(vcd_path="sim_results/test_fail.fsdb",
+             session_name="bug_123_investigation",
+             signals=["fifo_interface"], signals_are_groups=True, time="Cursor")
 
 # Found something interesting — bookmark it
 create_bookmark(bookmark_name="rd_en_dropped", time="Cursor",
+                waveform_path="sim_results/test_fail.fsdb",
+                session_name="bug_123_investigation",
                 description="rd_en went low unexpectedly")
 ```
 
@@ -110,14 +125,13 @@ create_bookmark(bookmark_name="rd_en_dropped", time="Cursor",
 # List existing sessions
 list_sessions()
 
-# Switch to a different investigation
-switch_session(session_name="bug_456_timeout")
-
 # Check what bookmarks exist in this session
-list_bookmarks()
+list_bookmarks(waveform_path="sim_results/test_fail.fsdb",
+               session_name="bug_456_timeout")
 
-# Come back to the original investigation
-switch_session(session_name="bug_123_investigation")
+# Check the original investigation without changing global active state
+list_bookmarks(waveform_path="sim_results/test_fail.fsdb",
+               session_name="bug_123_investigation")
 ```
 
 ### Sequence D — Evolve signal groups during investigation
@@ -127,18 +141,24 @@ switch_session(session_name="bug_123_investigation")
 create_signal_group(
     group_name="suspects",
     signals=["top.u_consumer.ready", "top.u_consumer.state", "top.u_arbiter.grant"],
-    description="Signals suspected of causing FIFO overflow"
+    description="Signals suspected of causing FIFO overflow",
+    waveform_path="sim_results/test_fail.fsdb",
+    session_name="bug_123_investigation"
 )
 
 # Later, narrow it down
 update_signal_group(
     group_name="suspects",
     signals=["top.u_consumer.state"],
-    description="Confirmed: consumer STALL state is the root cause"
+    description="Confirmed: consumer STALL state is the root cause",
+    waveform_path="sim_results/test_fail.fsdb",
+    session_name="bug_123_investigation"
 )
 
 # Clean up groups no longer needed
-delete_signal_group(group_name="suspects")
+delete_signal_group(group_name="suspects",
+                    waveform_path="sim_results/test_fail.fsdb",
+                    session_name="bug_123_investigation")
 ```
 
 ---
@@ -149,17 +169,18 @@ delete_signal_group(group_name="suspects")
 |---|---|
 | Quick one-off question about a waveform | Let `Default_Session` be created automatically |
 | Investigating a specific bug | Create a named session with a description |
-| Comparing behavior across two waveforms | Create a session for each, switch between them |
+| Comparing behavior across two waveforms | Create a session for each and pass explicit waveform/session names |
 | Multiple people debugging different issues on the same waveform | Create separate named sessions |
+| Multiple agents collaborating on one issue | Share one named session intentionally; concurrent state updates are preserved |
 
 ---
 
 ## Tips
 
 - **Name sessions after bug IDs or investigation goals**, not waveform filenames. Example: `"bug_123_overflow"` not `"test_fail_session"`.
-- **`create_session` does not activate the session.** Call `switch_session(...)` after creation if the following tool calls should use that named session.
+- **`create_session` does not activate the session.** Prefer passing `waveform_path` / `vcd_path` and `session_name` explicitly. Use `switch_session(...)` only for single-agent interactive convenience or when intentionally changing global active context.
 - **Bookmark liberally.** Bookmarks are cheap, and `"BM_<name>"` references are more readable than raw time values in subsequent tool calls.
 - **Signal groups integrate with `get_snapshot`.** Use `signals_are_groups=True` to expand a group name into its full signal list automatically.
-- **Cursor is global.** `set_cursor` changes the cursor for the active session. If you are switching between sessions, the cursor context switches with you.
+- **Cursor is session-local.** `set_cursor` changes the cursor of the selected session. If you omit `session_name`, it changes the active session's cursor.
 - **Sessions are waveform-bound.** You cannot use a session created for `wave_a.fsdb` to query `wave_b.fsdb`. Create a separate session for each waveform file.
-- **Created signals (virtual signals) also live in the session.** When you create a handshake signal or a bus slice with the virtual signal tools, it persists in the active session alongside bookmarks and signal groups. Switching sessions switches the virtual signal context too. See `07_VIRTUAL_SIGNALS.md`.
+- **Created signals (virtual signals) also live in the session.** When you create a handshake signal or a bus slice with the virtual signal tools, it persists in the selected session alongside bookmarks and signal groups. See `07_VIRTUAL_SIGNALS.md`.

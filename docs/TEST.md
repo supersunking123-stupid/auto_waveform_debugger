@@ -152,7 +152,11 @@ Files:
   - session-aware `get_signal_overview`
   - auto-resolution plumbing through the MCP layer
   - concurrent reuse of keyed `rtl_trace serve` sessions
+  - serialized concurrent queries against one `rtl_trace serve` session
   - concurrent reuse of waveform daemons
+  - serialized concurrent queries against one waveform daemon
+  - concurrent session-store JSON writes with unique temporary files
+  - concurrent same-session bookmark updates without lost updates
   - non-FSDB full-namespace fallback for internal waveform mapping
   - trace / explain / snapshot cross-link flows
   - optional real NVDLA FSDB integration workflow

@@ -26,6 +26,7 @@ If at any point two consecutive tool results are empty or nonsensical, stop and 
 | **Root-Cause Analysis** | Find the source of a bug by combining structural and waveform analysis | `04_ROOT_CAUSE_ANALYSIS.md` |
 | **Session Management** | Set up, organize, or switch debugging workspaces (cursors, bookmarks, signal groups) | `05_SESSION_MANAGEMENT.md` |
 | **Supervised Debug** | Debug with a two-agent setup (Debugger + Supervisor) when single-agent attempts have failed or the model is prone to carelessness/hallucination | `06_SUPERVISED_DEBUG.md` |
+| **Parallel Multi-Agent Debug** | Launch several independent Debugger agents on the same bug, then aggregate and review their conclusions | `10_PARALLEL_DEBUG_ORCHESTRATION.md` |
 | **Virtual Signals** | Create derived signals (compound conditions, bus slices/concatenations) so that browsing and search tools can operate on them directly | `07_VIRTUAL_SIGNALS.md` |
 | **Design Mapping** | Obtain or generate architecture documentation for the full design or a subsystem before deep debug | `08_DESIGN_MAPPING.md` |
 | **X Tracing** | Find where a harmful `X` first becomes active by moving across parent/sibling hierarchy boundaries before deep cone tracing | `09_X_TRACING.md` |
@@ -43,10 +44,11 @@ Follow these rules to pick the right playbook:
 7. **"What caused this bug / failure / assertion?"** → Root-Cause Analysis
 8. **"Set a bookmark / create a signal group / switch session"** → Session Management
 9. **"Debug failed with single agent" / "Agent keeps making mistakes" / "Use supervised mode"** → Supervised Debug
-10. **"Create a handshake / condition / error-flag signal" / "Slice or reassemble a bus" / "Define a derived observable"** → Virtual Signals
-11. **"I need an overview / architecture map / subsystem document"** → Design Mapping
-12. **"No sufficient design doc exists for this debug scope"** → Design Mapping
-13. **"Where did this `X` come from?" / "`X`-filled write/read data" / "unknown payload is propagating"** → X Tracing first, then Root-Cause Analysis inside the isolated creator block while reusing the completed boundary evidence table from Playbook 09
+10. **"Launch multiple agents" / "Run independent debug sessions in parallel" / "Use an orchestrator to collect conclusions"** → Parallel Multi-Agent Debug
+11. **"Create a handshake / condition / error-flag signal" / "Slice or reassemble a bus" / "Define a derived observable"** → Virtual Signals
+12. **"I need an overview / architecture map / subsystem document"** → Design Mapping
+13. **"No sufficient design doc exists for this debug scope"** → Design Mapping
+14. **"Where did this `X` come from?" / "`X`-filled write/read data" / "unknown payload is propagating"** → X Tracing first, then Root-Cause Analysis inside the isolated creator block while reusing the completed boundary evidence table from Playbook 09
 
 ## Step 3 — Chaining playbooks
 
@@ -56,6 +58,7 @@ Some tasks require chaining. Common chains:
 - **Full root-cause debug** → Design Mapping if docs are missing or insufficient → Session Management → Root-Cause Analysis (which internally chains Structural Exploration + Waveform Browsing, and may chain Virtual Signals for reusable protocol events)
 - **Harmful `X` debug** → Design Mapping if docs are missing → Session Management → X Tracing → Root-Cause Analysis once the likely creator block is isolated, reusing the completed creator-block / subsystem-boundary evidence from Playbook 09
 - **Supervised root-cause debug** → Supervised Debug (wraps Root-Cause Analysis with a Supervisor agent reviewing each phase)
+- **Parallel root-cause debug** → Parallel Multi-Agent Debug (Orchestrator launches independent Root-Cause Analysis or X Tracing branches, waits for all conclusions or timeout, then aggregates the report)
 - **Design review / connectivity audit** → Structural Exploration → Waveform Browsing (verify structural understanding against simulation)
 - **Protocol or condition search** → Virtual Signals (define the handshake or condition as a named signal) → Waveform Browsing (search and count occurrences) → Signal Investigation (trace the real drivers of an anomalous event)
 - **Stuck inside one opaque subsystem** → Design Mapping → return to Root-Cause Analysis from the mapped subsystem boundary
@@ -73,6 +76,7 @@ Quick reference of which tools belong to which playbook. Use the tools listed in
 | Session Management | `create_session`, `list_sessions`, `get_session`, `switch_session`, `delete_session`, `set_cursor`, `move_cursor`, `get_cursor`, `create_bookmark`, `delete_bookmark`, `list_bookmarks`, `create_signal_group`, `update_signal_group`, `delete_signal_group`, `list_signal_groups` |
 | Virtual Signals | `create_signal_expression`, `update_signal_expression`, `delete_signal_expression`, `list_signal_expressions`, `create_bus_concat`, `create_bus_slice`, `create_bus_slices`, `create_reversed_bus` — plus all Waveform Browsing tools (they accept virtual signal names transparently) |
 | Supervised Debug | All tools from Root-Cause Analysis, used by the Debugger agent; Supervisor uses no MCP tools (review only) |
+| Parallel Multi-Agent Debug | Orchestrator uses Session Management for per-agent setup and collects reports; Debugger agents use the tools from Root-Cause Analysis or X Tracing through their assigned sessions |
 | Design Mapping | Crawler flow for full-design or subsystem docs: use `rtl-crawler` by default, and use `rtl-crawler-multi-agent` only when delegation is explicitly authorized. The skill flow uses `rtl_trace` compile/serve queries under the hood, but you should invoke the skill workflow rather than manually recreating it |
 | X Tracing | Waveform Browsing tools at instance boundaries, `find_edge` / `find_value_intervals` / `get_transitions` to locate the first harmful activation time, `rtl_trace hier` for parent/sibling movement, `rtl_trace trace` to confirm the structural owner of a boundary net, `whereis-instance` only for lookup after an instance is already known, plus Signal Investigation tools only after the likely creator instance is isolated |
 
@@ -87,6 +91,8 @@ Quick reference of which tools belong to which playbook. Use the tools listed in
 - **`TraceMode`** is `"drivers"` or `"loads"`.
 - If `vcd_path` is omitted in a session-aware tool, the active Session's waveform is used.
 - If no session exists yet, a `Default_Session` is created on first session-aware use.
+- **Multi-agent rule:** The active Session is a global pointer. In any supervised, delegated, or parallel-agent workflow, pass explicit `vcd_path` / `waveform_path` and `session_name` on session-aware calls instead of relying on `switch_session`.
+- Same-session cursor/bookmark/signal-group/virtual-signal mutations are transaction-safe, so agents may intentionally share a session. If agents are pursuing independent branches, use distinct `session_name` values.
 - **Time values are in units of the waveform's time precision — not nanoseconds.** Before passing any integer time to any tool, call `get_signal_info` on any signal and check the reported timescale. For the common `` `timescale 1ns/1ps `` setup, precision is 1 ps, so 100 ns must be passed as `100000`. Guessing the wrong unit silently queries the wrong time. See Rule 12 in `rtl_debug_guide.md` for the full explanation.
 
 ---

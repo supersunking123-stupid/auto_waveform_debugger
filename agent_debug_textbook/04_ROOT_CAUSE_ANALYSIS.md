@@ -119,9 +119,9 @@ Use these defaults unless you have a specific reason not to:
      entire debug. Every investigation branch starts here and must ultimately
      explain the signals captured in this snapshot.
      → create_session(waveform_path=<path>, session_name="error_scenario")
-     → switch_session(session_name="error_scenario", waveform_path=<path>)
-     → set_cursor(time=T_fail)
+     → set_cursor(time=T_fail, waveform_path=<path>, session_name="error_scenario")
      → create_bookmark(bookmark_name="error_point", time=T_fail,
+                        waveform_path=<path>, session_name="error_scenario",
                         description="<failure desc + time precision note>")
 
 1.3  Trace the structural driver chain of the failing signal BEFORE waveform
@@ -301,8 +301,11 @@ Use these defaults unless you have a specific reason not to:
 
 **Backtracking to the error-scenario anchor:** If a branch terminates at a correct signal (dead end), return to the error-scenario session and pick a different signal from the `error_interface` group to trace:
 ```
-switch_session(session_name="error_scenario")
-get_snapshot(signals=["error_interface"], signals_are_groups=True, time="BM_error_point")
+get_snapshot(vcd_path="wave.fsdb",
+             session_name="error_scenario",
+             signals=["error_interface"],
+             signals_are_groups=True,
+             time="BM_error_point")
 # Pick the next untried signal from the group and restart from Phase 2
 ```
 

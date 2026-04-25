@@ -72,6 +72,13 @@ The waveform tools operate through sessions that maintain state across queries.
 | **Bus reverse** | Reverses the bit order of a bus |
 | **Signal expression** | Creates a virtual signal from a Verilog-like expression (supports bitwise, logical, arithmetic, shift, and ternary operators) |
 
+Session and backend state are safe for shared MCP-service use by multiple agents:
+- Shared waveform and RTL serve backends serialize each request/response transaction.
+- Session writes use file locking and atomic reload-mutate-save updates to preserve concurrent cursor, bookmark, signal-group, and virtual-signal changes.
+- The active session pointer is still global; independent agents should provide explicit waveform and session names.
+
+The agent playbooks include a parallel debug orchestration workflow: an Orchestrator can launch several independent Debugger agents against the same bug, wait for every conclusion or a configured timeout, then generate a report that lists and reviews each agent's conclusion.
+
 ## Supported File Formats
 
 - **RTL source**: Verilog, SystemVerilog (parsed via slang)
