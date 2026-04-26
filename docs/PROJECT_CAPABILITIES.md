@@ -77,7 +77,7 @@ Session and backend state are safe for shared MCP-service use by multiple agents
 - Session writes use file locking and atomic reload-mutate-save updates to preserve concurrent cursor, bookmark, signal-group, and virtual-signal changes.
 - The active session pointer is still global; independent agents should provide explicit waveform and session names.
 
-The agent playbooks include a parallel debug orchestration workflow: an Orchestrator pre-creates per-agent sessions, warms the shared waveform backend once, launches several independent Debugger agents against the same bug, waits for every conclusion or a configured timeout, then generates a report that lists and reviews each agent's conclusion.
+The agent playbooks include a parallel debug orchestration workflow: an Orchestrator pre-creates per-agent sessions, warms the shared waveform backend once, strips orchestration-only directives from the user request, launches several independent Debugger agents against the same bug with the resulting serial-mode debug task, waits for every conclusion or a configured timeout, then generates a report that lists and reviews each agent's conclusion.
 
 ## Supported File Formats
 

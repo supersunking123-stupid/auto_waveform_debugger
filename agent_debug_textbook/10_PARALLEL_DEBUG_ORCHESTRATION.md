@@ -29,7 +29,7 @@ The Orchestrator owns the run control, not the detailed signal tracing. It:
 - Selects the applicable playbook chain for the bug
 - Creates per-agent sessions sequentially before launching Debugger agents
 - Warms the shared waveform backend once so agents do not all block on first FSDB open/indexing
-- Launches `agent_count` independent Debugger agents with identical shared facts and distinct `session_name` values
+- Launches `agent_count` independent Debugger agents with a serial-mode debug task derived from the user request, identical supplemental shared facts, and distinct `session_name` values
 - Monitors whether each agent has reached a terminal status
 - Stops the collection phase when all agents finish or `timeout_minutes` expires
 - Validates each agent output against the required `DEBUG_CONCLUSION` schema before treating it as finished
@@ -79,7 +79,9 @@ Before launching agents, the Orchestrator completes this checklist:
 7. If any session name already exists from an earlier run, either choose a new `session_prefix` or explicitly choose `reuse_existing_sessions=true` and record that stale state is being reused.
 8. If using fresh sessions, pre-create every per-agent session sequentially with `create_session(waveform_path="<waveform_path>", session_name="<session_prefix>__agent_<NN>")`. If session creation fails because the session already exists, choose a new prefix or switch explicitly to the reuse flow; other creation failures are startup blockers. If reusing existing sessions, verify every assigned session sequentially with `get_session(waveform_path="<waveform_path>", session_name="<session_prefix>__agent_<NN>")` instead of calling `create_session`.
 9. Warm the shared waveform backend once before launch. Prefer `get_signal_info` on a known clock or failure signal; if no signal is known yet, run a narrow `list_signals` query. Record the time precision if numeric times will be given to agents. If warm-up fails or times out, stop before launch and report a waveform startup blocker.
-10. Prepare one prompt per Debugger agent using the template below.
+10. Derive the serial-mode debug task from the user request. Preserve the actual debug request and failure facts, but remove orchestration-only directives before passing it to Debugger agents. Do not pass text such as "run parallel orchestration", "launch agents", "act as Orchestrator", "use Playbook 10", agent-count/timeout instructions, aggregation/reporting instructions for the Orchestrator, or other parallel-run control text.
+11. If removing orchestration-only text would leave no concrete debug task, synthesize a short serial-mode task from the verified failure facts and record that the task was synthesized.
+12. Prepare one prompt per Debugger agent using the template below.
 
 Do not launch agents before the architecture-doc gate, per-agent session setup, and shared waveform warm-up are complete. Parallelizing poorly oriented debug attempts usually creates several wrong narratives instead of one; parallelizing first-touch FSDB open/indexing usually creates three blocked agents instead of three investigations.
 
@@ -87,7 +89,7 @@ Do not launch agents before the architecture-doc gate, per-agent session setup, 
 
 ## Phase 1 - Launch Debugger agents
 
-Launch all Debugger agents as close together as possible so they explore independently. Each agent receives the same failure facts but a different `agent_id` and `session_name`.
+Launch all Debugger agents as close together as possible so they explore independently. Each agent receives the same serial-mode debug task and the same supplemental failure facts, but a different `agent_id` and `session_name`.
 
 The default startup model is a barrier:
 
@@ -100,14 +102,21 @@ Use leaf-created sessions only for small waveforms or special experiments. For l
 ### Debugger agent prompt template
 
 ```text
-You are Debugger Agent <agent_id> of <agent_count> in a parallel RTL debug run.
+You are Debugger Agent <agent_id> in an isolated RTL debug investigation.
 
 Read agent_debug_textbook/00_ROUTER.md first. Follow the selected playbooks exactly:
 - Primary playbook: <04_ROOT_CAUSE_ANALYSIS.md or 09_X_TRACING.md then 04_ROOT_CAUSE_ANALYSIS.md>
 - Supporting playbooks: <01/02/03/05/07/08 as needed>
 - General guide: agent_debug_textbook/rtl_debug_guide.md
 
-Shared facts:
+Serial-mode user debug task, with orchestration directives removed:
+<SERIAL_DEBUG_TASK_START>
+<debug_task_prompt_with_parallel_orchestration_text_removed>
+<SERIAL_DEBUG_TASK_END>
+
+Treat the serial-mode debug task above as your primary task, the same way you would in serial single-agent mode. The supplemental facts below provide verified execution context and your isolated session. If semantic debug intent conflicts with the supplemental facts, preserve the serial-mode task's intent. If execution details conflict, use the supplemental facts for `waveform_path`, `rtl_trace_db_path`, converted failure time or interval, time precision, architecture-doc paths, session assignment, deadline, and launch-wrapper safety constraints. Report any such conflict in `remaining_uncertainties` instead of silently ignoring it.
+
+Supplemental shared facts:
 - Failure description: <failure_description>
 - Waveform path: <waveform_path>
 - Structural DB path: <rtl_trace_db_path>
@@ -122,10 +131,11 @@ Your assigned session:
 - session_name: <session_prefix>__agent_<NN>
 
 Rules:
-- Do not call create_session during startup. The Orchestrator should already have created or verified your assigned session. If get_session fails for your assigned session, report `blocked` with the missing session details instead of starting a competing session-creation flow.
+- Do not call create_session during startup. Your assigned session should already have been created or verified before launch. If get_session fails for your assigned session, report `blocked` with the missing session details instead of starting a competing session-creation flow.
 - Use explicit waveform_path/vcd_path and session_name on every session-aware tool call.
 - Do not rely on switch_session.
 - Do not inspect or reuse other agents' intermediate notes or conclusions.
+- Do not launch, supervise, or manage other agents. If orchestration text such as "run parallel", "launch agents", or "aggregate agents" appears in your assigned debug task, treat that as a prompt-preparation error: ignore the orchestration directive, continue the serial debug task if one is still clear, and mention the issue in `remaining_uncertainties`. If no concrete serial debug task remains after ignoring orchestration text, return `status: blocked` with `root_cause_location: unresolved - prompt preparation error: no concrete serial debug task`.
 - Use MCP tools for structural and waveform evidence; do not substitute source reading for tracing.
 - Return the literal `DEBUG_CONCLUSION` block before the deadline, even if it is inconclusive or blocked. A markdown summary without this block does not count as a terminal conclusion.
 - If `status: concluded`, `root_cause_type` and `root_cause_location` must identify what caused the test failure precisely enough that a human can act on it. For RTL or testbench code bugs, `root_cause_location` must contain the source file, line, and statement or expression. If only a region or signal boundary is known, use `status: inconclusive` and set `root_cause_location: unresolved - <reason>`.

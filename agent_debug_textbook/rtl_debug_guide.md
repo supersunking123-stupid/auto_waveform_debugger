@@ -179,7 +179,7 @@ Use parallel mode when:
 - A prior single-agent or supervised attempt reached a weak, low-confidence, or conflicting conclusion.
 - You want multiple independent investigations before deciding whether to patch RTL or testbench code.
 
-Default parallel mode launches 3 Debugger agents and uses a 30-minute wall-clock timeout after launch. Before launch, the Orchestrator pre-creates per-agent sessions sequentially and warms the shared waveform backend once so the agents do not all block on first FSDB open/indexing. Each agent must follow the router and applicable playbooks, use an explicit per-agent `session_name`, and avoid reading other agents' intermediate work. The Orchestrator finishes when all agents return conclusions or the timeout expires, then writes a report that lists every agent's conclusion, including inconclusive, blocked, and timed-out runs.
+Default parallel mode launches 3 Debugger agents and uses a 30-minute wall-clock timeout after launch. Before launch, the Orchestrator pre-creates per-agent sessions sequentially and warms the shared waveform backend once so the agents do not all block on first FSDB open/indexing. The Orchestrator strips parallel-orchestration directives from the user request and gives each Debugger the resulting serial-mode debug task, plus supplemental shared facts and an explicit per-agent `session_name`. Each agent must follow the router and applicable playbooks and avoid reading other agents' intermediate work. The Orchestrator finishes when all agents return conclusions or the timeout expires, then writes a report that lists every agent's conclusion, including inconclusive, blocked, and timed-out runs.
 
 ### Rule 4 — Escalate in two steps: crawl first, simulate second
 
