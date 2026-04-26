@@ -1,5 +1,6 @@
 # Build outputs
 standalone_trace/build/
+standalone_trace/build_mimalloc/
 waveform_explorer/build/
 standalone_trace/slang_*.log
 standalone_trace/slang_mem_profile*.log

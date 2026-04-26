@@ -9,8 +9,10 @@
 | Parameter | Default | Meaning |
 |---|---|---|
 | `agent_count` | `3` | Number of independent Debugger agents to launch |
-| `timeout_minutes` | `20` | Wall-clock timeout for the whole parallel run |
+| `timeout_minutes` | `30` | Wall-clock timeout for the whole parallel run |
 | `session_prefix` | `<bug_id_or_timestamp>` | Unique prefix used to create per-agent session names |
+| `session_startup` | `orchestrator_precreate` | Orchestrator creates per-agent sessions sequentially before launch |
+| `waveform_warmup` | `required` | Orchestrator opens/indexes the shared waveform once before launch |
 | `share_intermediate_findings` | `false` | Debugger agents should not see each other's hypotheses before the Orchestrator review |
 
 **Prerequisites:** Same entry gates as `04_ROOT_CAUSE_ANALYSIS.md`: a compiled structural DB if structural tracing is needed, a waveform file, confirmed waveform time precision before time-based calls, and sufficient architecture context for the active debug scope. If architecture context is missing, run `08_DESIGN_MAPPING.md` before launching the parallel agents. If the failure involves harmful `X` propagation, each Debugger agent must route through `09_X_TRACING.md` before ordinary root-cause tracing.
@@ -25,10 +27,13 @@ The Orchestrator owns the run control, not the detailed signal tracing. It:
 
 - Performs the pre-flight checks in `00_ROUTER.md`
 - Selects the applicable playbook chain for the bug
+- Creates per-agent sessions sequentially before launching Debugger agents
+- Warms the shared waveform backend once so agents do not all block on first FSDB open/indexing
 - Launches `agent_count` independent Debugger agents with identical shared facts and distinct `session_name` values
 - Monitors whether each agent has reached a terminal status
 - Stops the collection phase when all agents finish or `timeout_minutes` expires
-- Collects every available agent conclusion, including inconclusive, blocked, and timed-out outcomes
+- Validates each agent output against the required `DEBUG_CONCLUSION` schema before treating it as finished
+- Collects every available agent conclusion, including inconclusive, blocked, timed-out, and non-compliant outcomes
 - Reviews the conclusions for consensus, disagreement, unsupported claims, and unique evidence
 - Writes the final parallel debug report
 
@@ -41,9 +46,11 @@ Each Debugger agent follows `00_ROUTER.md`, the selected playbooks, and `rtl_deb
 - Uses its assigned session name, for example `bug123__agent_01`
 - Passes explicit `waveform_path` / `vcd_path` and `session_name` on session-aware calls
 - Does not rely on `switch_session`
+- Does not call `create_session` during startup unless the Orchestrator explicitly chose leaf-created sessions
 - Does not inspect other agents' intermediate notes, sessions, or conclusions
 - Records bookmarks, signal groups, virtual signals, and summaries in its own session unless the Orchestrator explicitly asks agents to share a session
 - Returns the required conclusion schema before the deadline, even if the result is inconclusive
+- If it claims `status: concluded`, identifies the root-cause type and a precise root-cause location. For RTL or testbench code bugs, this should be a source file, line, and statement or expression. For stimulus, CDC/timing, configuration, or environment roots, this should be the exact interface, event, setting, or boundary that caused the failure.
 
 ---
 
@@ -53,6 +60,7 @@ Each Debugger agent follows `00_ROUTER.md`, the selected playbooks, and `rtl_deb
 - Independent branches should use distinct sessions: `<session_prefix>__agent_01`, `<session_prefix>__agent_02`, and so on. Include a timestamp or run ID in `session_prefix` unless the Orchestrator intentionally wants to reuse existing state.
 - Agents may intentionally share one session only when the Orchestrator wants collaborative state. That is not the default for this playbook.
 - The active Session pointer is global. In parallel mode, every session-aware tool call must pass explicit `waveform_path` or `vcd_path` and explicit `session_name`.
+- Do not let every Debugger agent perform first-touch waveform/session startup concurrently. Large FSDB open/indexing can become the bottleneck and make all agents appear idle.
 - Do not merge intermediate hypotheses while agents are still running. Cross-contamination reduces the value of independent attempts.
 - A majority conclusion is not automatically correct. The Orchestrator must judge evidence quality, not just vote count.
 
@@ -65,20 +73,29 @@ Before launching agents, the Orchestrator completes this checklist:
 1. Confirm the EDA MCP tool surface is available.
 2. Confirm the structural DB path if structural tracing or RCA will be used.
 3. Confirm the waveform path and expected failure time or failure interval.
-4. Confirm waveform time precision with `get_signal_info` if the Orchestrator will provide numeric times to agents.
-5. Confirm sufficient architecture documentation for the debug scope; otherwise run `08_DESIGN_MAPPING.md`.
-6. Route harmful-`X` failures to `09_X_TRACING.md`; route ordinary failures to `04_ROOT_CAUSE_ANALYSIS.md`.
-7. Choose `agent_count`, `timeout_minutes`, and `session_prefix`.
-8. Decide whether the Orchestrator will pre-create per-agent sessions or each Debugger agent will create its own assigned session. If a per-agent session name already exists from an earlier run, either choose a new `session_prefix` or explicitly record that stale state is being reused.
-9. Prepare one prompt per Debugger agent using the template below.
+4. Confirm sufficient architecture documentation for the debug scope; otherwise run `08_DESIGN_MAPPING.md`.
+5. Route harmful-`X` failures to `09_X_TRACING.md`; route ordinary failures to `04_ROOT_CAUSE_ANALYSIS.md`.
+6. Choose `agent_count`, `timeout_minutes`, and `session_prefix`.
+7. If any session name already exists from an earlier run, either choose a new `session_prefix` or explicitly choose `reuse_existing_sessions=true` and record that stale state is being reused.
+8. If using fresh sessions, pre-create every per-agent session sequentially with `create_session(waveform_path="<waveform_path>", session_name="<session_prefix>__agent_<NN>")`. If session creation fails because the session already exists, choose a new prefix or switch explicitly to the reuse flow; other creation failures are startup blockers. If reusing existing sessions, verify every assigned session sequentially with `get_session(waveform_path="<waveform_path>", session_name="<session_prefix>__agent_<NN>")` instead of calling `create_session`.
+9. Warm the shared waveform backend once before launch. Prefer `get_signal_info` on a known clock or failure signal; if no signal is known yet, run a narrow `list_signals` query. Record the time precision if numeric times will be given to agents. If warm-up fails or times out, stop before launch and report a waveform startup blocker.
+10. Prepare one prompt per Debugger agent using the template below.
 
-Do not launch agents before the architecture-doc gate is satisfied. Parallelizing poorly oriented debug attempts usually creates several wrong narratives instead of one.
+Do not launch agents before the architecture-doc gate, per-agent session setup, and shared waveform warm-up are complete. Parallelizing poorly oriented debug attempts usually creates several wrong narratives instead of one; parallelizing first-touch FSDB open/indexing usually creates three blocked agents instead of three investigations.
 
 ---
 
 ## Phase 1 - Launch Debugger agents
 
 Launch all Debugger agents as close together as possible so they explore independently. Each agent receives the same failure facts but a different `agent_id` and `session_name`.
+
+The default startup model is a barrier:
+
+1. Orchestrator creates or verifies all per-agent sessions sequentially.
+2. Orchestrator warms the waveform backend once and records the result.
+3. Orchestrator launches Debugger agents.
+
+Use leaf-created sessions only for small waveforms or special experiments. For large FSDBs, leaf-created sessions are a known failure mode because all agents can block before making evidence queries.
 
 ### Debugger agent prompt template
 
@@ -96,6 +113,7 @@ Shared facts:
 - Structural DB path: <rtl_trace_db_path>
 - Failure time or interval: <time_or_interval_in_waveform_units>
 - Time precision: <time_precision>
+- Waveform warm-up: <completed_or_failed_with_details>
 - Architecture docs to read: <doc_paths>
 - Relevant logs or assertions: <log_summary>
 - Deadline: <absolute_deadline_or_timeout_minutes_from_launch>
@@ -104,12 +122,13 @@ Your assigned session:
 - session_name: <session_prefix>__agent_<NN>
 
 Rules:
-- First create your assigned session with create_session(waveform_path="<waveform_path>", session_name="<session_prefix>__agent_<NN>") unless the Orchestrator says it has already been created. If creation fails because the session already exists, report the collision and use get_session/list_sessions to verify whether the Orchestrator intended to reuse it.
+- Do not call create_session during startup. The Orchestrator should already have created or verified your assigned session. If get_session fails for your assigned session, report `blocked` with the missing session details instead of starting a competing session-creation flow.
 - Use explicit waveform_path/vcd_path and session_name on every session-aware tool call.
 - Do not rely on switch_session.
 - Do not inspect or reuse other agents' intermediate notes or conclusions.
 - Use MCP tools for structural and waveform evidence; do not substitute source reading for tracing.
-- Return a conclusion before the deadline, even if it is inconclusive or blocked.
+- Return the literal `DEBUG_CONCLUSION` block before the deadline, even if it is inconclusive or blocked. A markdown summary without this block does not count as a terminal conclusion.
+- If `status: concluded`, `root_cause_type` and `root_cause_location` must identify what caused the test failure precisely enough that a human can act on it. For RTL or testbench code bugs, `root_cause_location` must contain the source file, line, and statement or expression. If only a region or signal boundary is known, use `status: inconclusive` and set `root_cause_location: unresolved - <reason>`.
 
 Required final schema:
 
@@ -118,6 +137,8 @@ agent_id: <agent_id>
 session_name: <session_name>
 status: concluded | inconclusive | blocked
 root_cause_summary: <one paragraph>
+root_cause_type: rtl_design_bug | testbench_stimulus | testbench_model_bug | cdc_timing | configuration | environment | unknown
+root_cause_location: <file:line: statement/expression, interface event, CDC boundary, configuration item, environment dependency, or unresolved - reason>
 confidence: high | medium | low
 primary_evidence:
 - <tool-backed evidence item>
@@ -133,7 +154,7 @@ recommended_next_steps:
 - <next action>
 ```
 
-If an agent reaches the deadline without returning this schema, the Orchestrator records it as `timed_out` and includes whatever partial summary is available.
+If an agent returns text without this schema before the deadline, the Orchestrator must not mark it finished. If time remains, re-prompt the same agent to rewrite its conclusion in the required schema. If the deadline expires without a valid schema, record it as `non_compliant` or `timed_out` and include whatever partial summary is available.
 
 ---
 
@@ -143,7 +164,7 @@ The Orchestrator monitors each Debugger agent until one of the finish conditions
 
 Finish conditions:
 
-- All agents return `DEBUG_CONCLUSION`
+- All agents return valid `DEBUG_CONCLUSION` blocks
 - `timeout_minutes` expires
 
 Status values:
@@ -155,13 +176,16 @@ Status values:
 | `inconclusive` | Agent finished but could not identify a root cause |
 | `blocked` | Agent could not proceed because a required tool, DB, waveform, or document was unavailable |
 | `timed_out` | The Orchestrator deadline expired before the agent returned a conclusion |
+| `non_compliant` | Agent returned output, but it did not contain a valid `DEBUG_CONCLUSION` schema before the deadline |
 
 Monitoring rules:
 
-- Default timeout is 20 minutes from agent launch.
+- Default timeout is 30 minutes from agent launch. Orchestrator setup time, including session setup and waveform warm-up, is reported separately and does not count as agent investigation time.
 - Do not silently extend the timeout. If more time is needed, record the extension reason or ask the user.
 - Do not stop other agents just because one agent has a plausible answer. Continue until all agents finish or the timeout expires.
 - Preserve partial results from blocked or timed-out agents; they can still contain useful eliminations or evidence.
+- Treat a report as terminal only when it contains a parseable `DEBUG_CONCLUSION` block with all required fields. In particular, `root_cause_type` and `root_cause_location` are required even when the location is explicitly unresolved.
+- If an agent omits the schema or a required field and time remains, send a schema-fix prompt to that agent. Do not let a non-compliant report satisfy the `all_agents_finished` condition.
 
 ---
 
@@ -170,7 +194,7 @@ Monitoring rules:
 After the finish condition is met, the Orchestrator collects:
 
 - Every `DEBUG_CONCLUSION` from finished agents
-- Status and partial notes from blocked or timed-out agents
+- Status and partial notes from blocked, timed-out, or non-compliant agents
 - Session names and important artifacts for each agent
 - Tool failures or environment blockers that affected any agent
 
@@ -190,8 +214,11 @@ Required checks:
 4. **Conflict check:** Which conclusions disagree, and what evidence would distinguish them?
 5. **Quality check:** Which claims depend on assumptions, failed tools, or missing architecture context?
 6. **Coverage check:** Which hypotheses were eliminated by multiple agents, and which remain untested?
+7. **Precise-location check:** For every `concluded` agent, does `root_cause_type` match the claimed cause, does `root_cause_location` identify the actionable source statement, stimulus event, CDC boundary, configuration item, or environment dependency, and does the causal chain prove why that location caused the observed failure?
 
 The Orchestrator may choose a "most supported root cause", but only if the evidence supports it. If all agents are inconclusive or conflicting, report that directly and recommend the next investigation step.
+
+If all completed agents are `inconclusive`, or if the strongest consensus only identifies a region or signal boundary rather than a precise root-cause location, the Orchestrator must use remaining time for a focused continuation before finalizing. The continuation may re-prompt one or more existing agents or launch a follow-up branch targeted at the best current frontier. Only finalize without a precise root-cause location when the Orchestrator deadline expires, a required artifact is missing, or the report explicitly records why the location cannot be proven.
 
 ---
 
@@ -206,6 +233,8 @@ The Orchestrator may choose a "most supported root cause", but only if the evide
 - Structural DB: <rtl_trace_db_path>
 - Agent count: <N>
 - Timeout: <timeout_minutes> minutes
+- Startup status: <sessions_created_and_waveform_warmed | sessions_verified_and_waveform_warmed | startup_blocked>
+- Startup duration: <duration>
 - Finish condition: all_agents_finished | timeout
 - Playbooks used: <playbook list>
 
@@ -214,6 +243,9 @@ The Orchestrator may choose a "most supported root cause", but only if the evide
 |---|---|---|---|---|---|
 | agent_<NN> | <session> | <status> | <summary> | <confidence> | <evidence> |
 | ...repeat one row for every launched agent... | <session> | <status> | <summary> | <confidence> | <evidence> |
+
+## Root Cause Location
+<Root-cause type and actionable location: file:line statement/expression, stimulus event, CDC boundary, configuration item, environment dependency, or `unresolved` with the specific blocker. Do not report a regional signal boundary as a precise root-cause location.>
 
 ## Orchestrator Review
 <Analysis of evidence quality, unsupported claims, and whether conclusions follow from tool results.>
@@ -250,6 +282,8 @@ Repeat one appendix section for every launched agent, including timed-out and bl
 - **Premature convergence:** The Orchestrator shares one agent's theory too early and collapses independent search diversity.
 - **Session collision:** Agents rely on the global active Session and overwrite each other's cursor or bookmarks. Use explicit per-agent sessions.
 - **Hidden timeout:** The report only lists successful agents and omits timed-out runs. Always list every agent.
+- **Schema drift:** A useful markdown report lacks `DEBUG_CONCLUSION` or omits required fields. Re-prompt before the deadline; otherwise record it as `non_compliant` and do not count it as finished.
+- **Regional stop:** Agents agree on a subsystem boundary but do not identify a precise root-cause location. Use remaining time for focused continuation instead of reporting regional localization as root cause.
 - **Architecture-doc skip:** Agents start deep waveform tracing without knowing the relevant hierarchy boundaries. Run Playbook 08 first.
 - **Vote over evidence:** The most common conclusion is not necessarily the best one. Prefer the conclusion with the clearest causal chain and strongest tool-backed evidence.
 
