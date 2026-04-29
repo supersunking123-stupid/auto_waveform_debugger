@@ -81,7 +81,7 @@ Before launching agents, the Orchestrator completes this checklist:
 8. If using fresh sessions, pre-create every per-agent session sequentially with `create_session(waveform_path="<waveform_path>", session_name="<session_prefix>__agent_<NN>")`. If session creation fails because the session already exists, choose a new prefix or switch explicitly to the reuse flow; other creation failures are startup blockers. If reusing existing sessions, verify every assigned session sequentially with `get_session(waveform_path="<waveform_path>", session_name="<session_prefix>__agent_<NN>")` instead of calling `create_session`.
 9. Warm the shared waveform backend once before launch. Prefer `get_signal_info` on a known clock or failure signal; if no signal is known yet, run a narrow `list_signals` query. Record the time precision if numeric times will be given to agents. If warm-up fails or times out, stop before launch and report a waveform startup blocker.
 10. Identify the exact serial single-agent prompt body. If the launch wrapper provides a generated serial prompt, use that full text as the child prompt prefix. Copy it as literally as possible, including the opening sentence, task, artifact list, source links, textbook list, constraints, safety rules, helper-agent permissions, and serial final-answer instructions. Do not summarize, reorder, rewrite, or selectively transfer those sections.
-11. Remove only text that is truly orchestration-only and would make a child agent act as an Orchestrator, such as "run parallel orchestration", "launch agents", "act as Orchestrator", an instruction to use Playbook 10 as the active workflow, agent-count/timeout control instructions, aggregation/reporting instructions for the Orchestrator, or other parallel-run control text. Do not remove ordinary serial debug instructions or passive reference material, such as a textbook list that happens to name `10_PARALLEL_DEBUG_ORCHESTRATION.md`. If a safety rule such as "Do not read `bug_inject/`" is present in the serial prompt, it must remain present in the child prompt.
+11. Remove only text that is truly orchestration-only and would make a child agent act as an Orchestrator, such as "run parallel orchestration", "launch agents", "act as Orchestrator", an instruction to use Playbook 10 as the active workflow, parallel-run agent-count controls, parallel-run investigation deadline controls, aggregation/reporting instructions for the Orchestrator, or other parallel-run control text. Do not remove ordinary serial debug instructions or passive reference material, such as a textbook list that happens to name `10_PARALLEL_DEBUG_ORCHESTRATION.md`. Preserve DUT, testbench, simulation, or protocol timeout failures and all timestamp/timing facts; those are debug facts, not orchestration controls. If a safety rule such as "Do not read `bug_inject/`" is present in the serial prompt, it must remain present in the child prompt.
 12. If no explicit serial prompt body is available, synthesize a short serial-mode prompt from the verified failure facts, record that the task was synthesized, and keep the synthesized prompt in the same shape as a normal serial prompt.
 13. Prepare one prompt per Debugger agent by appending only the minimal parallel appendix shown below.
 
@@ -113,13 +113,20 @@ The generated child prompt must start with the serial prompt body. Nothing, incl
 Parallel debug appendix:
 - agent_id: <agent_id>
 - session_name: <session_prefix>__agent_<NN>
+- session_startup: orchestrator_precreate | reused_existing | leaf_created
 - deadline: <absolute_deadline_or_timeout_minutes_from_launch>
+
+Execution overrides:
+- Omit this section when there are no verified overrides.
+- Use this section only for execution facts verified during Orchestrator pre-flight, such as corrected waveform_path, rtl_trace_db_path, failure_time_or_interval in waveform precision units, time_precision, architecture_docs, or relevant_log_summary.
+- Apply only the exact fields listed here; do not treat this section as a replacement for the serial prompt's debug intent.
 
 The serial prompt above is your debug assignment. Treat it the same way you would in serial single-agent mode. The appendix only adds the session isolation and terminal reporting requirements needed for this parallel run.
 
 Parallel-only rules:
-- Your assigned session should already have been created or verified before launch. Do not call `create_session` during startup. If `get_session` fails for your assigned session, report `blocked` with the missing session details instead of starting a competing session-creation flow.
-- Use the waveform path and structural DB path from the serial prompt unless this appendix explicitly lists an execution override.
+- If `session_startup` is `orchestrator_precreate` or `reused_existing`, your assigned session should already have been created or verified before launch. Do not call `create_session` during startup. If `get_session` fails for your assigned session, report `blocked` with the missing session details instead of starting a competing session-creation flow.
+- If `session_startup` is `leaf_created`, create only your assigned session once with the assigned `session_name`, then continue with explicit session-aware calls. Do not create any other session.
+- Use waveform paths, structural DB paths, failure times, time precision, architecture docs, and log summaries from the serial prompt unless this appendix explicitly lists an execution override. When an override exists, use it for execution and record the conflict in `remaining_uncertainties`; do not change the serial prompt's debug intent.
 - Use explicit `waveform_path` or `vcd_path` and explicit `session_name` on every session-aware tool call.
 - Do not rely on `switch_session`.
 - Do not inspect or reuse other agents' intermediate notes, sessions, or conclusions.
