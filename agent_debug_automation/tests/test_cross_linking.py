@@ -13,8 +13,10 @@ from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[2]
-NVDLA_WAVEFORM = Path("/home/qsun/DVT/nvdla/hw/verif/sim_vip/cc_alexnet_conv5_relu5_int16_dtest_cvsram/wave.fsdb")
-NVDLA_RTL_TRACE_DB = Path("/home/qsun/DVT/nvdla/hw/verif/sim_vip/rtl_trace.db")
+# Small regenerable fixture (design + FSDB + rtl_trace DB) built by test_cases/make_fixture.sh
+FIXTURE_WAVEFORM = ROOT / "test_cases" / "wave.fsdb"
+FIXTURE_RTL_TRACE_DB = ROOT / "test_cases" / "rtl_trace.db"
+FIXTURE_MAKE_SCRIPT = ROOT / "test_cases" / "make_fixture.sh"
 sys.path.insert(0, str(ROOT))
 
 from agent_debug_automation import agent_debug_automation_mcp as mcp_mod
@@ -1891,14 +1893,35 @@ class CrossLinkingTests(unittest.TestCase):
             self.assertIn("no", result.get("message", "").lower() + "no")
 
 
-@unittest.skipUnless(NVDLA_WAVEFORM.exists() and NVDLA_RTL_TRACE_DB.exists(), "NVDLA FSDB/rtl_trace.db not available")
-class NvdlaSessionIntegrationTests(unittest.TestCase):
-    waveform_path = str(NVDLA_WAVEFORM)
-    db_path = str(NVDLA_RTL_TRACE_DB)
-    rlast = "top.nvdla_top.u_nvdla_cvsram_axi_svt_bind.mon_if.master_if[0].rlast"
-    rready = "top.nvdla_top.u_nvdla_cvsram_axi_svt_bind.mon_if.master_if[0].rready"
-    rid = "top.nvdla_top.u_nvdla_cvsram_axi_svt_bind.mon_if.master_if[0].rid[7:0]"
-    edge_time = 307050000
+class FixtureSessionIntegrationTests(unittest.TestCase):
+    """Session/cross-link workflow on a real FSDB + rtl_trace DB.
+
+    Uses the generated cross-link fixture (test_cases/make_fixture.sh). The
+    fixture is built on demand; the class is skipped only if it cannot be built
+    (for example VCS/Verdi are not installed).
+    """
+
+    waveform_path = str(FIXTURE_WAVEFORM)
+    db_path = str(FIXTURE_RTL_TRACE_DB)
+    valid = "top.hs_mon.valid_in"
+    ready = "top.hs_mon.ready_in"
+    ident = "top.hs_mon.id_in[7:0]"
+    # Clock posedge at which ready_in and valid_in fall (see test_cases/cross_link_common.py)
+    edge_time = 175000
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            proc = subprocess.run(
+                [str(FIXTURE_MAKE_SCRIPT)], capture_output=True, text=True, timeout=900
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise unittest.SkipTest(f"cross-link fixture not available: {exc}")
+        if proc.returncode != 0 or not (FIXTURE_WAVEFORM.exists() and FIXTURE_RTL_TRACE_DB.exists()):
+            raise unittest.SkipTest(
+                f"cross-link fixture could not be built (run {FIXTURE_MAKE_SCRIPT} --force): "
+                f"{(proc.stdout + proc.stderr)[-500:]}"
+            )
 
     def setUp(self):
         for daemon in mcp_mod.wave_daemons.values():
@@ -1917,12 +1940,12 @@ class NvdlaSessionIntegrationTests(unittest.TestCase):
     def test_real_fsdb_session_workflow(self):
         create_session = mcp_mod.create_session(
             self.waveform_path,
-            "nvdla_debug",
-            "integration regression on real FSDB",
+            "fixture_debug",
+            "integration regression on generated fixture FSDB",
         )
         self.assertEqual(create_session["status"], "success")
 
-        switch_session = mcp_mod.switch_session("nvdla_debug", waveform_path=self.waveform_path)
+        switch_session = mcp_mod.switch_session("fixture_debug", waveform_path=self.waveform_path)
         self.assertEqual(switch_session["status"], "success")
 
         set_cursor = mcp_mod.set_cursor(self.edge_time, waveform_path=self.waveform_path)
@@ -1930,7 +1953,7 @@ class NvdlaSessionIntegrationTests(unittest.TestCase):
         self.assertEqual(set_cursor["data"]["cursor_time"], self.edge_time)
 
         bookmark = mcp_mod.create_bookmark(
-            "rlast_edge",
+            "ready_fall_edge",
             "Cursor",
             waveform_path=self.waveform_path,
             description="Known real edge for integration test",
@@ -1938,29 +1961,30 @@ class NvdlaSessionIntegrationTests(unittest.TestCase):
         self.assertEqual(bookmark["status"], "success")
 
         group = mcp_mod.create_signal_group(
-            "axi_read_rsp",
-            [self.rlast, self.rready, self.rid],
+            "handshake_bundle",
+            [self.valid, self.ready, self.ident],
             waveform_path=self.waveform_path,
-            description="Real FSDB bundle",
+            description="Fixture handshake bundle",
         )
         self.assertEqual(group["status"], "success")
 
         snapshot = mcp_mod.get_snapshot(
             vcd_path=self.waveform_path,
-            signals=["axi_read_rsp"],
-            time="BM_rlast_edge",
+            signals=["handshake_bundle"],
+            time="BM_ready_fall_edge",
             signals_are_groups=True,
         )
         self.assertEqual(snapshot["status"], "success")
         self.assertEqual(snapshot["resolved_time"]["resolved_time"], self.edge_time)
-        self.assertEqual(snapshot["resolved_signals"]["expanded_signals"], [self.rlast, self.rready, self.rid])
-        self.assertEqual(snapshot["data"][self.rlast], "falling")
-        self.assertEqual(snapshot["data"][self.rready], "1")
-        self.assertEqual(snapshot["data"][self.rid], "h09")
+        self.assertEqual(snapshot["resolved_signals"]["expanded_signals"], [self.valid, self.ready, self.ident])
+        self.assertEqual(snapshot["data"][self.valid], "falling")
+        self.assertEqual(snapshot["data"][self.ready], "falling")
+        # id_in increments on the same edge, so a multi-bit signal reports "changing"
+        self.assertEqual(snapshot["data"][self.ident], "changing")
 
         value = mcp_mod.get_value_at_time(
             vcd_path=self.waveform_path,
-            path=self.rlast,
+            path=self.ready,
             time="Cursor",
         )
         self.assertEqual(value["status"], "success")
@@ -1968,7 +1992,7 @@ class NvdlaSessionIntegrationTests(unittest.TestCase):
 
         edge = mcp_mod.find_edge(
             vcd_path=self.waveform_path,
-            path=self.rlast,
+            path=self.ready,
             edge_type="anyedge",
             start_time="Cursor",
             direction="backward",
@@ -1979,7 +2003,7 @@ class NvdlaSessionIntegrationTests(unittest.TestCase):
         explanation = mcp_mod.explain_edge_cause(
             db_path=self.db_path,
             waveform_path=self.waveform_path,
-            signal=self.rlast,
+            signal=self.ready,
             time="Cursor",
             edge_type="anyedge",
             direction="backward",
@@ -1990,31 +2014,31 @@ class NvdlaSessionIntegrationTests(unittest.TestCase):
         self.assertEqual(explanation["waveform"]["edge_context"]["value_at_edge"], "falling")
         self.assertEqual(
             explanation["explanations"]["top_candidate"]["endpoint_path"],
-            "top.nvdla_top.u_nvdla_cvsram_axi_svt_bind.nvdla_core2cvsram_r_rlast",
+            "top.dut.u_fifo.wr_ready",
         )
 
         second_session = mcp_mod.create_session(
             self.waveform_path,
-            "nvdla_alt",
+            "fixture_alt",
             "session isolation regression",
         )
         self.assertEqual(second_session["status"], "success")
-        mcp_mod.switch_session("nvdla_alt", waveform_path=self.waveform_path)
+        mcp_mod.switch_session("fixture_alt", waveform_path=self.waveform_path)
         alt_cursor_before = mcp_mod.get_cursor(waveform_path=self.waveform_path)
         self.assertEqual(alt_cursor_before["data"]["cursor_time"], 0)
         mcp_mod.set_cursor(self.edge_time - 1, waveform_path=self.waveform_path)
         alt_cursor_after = mcp_mod.get_cursor(waveform_path=self.waveform_path)
         self.assertEqual(alt_cursor_after["data"]["cursor_time"], self.edge_time - 1)
 
-        mcp_mod.switch_session("nvdla_debug", waveform_path=self.waveform_path)
+        mcp_mod.switch_session("fixture_debug", waveform_path=self.waveform_path)
         restored_cursor = mcp_mod.get_cursor(waveform_path=self.waveform_path)
         self.assertEqual(restored_cursor["data"]["cursor_time"], self.edge_time)
 
-        delete_bookmark = mcp_mod.delete_bookmark("rlast_edge", waveform_path=self.waveform_path, session_name="nvdla_debug")
+        delete_bookmark = mcp_mod.delete_bookmark("ready_fall_edge", waveform_path=self.waveform_path, session_name="fixture_debug")
         self.assertEqual(delete_bookmark["status"], "success")
-        delete_group = mcp_mod.delete_signal_group("axi_read_rsp", waveform_path=self.waveform_path, session_name="nvdla_debug")
+        delete_group = mcp_mod.delete_signal_group("handshake_bundle", waveform_path=self.waveform_path, session_name="fixture_debug")
         self.assertEqual(delete_group["status"], "success")
-        delete_alt = mcp_mod.delete_session("nvdla_alt", waveform_path=self.waveform_path)
+        delete_alt = mcp_mod.delete_session("fixture_alt", waveform_path=self.waveform_path)
         self.assertEqual(delete_alt["status"], "success")
 
 

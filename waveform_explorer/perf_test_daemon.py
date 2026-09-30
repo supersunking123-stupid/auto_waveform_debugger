@@ -1,11 +1,13 @@
 import time
 import os
+from pathlib import Path
 from daemon_client import WaveformDaemon
 
 # Paths
 VCD_PATH = os.path.join(os.path.dirname(__file__), "timer_tb.vcd")
-LARGE_VCD_PATH = "/home/qsun/AI_PROJ/auto_waveform_debugger/Cores-VeeR-EH1/sim.vcd"
-FST_PATH = "/home/qsun/AI_PROJ/auto_waveform_debugger/Cores-VeeR-EH1/sim.fst"
+_VEER_DIR = Path(__file__).resolve().parents[1] / "Cores-VeeR-EH1"
+LARGE_VCD_PATH = str(_VEER_DIR / "sim.vcd")
+FST_PATH = str(_VEER_DIR / "sim.fst")
 
 def test_performance(vcd_path):
     print(f"--- Benchmarking (Daemon Mode): {vcd_path} ---")

@@ -4,14 +4,15 @@ Test Case 26: Cross-Link Non-Clock Active Signal
 Phase 11: Non-Clock Active Signal Case
 """
 
-import os
 import sys
 import unittest
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT_DIR))
+sys.path.insert(0, str(ROOT_DIR / "test_cases"))
 
+import cross_link_common as fx  # noqa: E402
 from agent_debug_automation import agent_debug_automation_mcp as mcp_mod
 
 
@@ -22,24 +23,20 @@ class NonClockActiveSignalTests(unittest.TestCase):
     def setUpClass(cls):
         cls.test_cases_dir = Path(__file__).resolve().parent
         cls.root_dir = Path(__file__).resolve().parents[1]
-        cls.db_path = str(cls.root_dir / "rtl_trace.db")
-        cls.waveform_path = str(cls.root_dir / "wave.fsdb")
-        cls.rtl_trace_bin = str(cls.root_dir.parent / "standalone_trace" / "build" / "rtl_trace")
-        cls.wave_cli_bin = str(cls.root_dir.parent / "waveform_explorer" / "build" / "wave_agent_cli")
-        cls.time = 399970000
+        cls.db_path = fx.DB_PATH
+        cls.waveform_path = fx.WAVE_PATH
+        cls.rtl_trace_bin = fx.RTL_TRACE_BIN
+        cls.wave_cli_bin = fx.WAVE_CLI_BIN
+        cls.time = fx.T_REF
 
         # Candidate signals
         cls.candidates = [
-            "top.mem0_rd_bw_mon.ready_in",
-            "top.mem0_rd_bw_mon.valid_in",
+            fx.READY,
+            fx.VALID,
         ]
 
-        for path, name in [(cls.db_path, "rtl_trace.db"), 
-                           (cls.waveform_path, "wave.fsdb"),
-                           (cls.rtl_trace_bin, "rtl_trace"),
-                           (cls.wave_cli_bin, "wave_agent_cli")]:
-            if not os.path.exists(path):
-                raise FileNotFoundError(f"{name} not found: {path}")
+        # Build the fixture on demand (no-op when up to date)
+        fx.ensure_fixture()
 
     def setUp(self):
         mcp_mod.wave_signal_resolution_cache.clear()
@@ -86,7 +83,7 @@ class NonClockActiveSignalTests(unittest.TestCase):
         print("\n[Test 11.1] Non-clock active signal validation")
 
         # First try the hardcoded known-active signal
-        hardcoded_signal = "top.mem0_rd_bw_mon.ready_in"
+        hardcoded_signal = fx.READY
         signal = None
         edge_time = None
 
@@ -109,14 +106,12 @@ class NonClockActiveSignalTests(unittest.TestCase):
             signal, edge_time = self._find_active_signal_and_time()
 
         if signal is None or edge_time is None:
-            print("  [WARN] No suitable non-clock active signal found (hardcoded and dynamic)")
-            print("  Checked signals:")
-            for s in [hardcoded_signal] + self.candidates:
-                print(f"    - {s}: no edge found near reference time")
-            # Still pass but with warning
-            print("  [PASS] Test 11.1: Non-clock active signal (WARN - no active signal found)")
-            return
+            self.fail(
+                "No non-clock active signal found near the fixture reference time; "
+                "regenerate the fixture with test_cases/make_fixture.sh --force"
+            )
 
+        self.assertEqual(edge_time, self.time, "ready_in should have an edge at the fixture reference time")
         self.assertIsNotNone(signal, "Expected to find a known-active non-clock signal")
         self.assertIsNotNone(edge_time, "Expected to find an edge time for the active signal")
 
@@ -134,6 +129,7 @@ class NonClockActiveSignalTests(unittest.TestCase):
             wave_cli_bin=self.wave_cli_bin,
         )
         self.assertEqual(drivers_rank.get("status"), "success")
+        self.assertTrue(drivers_rank.get("ranking", {}).get("all_signals"), "drivers ranking is empty")
         print(f"    drivers signals ranked: {len(drivers_rank.get('ranking', {}).get('all_signals', []))}")
 
         # Run rank_cone_by_time loads
@@ -148,6 +144,7 @@ class NonClockActiveSignalTests(unittest.TestCase):
             wave_cli_bin=self.wave_cli_bin,
         )
         self.assertEqual(loads_rank.get("status"), "success")
+        self.assertTrue(loads_rank.get("ranking", {}).get("all_signals"), "loads ranking is empty")
         print(f"    loads signals ranked: {len(loads_rank.get('ranking', {}).get('all_signals', []))}")
 
         # Run explain_signal_at_time drivers
@@ -163,6 +160,7 @@ class NonClockActiveSignalTests(unittest.TestCase):
         )
         self.assertEqual(drivers_explain.get("status"), "success")
         drivers_summary = drivers_explain.get("explanations", {}).get("top_summary")
+        self.assertTrue(drivers_summary, "drivers explanation should have a top_summary")
         print(f"    drivers top_summary: {drivers_summary}")
 
         # Run explain_signal_at_time loads
@@ -178,6 +176,7 @@ class NonClockActiveSignalTests(unittest.TestCase):
         )
         self.assertEqual(loads_explain.get("status"), "success")
         loads_summary = loads_explain.get("explanations", {}).get("top_summary")
+        self.assertTrue(loads_summary, "loads explanation should have a top_summary")
         print(f"    loads top_summary: {loads_summary}")
 
         # Optionally run explain_edge_cause
@@ -193,12 +192,12 @@ class NonClockActiveSignalTests(unittest.TestCase):
             rtl_trace_bin=self.rtl_trace_bin,
             wave_cli_bin=self.wave_cli_bin,
         )
-        if edge_cause.get("status") == "success":
-            edge_context = edge_cause.get("waveform", {}).get("edge_context", {})
-            print(f"    edge_context: value_before={edge_context.get('value_before_edge')}, "
-                  f"value_at={edge_context.get('value_at_edge')}")
-        else:
-            print(f"    explain_edge_cause: {edge_cause.get('message', 'no result')}")
+        self.assertEqual(edge_cause.get("status"), "success", edge_cause.get("message"))
+        edge_context = edge_cause.get("waveform", {}).get("edge_context", {})
+        print(f"    edge_context: value_before={edge_context.get('value_before_edge')}, "
+              f"value_at={edge_context.get('value_at_edge')}")
+        self.assertEqual(edge_context.get("value_before_edge"), "1")
+        self.assertEqual(edge_context.get("value_at_edge"), "falling")
 
         print(f"\n  [PASS] Test 11.1: Non-clock active signal validation")
 

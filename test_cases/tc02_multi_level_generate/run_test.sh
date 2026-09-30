@@ -14,7 +14,7 @@ if [ -f ~/my_env/vcs.bash ]; then
     vcs -full64 -f files.f -top multi_level_generate_top -l vcs.log -sverilog && echo "VCS compilation passed!" || echo "VCS not available, skipping..."
 fi
 
-RTL_TRACE="${RTL_TRACE:-/home/qsun/AI_PROJ/auto_waveform_debugger/standalone_trace/build/rtl_trace}"
+RTL_TRACE="${RTL_TRACE:-$(cd "$SCRIPT_DIR/../.." && pwd)/standalone_trace/build/rtl_trace}"
 
 echo "=========================================="
 echo "Test Case 02: Multi-Level Generate"

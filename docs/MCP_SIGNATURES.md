@@ -4,7 +4,7 @@ This file lists the MCP tool signatures exposed by the local servers in this rep
 
 ## Main Agent MCP
 
-Source: [`agent_debug_automation/agent_debug_automation_mcp.py`](/home/qsun/AI_PROJ/auto_waveform_debugger/agent_debug_automation/agent_debug_automation_mcp.py)
+Source: [`agent_debug_automation/agent_debug_automation_mcp.py`](../agent_debug_automation/agent_debug_automation_mcp.py)
 
 ### Waveform view model
 
@@ -48,7 +48,7 @@ rtl_trace_serve_stop(session_id: str)
 
 #### `rtl_trace(...)` supported command families
 
-`rtl_trace(...)` is a generic wrapper around the local `standalone_trace/build/rtl_trace` CLI. The supported commands are the CLI subcommands documented in [`standalone_trace/README.md`](/home/qsun/AI_PROJ/auto_waveform_debugger/standalone_trace/README.md).
+`rtl_trace(...)` is a generic wrapper around the local `standalone_trace/build/rtl_trace` CLI. The supported commands are the CLI subcommands documented in [`standalone_trace/README.md`](../standalone_trace/README.md).
 
 Common patterns:
 
@@ -233,7 +233,7 @@ analyze_pattern(vcd_path: Optional[str] = None, path: str = "", start_time: Time
 - `pattern`
   - Default `""`: list only signals declared directly in the top module.
   - `"*"`: list the full waveform namespace.
-  - Hierarchical wildcard such as `"top.nvdla_top.nvdla_core2cvsram_ar_*"`: narrow by path prefix/pattern.
+  - Hierarchical wildcard such as `"top.dut.u_fifo.*"`: narrow by path prefix/pattern.
   - `"regex:<expr>"`: use a raw regular expression instead of glob-style matching.
 - `types`
   - Optional list of signal categories used as an OR filter.
@@ -454,7 +454,7 @@ explain_edge_cause(
 
 ## Standalone Waveform MCP
 
-Source: [`waveform_explorer/waveform_mcp.py`](/home/qsun/AI_PROJ/auto_waveform_debugger/waveform_explorer/waveform_mcp.py)
+Source: [`waveform_explorer/waveform_mcp.py`](../waveform_explorer/waveform_mcp.py)
 
 ```python
 list_signals(vcd_path: str, pattern: str = "", types: Optional[List[str]] = None)
@@ -480,11 +480,11 @@ analyze_pattern(vcd_path: str, path: str, start_time: int, end_time: int)
 
 ```python
 list_signals(vcd_path="wave.fsdb")
-list_signals(vcd_path="wave.fsdb", pattern="top.nvdla_top.nvdla_core2cvsram_ar_*", types=["net"])
+list_signals(vcd_path="wave.fsdb", pattern="top.dut.u_fifo.*", types=["net"])
 list_signals(vcd_path="wave.fsdb", pattern="*", types=["input", "output"])
 get_snapshot(vcd_path="wave.fsdb", signals=["top.a", "top.b"], time=100, radix="hex")
 get_value_at_time(vcd_path="wave.fsdb", path="top.addr", time=100, radix="dec")
-find_value_intervals(vcd_path="wave.fsdb", path="top.rid", value="d8", start_time=307050000, end_time=327970000, radix="dec")
+find_value_intervals(vcd_path="wave.fsdb", path="top.hs_mon.id_in", value="d8", start_time=0, end_time=4000000, radix="dec")
 find_edge(vcd_path="wave.fsdb", path="top.clk", edge_type="rising", start_time=100, direction="backward")
 get_signal_overview(vcd_path="wave.fsdb", path="top.bus[7:0]", start_time=0, end_time=100000, resolution="auto", radix="hex")
 trace_with_snapshot(db_path="rtl_trace.db", waveform_path="wave.fsdb", signal="top.foo", time="Cursor")

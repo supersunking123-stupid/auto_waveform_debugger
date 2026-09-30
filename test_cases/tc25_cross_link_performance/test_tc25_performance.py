@@ -7,7 +7,6 @@ Measures cold and hot run times for cross-link tools.
 """
 
 import json
-import os
 import subprocess
 import sys
 import time
@@ -16,7 +15,9 @@ from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT_DIR))
+sys.path.insert(0, str(ROOT_DIR / "test_cases"))
 
+import cross_link_common as fx  # noqa: E402
 from agent_debug_automation import agent_debug_automation_mcp as mcp_mod
 
 
@@ -27,25 +28,21 @@ class PerformanceTests(unittest.TestCase):
     def setUpClass(cls):
         cls.test_cases_dir = Path(__file__).resolve().parent
         cls.root_dir = Path(__file__).resolve().parents[1]
-        cls.db_path = str(cls.root_dir / "rtl_trace.db")
-        cls.waveform_path = str(cls.root_dir / "wave.fsdb")
-        cls.rtl_trace_bin = str(cls.root_dir.parent / "standalone_trace" / "build" / "rtl_trace")
-        cls.wave_cli_bin = str(cls.root_dir.parent / "waveform_explorer" / "build" / "wave_agent_cli")
-        cls.signal = "top.mem0_rd_bw_mon.ready_in"
-        cls.time = 399970000
-        cls.clock_signal = "top.mem0_rd_bw_mon.clk"
+        cls.db_path = fx.DB_PATH
+        cls.waveform_path = fx.WAVE_PATH
+        cls.rtl_trace_bin = fx.RTL_TRACE_BIN
+        cls.wave_cli_bin = fx.WAVE_CLI_BIN
+        cls.signal = fx.READY
+        cls.time = fx.T_REF
+        cls.clock_signal = fx.CLK
 
         # Performance thresholds
         cls.cold_threshold = 10.0  # seconds
         cls.hot_threshold = 0.2    # seconds
         cls.size_warn_threshold = 200 * 1024  # 200 KB
 
-        for path, name in [(cls.db_path, "rtl_trace.db"), 
-                           (cls.waveform_path, "wave.fsdb"),
-                           (cls.rtl_trace_bin, "rtl_trace"),
-                           (cls.wave_cli_bin, "wave_agent_cli")]:
-            if not os.path.exists(path):
-                raise FileNotFoundError(f"{name} not found: {path}")
+        # Build the fixture on demand (no-op when up to date)
+        fx.ensure_fixture()
 
     def setUp(self):
         # Don't clear caches here - we want to measure real hot performance

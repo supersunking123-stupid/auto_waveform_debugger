@@ -16,7 +16,7 @@ if [ -f ~/my_env/vcs.bash ]; then
 fi
 
 # Fallback to rtl_trace (slang) for syntax check
-RTL_TRACE="${RTL_TRACE:-/home/qsun/AI_PROJ/auto_waveform_debugger/standalone_trace/build/rtl_trace}"
+RTL_TRACE="${RTL_TRACE:-$(cd "$SCRIPT_DIR/../.." && pwd)/standalone_trace/build/rtl_trace}"
 
 echo "=========================================="
 echo "Test Case 01: Large Generate Loop"

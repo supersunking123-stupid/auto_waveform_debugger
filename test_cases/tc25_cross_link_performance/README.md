@@ -6,8 +6,8 @@ Measures cold and hot run times for cross-link tools.
 
 ## Test Configuration
 
-- **Signal:** `top.mem0_rd_bw_mon.ready_in`
-- **Time:** `399970000`
+- **Signal:** `top.hs_mon.ready_in`
+- **Time:** `175000`
 
 ## Test Cases
 
@@ -18,9 +18,9 @@ Measures cold and hot run times for cross-link tools.
 
 ## Expected Performance Envelope
 
-For small-cone NVDLA cases:
-- **Cold:** `3.5s` to `5s` (pass threshold: `< 10s`)
-- **Hot:** `0.002s` to `0.01s` (pass threshold: `< 0.2s`)
+For the small fixture cone:
+- **Cold:** roughly `0.01s` to `0.1s` (pass threshold: `< 10s`)
+- **Hot:** roughly `0.001s` (pass threshold: `< 0.2s`)
 
 ## JSON Size Expectations
 

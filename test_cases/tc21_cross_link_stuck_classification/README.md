@@ -6,8 +6,8 @@ Verifies `stuck_to_1`, `stuck_to_0`, and `stuck_other` classification.
 
 ## Test Configuration
 
-- **Signal:** `top.mem0_rd_bw_mon.ready_in`
-- **Time:** `399970000`
+- **Signal:** `top.hs_mon.ready_in`
+- **Time:** `2505000` (`T_STUCK`, inside the stall window 2005000-3005000)
 - **Mode:** `drivers`
 
 ## Test 6.1: Stuck Classification
@@ -21,8 +21,14 @@ Expected per entry:
 - `stuck_class`
 - `stuck_score`
 
-Expected ranking policy:
-- `stuck_to_1` > `stuck_to_0` > `stuck_other`
+Expected in the fixture cone at `T_STUCK`:
+- `top.hs_mon.ready_in`: `stuck_to_0` (FIFO full, sink stalled)
+- `top.dut.u_fifo.full`: `stuck_to_1`
+- `top.dut.u_fifo.cfg_en`: `stuck_to_1` (tied high in the testbench)
+- `top.dut.u_fifo.flush`: `stuck_to_0` (tied low in the testbench)
 
-If cone doesn't expose enough variation, rerun on `top.mem0_rd_bw_mon.valid_in`.
-If still insufficient, mark WARN.
+Expected ranking policy:
+- `stuck_to_1` > `stuck_to_0` > `stuck_other` (entries sorted by `stuck_score` descending)
+
+At the reference time `175000` the handshake signal toggles, so `ready_in` must
+not be reported stuck there.

@@ -13,12 +13,12 @@ Build both native binaries first:
 
 ```bash
 # 1) standalone_trace
-cd /home/qsun/AI_PROJ/auto_waveform_debugger/standalone_trace
+cd <repo root>/standalone_trace
 cmake -B build -GNinja .
 ninja -C build
 
 # 2) waveform_explorer
-cd /home/qsun/AI_PROJ/auto_waveform_debugger/waveform_explorer
+cd <repo root>/waveform_explorer
 cmake -B build .
 cmake --build build -j"$(nproc)"
 ```
@@ -26,7 +26,7 @@ cmake --build build -j"$(nproc)"
 Install the Python MCP runtime:
 
 ```bash
-cd /home/qsun/AI_PROJ/auto_waveform_debugger
+cd <repo root>
 python3 -m venv .venv
 .venv/bin/python3 -m pip install --upgrade pip
 .venv/bin/python3 -m pip install -r requirements.txt
@@ -39,7 +39,7 @@ service.
 ## Run MCP service
 
 ```bash
-cd /home/qsun/AI_PROJ/auto_waveform_debugger
+cd <repo root>
 .venv/bin/python3 -m agent_debug_automation.agent_debug_automation_mcp
 ```
 
@@ -49,7 +49,7 @@ cd /home/qsun/AI_PROJ/auto_waveform_debugger
 {
   "mcpServers": {
     "agent_debug_automation": {
-      "command": "/home/qsun/AI_PROJ/auto_waveform_debugger/.venv/bin/python",
+      "command": "/path/to/auto_waveform_debugger/.venv/bin/python",
       "args": [
         "-m",
         "agent_debug_automation.agent_debug_automation_mcp"
@@ -59,6 +59,7 @@ cd /home/qsun/AI_PROJ/auto_waveform_debugger
 }
 ```
 
+Replace `/path/to/auto_waveform_debugger` with the absolute path of your checkout.
 If you are not using the repo virtualenv, replace `command` with your system `python3`.
 
 ## Waveform View Model
@@ -121,7 +122,7 @@ These keep the original `rtl_trace` command model unchanged.
 Waveform semantics stay aligned with `wave_agent_cli`. In particular, backward edge search now resolves the last matching edge at or before `T`, including an edge exactly at `T`.
 For multi-bit value queries, `radix` may be `hex`, `bin`, or `dec`; the default is `hex`.
 `get_signal_overview` provides a zoomed-out, resolution-aware summary of one signal and also accepts `resolution="auto"` for an overview capped to a manageable number of segments.
-`list_signals` now defaults to top-module-only output. Pass `pattern="*"` for the full namespace, a narrower wildcard such as `top.nvdla_top.nvdla_core2cvsram_ar_*`, and optionally `types=["input","output","net"]` to filter by signal category.
+`list_signals` now defaults to top-module-only output. Pass `pattern="*"` for the full namespace, a narrower wildcard such as `top.dut.u_fifo.*`, and optionally `types=["input","output","net"]` to filter by signal category.
 `count_transitions` counts scalar edges or multi-bit toggles over a time window.
 `dump_waveform_data` writes large transition streams or fixed-step samples directly to a local JSONL file so the full dataset does not have to travel through MCP.
 
@@ -261,27 +262,33 @@ Returned per-signal summaries include:
 - Per-signal transitions are fetched lazily when queries need them.
 - `list_signals_page` exists specifically for large FSDB designs.
 
-This is what makes the cross-link tools practical on large ASIC waveforms such as NVDLA.
+This is what makes the cross-link tools practical on large ASIC waveforms.
 
 ## Tests
 
-Portable regression:
+Standard commands (run from the repo root):
 
 ```bash
-python3 -m unittest waveform_explorer.tests.test_signal_overview
-python3 -m unittest agent_debug_automation.tests.test_cross_linking
+.venv/bin/python3 -m unittest waveform_explorer.tests.test_signal_overview
+.venv/bin/python3 -m unittest agent_debug_automation.tests.test_cross_linking
 ```
 
 The test module includes:
 - unit-style regression on the bundled `timer_tb.vcd` fixture
-- a real-environment NVDLA integration regression, auto-enabled only when these paths exist:
-  - `/home/qsun/DVT/nvdla/hw/verif/sim_vip/cc_alexnet_conv5_relu5_int16_dtest_cvsram/wave.fsdb`
-  - `/home/qsun/DVT/nvdla/hw/verif/sim_vip/rtl_trace.db`
+- a fixture-backed integration regression (`FixtureSessionIntegrationTests`) that runs against the small generated cross-link fixture (`test_cases/rtl_trace.db` + `test_cases/wave.fsdb`, built from `test_cases/cross_link_fixture/src`). The fixture is built automatically by `test_cases/make_fixture.sh` when it is missing or stale; the class is skipped only when the fixture cannot be built (for example, no VCS/Verdi or no `rtl_trace` binary).
 
-Run only the real-environment regression:
+Build or refresh the fixture by hand:
 
 ```bash
-python3 -m unittest agent_debug_automation.tests.test_cross_linking.NvdlaSessionIntegrationTests
+test_cases/make_fixture.sh          # build if missing/stale
+test_cases/make_fixture.sh --force  # rebuild
+test_cases/make_fixture.sh --check  # test whether it is up to date
+```
+
+Run only the fixture-backed regression:
+
+```bash
+.venv/bin/python3 -m unittest agent_debug_automation.tests.test_cross_linking.FixtureSessionIntegrationTests
 ```
 
 Because session state is persisted under `.session_store`, these tests should be run serially rather than in parallel.

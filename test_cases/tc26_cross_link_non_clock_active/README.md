@@ -7,13 +7,13 @@ The clock case is required but not sufficient. Validates cross-link on non-clock
 ## Test Configuration
 
 Start candidates:
-- `top.mem0_rd_bw_mon.ready_in`
-- `top.mem0_rd_bw_mon.valid_in`
+- `top.hs_mon.ready_in`
+- `top.hs_mon.valid_in`
 
 ## Test 11.1: Non-Clock Active Signal
 
 Procedure:
-1. Use waveform queries to determine if either signal has actual edge near candidate time (0..200010000)
+1. Use waveform queries to determine if either signal has actual edge near candidate time (the fixture reference time is `175000`; `ready_in` and `valid_in` both fall there)
 2. If not, inspect structural cone for nearby active non-clock signal
 3. Choose one in-range real edge time
 4. Run:
@@ -27,4 +27,5 @@ Expected:
 - Direction-aware ranking behaves sensibly
 - Explanations are usable on control/data path
 
-If no suitable non-clock active signal found, mark WARN.
+The fixture guarantees an active non-clock signal at the reference time, so
+finding none is a FAIL (regenerate with `test_cases/make_fixture.sh --force`).

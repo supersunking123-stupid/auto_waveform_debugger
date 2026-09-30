@@ -324,4 +324,4 @@ Think of `waveform_explorer` as:
 The backend decides how data is loaded. `AgentAPI` decides how that data is exposed.
 
 Regression history for the packed-vector lookup failure that motivated this behavior is recorded in:
-- `/home/qsun/AI_PROJ/auto_waveform_debugger/failure_history.md`
+- [`docs/failure_history.md`](../../docs/failure_history.md)

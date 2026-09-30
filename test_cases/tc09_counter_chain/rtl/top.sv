@@ -13,7 +13,7 @@ module counter_chain_top #(
     output wire               overflow
 );
 
-    wire [NUM_COUNTERS-1:0]   carry_chain;
+    wire [NUM_COUNTERS:0]     carry_chain;
     wire [COUNT_WIDTH-1:0]    counter_out [NUM_COUNTERS-1:0];
 
     // First counter gets carry_in = 1 (always enabled when enable is high)

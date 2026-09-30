@@ -21,7 +21,7 @@ Tests that exercise a single component in isolation.
 - **What it covers:** Signal overview generation, waveform query commands (snapshot, edge, transitions, etc.)
 - **Run commands:**
   ```bash
-  cd /home/qsun/AI_PROJ/auto_waveform_debugger
+  cd <repo root>
   .venv/bin/python3 -m unittest waveform_explorer.tests.test_signal_overview
   .venv/bin/python3 -m unittest waveform_explorer.tests.test_waveform_commands
   ```
@@ -32,7 +32,7 @@ Tests that exercise a single component in isolation.
 - **What it covers:** Cross-link tool behavior (trace_with_snapshot, explain_signal_at_time, rank_cone_by_time, explain_edge_cause), signal mapping, ranking heuristics
 - **Run command:**
   ```bash
-  cd /home/qsun/AI_PROJ/auto_waveform_debugger
+  cd <repo root>
   .venv/bin/python3 -m unittest agent_debug_automation.tests.test_cross_linking
   ```
 
@@ -42,14 +42,14 @@ Tests that exercise end-to-end workflows across multiple components.
 
 - **Location:** `test_cases/tc01/` through `test_cases/tc27/`
 - **Structure:** Each directory has `run_test.sh` + test-specific Python files
-- **Assets:** Shared `test_cases/rtl_trace.db` and `test_cases/wave.fsdb`
+- **Assets:** tc16-tc27 share the generated cross-link fixture `test_cases/rtl_trace.db` and `test_cases/wave.fsdb` (built from `test_cases/cross_link_fixture/src` by `test_cases/make_fixture.sh`; gitignored)
 
 #### Structural trace test cases (tc01–tc15)
 - Compile RTL, build DB, run trace/hier/find queries
 - Verify structural connectivity, hierarchy, and signal search
 
 #### Cross-link integration test cases (tc16–tc27)
-- Require both `rtl_trace.db` and `wave.fsdb`
+- Require both `rtl_trace.db` and `wave.fsdb` (auto-built by `test_cases/make_fixture.sh` when missing or stale)
 - Test cross-linked structural + waveform analysis
 - tc16: Backend sanity
 - tc17: Smoke test
@@ -66,16 +66,16 @@ Tests that exercise end-to-end workflows across multiple components.
 
 #### Run commands
 ```bash
-# All 27 test cases
-cd /home/qsun/AI_PROJ/auto_waveform_debugger
+# All 27 test cases (exits non-zero if any test fails; exit status 77 from a run_test.sh means SKIPPED)
+cd <repo root>
 ./test_cases/run_all_tests.sh
 
 # Cross-link tests only (tc16-tc27)
-cd /home/qsun/AI_PROJ/auto_waveform_debugger
+cd <repo root>
 .venv/bin/python3 test_cases/run_cross_link_tests.py
 
 # Single test case
-cd /home/qsun/AI_PROJ/auto_waveform_debugger/test_cases/tc16_cross_link_backend_sanity
+cd <repo root>/test_cases/tc16_cross_link_backend_sanity
 ./run_test.sh
 ```
 
@@ -84,7 +84,7 @@ cd /home/qsun/AI_PROJ/auto_waveform_debugger/test_cases/tc16_cross_link_backend_
 Run all test suites from project root:
 
 ```bash
-cd /home/qsun/AI_PROJ/auto_waveform_debugger
+cd <repo root>
 
 # 1. standalone_trace CTest
 (cd standalone_trace && ctest --test-dir build --output-on-failure)

@@ -54,8 +54,8 @@ Some Verdi FSDB builds print informational banners (for example `FSDB Reader...`
 
 ### FSDB Packed-Signal Resolution
 Some FSDB dumps store internal vectors only as packed signal names, for example:
-- `top.nvdla_top...u_cq.cq_rd_count9[8:0]`
-- `top.nvdla_top...u_cq.cq_rd_take_thread_id[3:0]`
+- `top.dut.u_fifo.count[2:0]`
+- `top.dut.u_src.id[7:0]`
 
 To keep structural and waveform queries aligned, `wave_agent_cli` now falls back from a bare path
 to the uniquely matching packed-vector signal when possible.
@@ -67,7 +67,7 @@ List waveform signal paths with optional hierarchy and type filtering.
 - **Query:** `{"cmd": "list_signals"}`
 - **Default behavior:** returns only signals declared directly in the top module.
 - **Full namespace:** pass `{"cmd": "list_signals", "args": {"pattern": "*"}}`
-- **Hierarchy wildcard:** pass `{"cmd": "list_signals", "args": {"pattern": "top.nvdla_top.nvdla_core2cvsram_ar_*"}}`
+- **Hierarchy wildcard:** pass `{"cmd": "list_signals", "args": {"pattern": "top.dut.u_fifo.*"}}`
 - **Type filter:** pass `{"cmd": "list_signals", "args": {"pattern": "*", "types": ["input", "output", "net"]}}`
 - **Response:** includes `data`, `pattern`, `types`, and `top_module_only`.
 - `types` may include any combination of `input`, `output`, `inout`, `net`, and `register`.
@@ -155,7 +155,7 @@ The tool can be run as an MCP (Model Context Protocol) service, allowing AI Agen
 ### Setup MCP
 Ensure the virtual environment is set up and `fastmcp` is installed:
 ```bash
-cd /home/qsun/AI_PROJ/auto_waveform_debugger
+cd <repo root>
 python3 -m venv .venv
 .venv/bin/python3 -m pip install --upgrade pip
 .venv/bin/python3 -m pip install -r requirements.txt
@@ -178,14 +178,16 @@ Add this to your `mcpServers` section in `~/.gemini/config.json` (or your specif
 {
   "mcpServers": {
     "waveform-explorer": {
-      "command": "/home/qsun/AI_PROJ/auto_waveform_debugger/.venv/bin/python",
+      "command": "/path/to/auto_waveform_debugger/.venv/bin/python",
       "args": [
-        "/home/qsun/AI_PROJ/auto_waveform_debugger/waveform_explorer/waveform_mcp.py"
+        "/path/to/auto_waveform_debugger/waveform_explorer/waveform_mcp.py"
       ]
     }
   }
 }
 ```
+
+Replace `/path/to/auto_waveform_debugger` with the absolute path of your checkout (in both MCP client configs below).
 
 ### 2. Configuration for Claude Desktop
 Edit your `claude_desktop_config.json` to include:
@@ -194,9 +196,9 @@ Edit your `claude_desktop_config.json` to include:
 {
   "mcpServers": {
     "waveform_explorer": {
-      "command": "/home/qsun/AI_PROJ/auto_waveform_debugger/.venv/bin/python",
+      "command": "/path/to/auto_waveform_debugger/.venv/bin/python",
       "args": [
-        "/home/qsun/AI_PROJ/auto_waveform_debugger/waveform_explorer/waveform_mcp.py"
+        "/path/to/auto_waveform_debugger/waveform_explorer/waveform_mcp.py"
       ]
     }
   }
@@ -205,10 +207,10 @@ Edit your `claude_desktop_config.json` to include:
 
 ### Verification
 Once configured, restart your agent and try asking:
-> "List all signals in /home/qsun/AI_PROJ/auto_waveform_debugger/waveform_explorer/timer_tb.vcd"
+> "List all signals in /path/to/auto_waveform_debugger/waveform_explorer/timer_tb.vcd"
 
 Regression-style examples for previously failing FSDB queries are recorded in
-`/home/qsun/AI_PROJ/auto_waveform_debugger/failure_history.md`.
+[`docs/failure_history.md`](../docs/failure_history.md).
 
 ### Exposed Tools
 - `list_signals(vcd_path, pattern="", types=None)`

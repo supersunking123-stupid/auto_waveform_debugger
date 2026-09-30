@@ -21,12 +21,19 @@ ctest --test-dir standalone_trace/build --output-on-failure
 # agent_debug_automation Python regressions
 .venv/bin/python3 -m unittest agent_debug_automation.tests.test_cross_linking
 
-# all scenario tests under test_cases/
-cd test_cases && ./run_all_tests.sh
+# all scenario tests under test_cases/ (exits non-zero if any test fails)
+test_cases/run_all_tests.sh
 
 # cross-link-only scenario harness with reports
-cd test_cases && .venv/bin/python3 run_cross_link_tests.py
+.venv/bin/python3 test_cases/run_cross_link_tests.py
+
+# (re)build the cross-link fixture by hand (tests also do this on demand)
+test_cases/make_fixture.sh --force
 ```
+
+The cross-link tests (tc16-tc27 and `FixtureSessionIntegrationTests` in `test_cross_linking.py`) need the
+`standalone_trace` and `waveform_explorer` binaries to be built, plus VCS + Verdi the first time the fixture is
+generated (see [Cross-link fixture](#cross-link-fixture)).
 
 ## Component Tests
 
@@ -40,7 +47,7 @@ Primary entry points:
 
 Files:
 
-- [standalone_trace/tests/semantic_regression.py](/home/qsun/AI_PROJ/auto_waveform_debugger/standalone_trace/tests/semantic_regression.py)
+- [standalone_trace/tests/semantic_regression.py](../standalone_trace/tests/semantic_regression.py)
   End-to-end semantic regression for the `rtl_trace` CLI.
   Covers:
   - compile smoke
@@ -65,7 +72,7 @@ Files:
   - default text format output validation
   - incremental compile cache miss (source modification)
 
-- [standalone_trace/tests/assignment_utils_test.cc](/home/qsun/AI_PROJ/auto_waveform_debugger/standalone_trace/tests/assignment_utils_test.cc)
+- [standalone_trace/tests/assignment_utils_test.cc](../standalone_trace/tests/assignment_utils_test.cc)
   Small C++ unit test for assignment-LHS parsing.
   Covers:
   - nonblocking assignment parsing such as `flag <= hit`
@@ -74,17 +81,17 @@ Files:
   - LHS starting with literal `top.` prefix
   - blocking assignment with ternary and `==` in RHS expression
 
-- [standalone_trace/CMakeLists.txt](/home/qsun/AI_PROJ/auto_waveform_debugger/standalone_trace/CMakeLists.txt)
+- [standalone_trace/CMakeLists.txt](../standalone_trace/CMakeLists.txt)
   Registers the two `ctest` targets:
   - `rtl_trace_semantic_regression`
   - `assignment_utils_test`
 
-- [standalone_trace/LOCALTEST.md](/home/qsun/AI_PROJ/auto_waveform_debugger/standalone_trace/LOCALTEST.md)
+- [standalone_trace/docs/LOCALTEST.md](../standalone_trace/docs/LOCALTEST.md)
   Local bring-up guide and manual validation notes.
 
 Fixture:
 
-- [standalone_trace/tests/fixtures/semantic_top.sv](/home/qsun/AI_PROJ/auto_waveform_debugger/standalone_trace/tests/fixtures/semantic_top.sv)
+- [standalone_trace/tests/fixtures/semantic_top.sv](../standalone_trace/tests/fixtures/semantic_top.sv)
 
 ### `waveform_explorer`
 
@@ -97,7 +104,7 @@ Primary entry points:
 
 Files:
 
-- [waveform_explorer/tests/test_signal_overview.py](/home/qsun/AI_PROJ/auto_waveform_debugger/waveform_explorer/tests/test_signal_overview.py)
+- [waveform_explorer/tests/test_signal_overview.py](../waveform_explorer/tests/test_signal_overview.py)
   CLI-oriented regression suite for `wave_agent_cli`.
   Covers:
   - `list_signals` default top-module-only behavior
@@ -111,7 +118,7 @@ Files:
   - forward `find_condition` direction
   - `get_signal_overview` with `radix="bin"` and `radix="dec"`
 
-- [waveform_explorer/tests/test_waveform_commands.py](/home/qsun/AI_PROJ/auto_waveform_debugger/waveform_explorer/tests/test_waveform_commands.py)
+- [waveform_explorer/tests/test_waveform_commands.py](../waveform_explorer/tests/test_waveform_commands.py)
   Comprehensive CLI regression for all waveform query commands.
   Covers:
   - `get_signal_info` single-bit, multi-bit, and nonexistent signal
@@ -124,10 +131,10 @@ Files:
 
 Supporting scripts:
 
-- [waveform_explorer/perf_test.py](/home/qsun/AI_PROJ/auto_waveform_debugger/waveform_explorer/perf_test.py)
+- [waveform_explorer/perf_test.py](../waveform_explorer/perf_test.py)
   Manual performance script, more benchmark than regression.
 
-- [waveform_explorer/perf_test_daemon.py](/home/qsun/AI_PROJ/auto_waveform_debugger/waveform_explorer/perf_test_daemon.py)
+- [waveform_explorer/perf_test_daemon.py](../waveform_explorer/perf_test_daemon.py)
   Daemon-mode benchmark helper.
 
 ### `agent_debug_automation`
@@ -140,7 +147,7 @@ Primary entry point:
 
 Files:
 
-- [agent_debug_automation/tests/test_cross_linking.py](/home/qsun/AI_PROJ/auto_waveform_debugger/agent_debug_automation/tests/test_cross_linking.py)
+- [agent_debug_automation/tests/test_cross_linking.py](../agent_debug_automation/tests/test_cross_linking.py)
   Main Python regression suite for the merged MCP layer.
   Covers:
   - default session creation
@@ -159,7 +166,7 @@ Files:
   - concurrent same-session bookmark updates without lost updates
   - non-FSDB full-namespace fallback for internal waveform mapping
   - trace / explain / snapshot cross-link flows
-  - optional real NVDLA FSDB integration workflow
+  - fixture-backed integration workflow (`FixtureSessionIntegrationTests`, runs against the generated cross-link fixture)
   - `move_cursor` with positive/negative delta and zero-clamping
   - `get_cursor` standalone
   - `list_bookmarks` and `list_signal_groups` listing
@@ -185,24 +192,25 @@ Files:
 Notes:
 
 - some tests are pure local regressions using repo fixtures
-- the NVDLA integration class depends on machine-specific external assets and is guarded accordingly inside the test file
+- `FixtureSessionIntegrationTests` uses the generated cross-link fixture (`test_cases/rtl_trace.db` + `test_cases/wave.fsdb`); it calls `test_cases/make_fixture.sh` on demand and is skipped only when the fixture cannot be built (for example no VCS/Verdi, or `rtl_trace` / `wave_agent_cli` not built)
+- run just that class with `.venv/bin/python3 -m unittest agent_debug_automation.tests.test_cross_linking.FixtureSessionIntegrationTests`
 
 ## `test_cases/` Scenario Suites
 
 Top-level harnesses:
 
-- [test_cases/run_all_tests.sh](/home/qsun/AI_PROJ/auto_waveform_debugger/test_cases/run_all_tests.sh)
-  Runs every `tc*/run_test.sh` directory in version order and prints a pass/fail summary.
+- [test_cases/run_all_tests.sh](../test_cases/run_all_tests.sh)
+  Runs every `tc*/run_test.sh` directory in version order and prints a pass/fail/skip summary. It exits non-zero if any test fails; a `run_test.sh` that exits with status 77 is counted as SKIPPED and does not fail the run.
 
-- [test_cases/run_cross_link_tests.py](/home/qsun/AI_PROJ/auto_waveform_debugger/test_cases/run_cross_link_tests.py)
+- [test_cases/run_cross_link_tests.py](../test_cases/run_cross_link_tests.py)
   Dedicated harness for the cross-link scenario suites.
-  Runs `tc16` through `tc27`, parses unittest output, and generates:
+  Runs `tc16` through `tc27` against the cross-link fixture, parses unittest output, and generates:
   - markdown report
   - CSV summary
   - JSON bug list
 
-- [test_cases/CROSS_LINK_TEST_SUITE.md](/home/qsun/AI_PROJ/auto_waveform_debugger/test_cases/CROSS_LINK_TEST_SUITE.md)
-  Describes the cross-link suite phases, known-good signals/times, and report outputs.
+- [test_cases/CROSS_LINK_TEST_SUITE.md](../test_cases/CROSS_LINK_TEST_SUITE.md)
+  Describes the cross-link suite phases, fixture signals/times, and report outputs.
 
 ### Structural / standalone scenario cases
 
@@ -230,45 +238,55 @@ Each `run_test.sh` now includes content assertions beyond exit-code checks:
 - DB file existence and non-zero size validation after `compile`
 - JSON endpoint count > 0 validation after key `trace` commands
 
+### Cross-link fixture
+
+tc16-tc27 (and the fixture-backed integration class in `test_cross_linking.py`) run against a small, regenerable design instead of a large external one. Nothing here depends on machine-local project data.
+
+- Sources: `test_cases/cross_link_fixture/src/*.sv` (`xl_src`, `xl_fifo`, `xl_sink`, `xl_dut`, `xl_hs_mon`, `tb_top`; the testbench top module is named `top`) and the file list `test_cases/cross_link_fixture/files.f`.
+- One command builds everything: `test_cases/make_fixture.sh` (`--force` rebuilds, `--check` only tests whether the outputs are up to date). It runs `standalone_trace/build/rtl_trace compile --top top -f files.f` to produce `test_cases/rtl_trace.db`, then VCS + Verdi FSDB dump to produce `test_cases/wave.fsdb`. Tests and `run_test.sh` scripts call it automatically when the outputs are missing or stale. Generated outputs are gitignored.
+- Shared constants (signal paths, times) live in [test_cases/cross_link_common.py](../test_cases/cross_link_common.py).
+- Key signals: `top.hs_mon.clk`, `top.hs_mon.ready_in`, `top.hs_mon.valid_in`, `top.hs_mon.last_in`, `top.hs_mon.id_in[7:0]`, `top.dut.u_fifo.count[2:0]`, `top.dut.u_fifo.wr_ready`, `top.dut.u_src.id[7:0]`.
+- Key times (FSDB timescale 1ps): reference posedge `T_REF` = 175000 ps (where `ready_in` / `valid_in` / `last_in` fall); stall window 2005000-3005000 ps (`ready_in` stuck at 0).
+
 ### Cross-link scenario cases
 
-These combine structural DB + waveform data + MCP-facing cross-link behavior. Each directory has `run_test.sh`, a Python test, and usually a `README.md`.
+These combine structural DB + waveform data + MCP-facing cross-link behavior on the fixture above. Each directory has `run_test.sh`, a Python test, and usually a `README.md`.
 
-- [test_cases/tc16_cross_link_backend_sanity/test_tc16_backend_sanity.py](/home/qsun/AI_PROJ/auto_waveform_debugger/test_cases/tc16_cross_link_backend_sanity/test_tc16_backend_sanity.py)
+- [test_cases/tc16_cross_link_backend_sanity/test_tc16_backend_sanity.py](../test_cases/tc16_cross_link_backend_sanity/test_tc16_backend_sanity.py)
   Backend sanity.
 
-- [test_cases/tc17_cross_link_smoke/test_tc17_smoke.py](/home/qsun/AI_PROJ/auto_waveform_debugger/test_cases/tc17_cross_link_smoke/test_tc17_smoke.py)
+- [test_cases/tc17_cross_link_smoke/test_tc17_smoke.py](../test_cases/tc17_cross_link_smoke/test_tc17_smoke.py)
   Basic smoke coverage for the cross-link tools.
 
-- [test_cases/tc18_cross_link_edge_correctness/test_tc18_edge_correctness.py](/home/qsun/AI_PROJ/auto_waveform_debugger/test_cases/tc18_cross_link_edge_correctness/test_tc18_edge_correctness.py)
+- [test_cases/tc18_cross_link_edge_correctness/test_tc18_edge_correctness.py](../test_cases/tc18_cross_link_edge_correctness/test_tc18_edge_correctness.py)
   Exact-edge correctness checks.
 
-- [test_cases/tc19_cross_link_direction_ranking/test_tc19_direction_ranking.py](/home/qsun/AI_PROJ/auto_waveform_debugger/test_cases/tc19_cross_link_direction_ranking/test_tc19_direction_ranking.py)
+- [test_cases/tc19_cross_link_direction_ranking/test_tc19_direction_ranking.py](../test_cases/tc19_cross_link_direction_ranking/test_tc19_direction_ranking.py)
   Direction-aware ranking (asserts drivers summary differs from loads summary).
 
-- [test_cases/tc20_cross_link_closeness_ranking/test_tc20_closeness_ranking.py](/home/qsun/AI_PROJ/auto_waveform_debugger/test_cases/tc20_cross_link_closeness_ranking/test_tc20_closeness_ranking.py)
+- [test_cases/tc20_cross_link_closeness_ranking/test_tc20_closeness_ranking.py](../test_cases/tc20_cross_link_closeness_ranking/test_tc20_closeness_ranking.py)
   Closeness-first ranking (asserts monotonically non-increasing `closeness_score` ordering).
 
-- [test_cases/tc21_cross_link_stuck_classification/test_tc21_stuck_classification.py](/home/qsun/AI_PROJ/auto_waveform_debugger/test_cases/tc21_cross_link_stuck_classification/test_tc21_stuck_classification.py)
+- [test_cases/tc21_cross_link_stuck_classification/test_tc21_stuck_classification.py](../test_cases/tc21_cross_link_stuck_classification/test_tc21_stuck_classification.py)
   Stuck-signal classification.
 
-- [test_cases/tc22_cross_link_snapshot_sampling/test_tc22_snapshot_sampling.py](/home/qsun/AI_PROJ/auto_waveform_debugger/test_cases/tc22_cross_link_snapshot_sampling/test_tc22_snapshot_sampling.py)
+- [test_cases/tc22_cross_link_snapshot_sampling/test_tc22_snapshot_sampling.py](../test_cases/tc22_cross_link_snapshot_sampling/test_tc22_snapshot_sampling.py)
   Snapshot and sampling behavior.
 
-- [test_cases/tc23_cross_link_mapping_robustness/test_tc23_mapping_robustness.py](/home/qsun/AI_PROJ/auto_waveform_debugger/test_cases/tc23_cross_link_mapping_robustness/test_tc23_mapping_robustness.py)
+- [test_cases/tc23_cross_link_mapping_robustness/test_tc23_mapping_robustness.py](../test_cases/tc23_cross_link_mapping_robustness/test_tc23_mapping_robustness.py)
   Signal mapping robustness (asserts TOP.-normalized resolution and bit-select fallback produce valid results).
 
-- [test_cases/tc24_cross_link_unmapped_handling/test_tc24_unmapped_handling.py](/home/qsun/AI_PROJ/auto_waveform_debugger/test_cases/tc24_cross_link_unmapped_handling/test_tc24_unmapped_handling.py)
+- [test_cases/tc24_cross_link_unmapped_handling/test_tc24_unmapped_handling.py](../test_cases/tc24_cross_link_unmapped_handling/test_tc24_unmapped_handling.py)
   Unmapped-signal handling (asserts `unmapped_signals` list structure and entry fields).
 
-- [test_cases/tc25_cross_link_performance/test_tc25_performance.py](/home/qsun/AI_PROJ/auto_waveform_debugger/test_cases/tc25_cross_link_performance/test_tc25_performance.py)
+- [test_cases/tc25_cross_link_performance/test_tc25_performance.py](../test_cases/tc25_cross_link_performance/test_tc25_performance.py)
   Performance checks and thresholds.
 
-- [test_cases/tc26_cross_link_non_clock_active/test_tc26_non_clock_active.py](/home/qsun/AI_PROJ/auto_waveform_debugger/test_cases/tc26_cross_link_non_clock_active/test_tc26_non_clock_active.py)
-  Non-clock active signal coverage (uses hardcoded known-active signal with dynamic fallback).
+- [test_cases/tc26_cross_link_non_clock_active/test_tc26_non_clock_active.py](../test_cases/tc26_cross_link_non_clock_active/test_tc26_non_clock_active.py)
+  Non-clock active signal coverage (uses a known-active fixture signal with dynamic fallback).
 
-- [test_cases/tc27_history_failure_regression/test_tc27_history_failure.py](/home/qsun/AI_PROJ/auto_waveform_debugger/test_cases/tc27_history_failure_regression/test_tc27_history_failure.py)
-  Regression for a previously observed history-related failure mode.
+- [test_cases/tc27_history_failure_regression/test_tc27_history_failure.py](../test_cases/tc27_history_failure_regression/test_tc27_history_failure.py)
+  Regression for a previously observed failure mode (bare hierarchical names resolving to packed-vector FSDB signals), retargeted to the fixture (window 1000000-1100000 ps). See also [docs/failure_history.md](failure_history.md).
 
 ## Practical Run Order
 
@@ -280,15 +298,17 @@ For fast local confidence:
 
 For broader end-to-end coverage:
 
-1. `cd test_cases && ./run_all_tests.sh`
-2. `cd test_cases && .venv/bin/python3 run_cross_link_tests.py`
+1. `test_cases/run_all_tests.sh`
+2. `.venv/bin/python3 test_cases/run_cross_link_tests.py`
 
 ## Notes
 
 - `test_cases/` includes generated artifacts in some directories; the authoritative test entry point is still each directory’s `run_test.sh`.
 - `run_cross_link_tests.py` targets `tc16` through `tc27` (phases 1-12).
-- some cross-link and FSDB-backed tests depend on machine-local assets such as NVDLA waveform and DB files; those are not guaranteed to exist on every machine.
-- vendored dependency test trees also exist under [standalone_trace/third_party/slang/tests](/home/qsun/AI_PROJ/auto_waveform_debugger/standalone_trace/third_party/slang/tests) and similar third-party paths, but they are upstream dependency tests rather than the primary project-maintained regression entry points listed above.
+- the cross-link and FSDB-backed tests use the generated fixture (`test_cases/rtl_trace.db`, `test_cases/wave.fsdb`); they need `standalone_trace/build/rtl_trace`, `waveform_explorer/build/wave_agent_cli`, and (to build the FSDB) VCS + Verdi. If the fixture cannot be built the tests fail with the exact `test_cases/make_fixture.sh --force` command to run (or skip, for `FixtureSessionIntegrationTests`).
+- `test_cases/run_all_tests.sh` returns non-zero if any test case fails; exit status 77 from a `run_test.sh` means SKIPPED.
+- use `.venv/bin/python3` for every Python command in this repo (the system Python lacks the project dependencies).
+- vendored dependency test trees also exist under [standalone_trace/third_party/slang/tests](../standalone_trace/third_party/slang/tests) and similar third-party paths, but they are upstream dependency tests rather than the primary project-maintained regression entry points listed above.
 
 ## Enhancement Summary (2026-03-30)
 

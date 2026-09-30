@@ -7,7 +7,6 @@ Validates the backend infrastructure before running cross-link tests.
 """
 
 import json
-import os
 import sys
 import time
 import unittest
@@ -16,7 +15,9 @@ from pathlib import Path
 # Add project root to path
 ROOT_DIR = Path(__file__).resolve().parents[2]  # Go to project root
 sys.path.insert(0, str(ROOT_DIR))
+sys.path.insert(0, str(ROOT_DIR / "test_cases"))
 
+import cross_link_common as fx  # noqa: E402
 from agent_debug_automation import agent_debug_automation_mcp as mcp_mod
 
 
@@ -28,24 +29,17 @@ class BackendSanityTests(unittest.TestCase):
         """Set up test fixtures."""
         cls.test_cases_dir = Path(__file__).resolve().parent
         cls.root_dir = Path(__file__).resolve().parents[1]  # test_cases directory
-        cls.db_path = str(cls.root_dir / "rtl_trace.db")
-        cls.waveform_path = str(cls.root_dir / "wave.fsdb")
-        cls.rtl_trace_bin = str(cls.root_dir.parent / "standalone_trace" / "build" / "rtl_trace")
-        cls.wave_cli_bin = str(cls.root_dir.parent / "waveform_explorer" / "build" / "wave_agent_cli")
+        cls.db_path = fx.DB_PATH
+        cls.waveform_path = fx.WAVE_PATH
+        cls.rtl_trace_bin = fx.RTL_TRACE_BIN
+        cls.wave_cli_bin = fx.WAVE_CLI_BIN
 
-        # Known-good reference point
-        cls.clock_signal = "top.mem0_rd_bw_mon.clk"
-        cls.clock_edge_time = 399970000
+        # Known-good reference point (see cross_link_common.py for the fixture timeline)
+        cls.clock_signal = fx.CLK
+        cls.clock_edge_time = fx.T_REF
 
-        # Verify assets exist
-        if not os.path.exists(cls.db_path):
-            raise FileNotFoundError(f"RTL DB not found: {cls.db_path}")
-        if not os.path.exists(cls.waveform_path):
-            raise FileNotFoundError(f"Waveform not found: {cls.waveform_path}")
-        if not os.path.exists(cls.rtl_trace_bin):
-            raise FileNotFoundError(f"rtl_trace binary not found: {cls.rtl_trace_bin}")
-        if not os.path.exists(cls.wave_cli_bin):
-            raise FileNotFoundError(f"wave_agent_cli binary not found: {cls.wave_cli_bin}")
+        # Build the fixture on demand (no-op when up to date)
+        fx.ensure_fixture()
 
     def setUp(self):
         """Clear caches before each test."""
@@ -163,6 +157,38 @@ class BackendSanityTests(unittest.TestCase):
         print(f"  type: {data.get('type')}")
         print(f"  timescale: {data.get('timescale')}")
         print(f"  [PASS] Test 1.3: FSDB signal-info sanity")
+
+    def test_1_4_fixture_reference_points(self):
+        """Test 1.4: Fixture self-check (reference edge and stuck window)"""
+        print("\n[Test 1.4] Fixture reference points")
+
+        # ready_in / valid_in / last_in all fall at the reference posedge.
+        for sig in (fx.READY, fx.VALID, fx.LAST):
+            edge = mcp_mod.find_edge(
+                vcd_path=self.waveform_path,
+                path=sig,
+                edge_type="negedge",
+                start_time=self.clock_edge_time,
+                direction="backward",
+            )
+            self.assertEqual(edge.get("status"), "success", f"find_edge failed for {sig}: {edge.get('message')}")
+            self.assertEqual(edge.get("data"), self.clock_edge_time,
+                             f"{sig} should fall at fixture reference time {self.clock_edge_time}")
+
+        # ready_in is stuck at 0 for the whole stall window: exactly one
+        # transition (to 0) at STALL_START and the next one (to 1) at STALL_END.
+        trans = mcp_mod.get_transitions(
+            vcd_path=self.waveform_path,
+            path=fx.READY,
+            start_time=fx.STALL_START - 1,
+            end_time=fx.STALL_END,
+            max_limit=10,
+        )
+        self.assertEqual(trans.get("status"), "success")
+        pairs = [(t["t"], t["v"]) for t in trans.get("data", [])]
+        print(f"  ready_in transitions around stall window: {pairs}")
+        self.assertEqual(pairs, [(fx.STALL_START, "0"), (fx.STALL_END, "1")])
+        print(f"  [PASS] Test 1.4: Fixture reference points")
 
 
 if __name__ == "__main__":

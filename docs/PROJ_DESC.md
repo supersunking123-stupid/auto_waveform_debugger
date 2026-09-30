@@ -52,22 +52,32 @@ uv pip install fastmcp
 ```bash
 .venv/bin/python3 -m unittest waveform_explorer.tests.test_signal_overview
 .venv/bin/python3 -m unittest agent_debug_automation.tests.test_cross_linking
-cd standalone_trace && ctest --test-dir build --output-on-failure
+(cd standalone_trace && ctest --test-dir build --output-on-failure)
+
+# scenario suites; exits non-zero if any test fails (exit status 77 = SKIPPED)
+test_cases/run_all_tests.sh
 ```
+
+All commands run from the repo root. The cross-link tests (`test_cases/tc16`-`tc27` and
+`FixtureSessionIntegrationTests` in `test_cross_linking.py`) run against a small generated fixture,
+`test_cases/rtl_trace.db` + `test_cases/wave.fsdb`, built from `test_cases/cross_link_fixture/src`
+(testbench top module `top`) by `test_cases/make_fixture.sh` (`--force` rebuilds, `--check` tests whether it
+is up to date). The tests call it automatically when the outputs are missing or stale; the outputs are
+gitignored. Shared signal names and times are in `test_cases/cross_link_common.py`. See [TEST.md](TEST.md).
 
 ## Key Documentation
 
 | File | Content |
 |---|---|
-| `MCP_SIGNATURES.md` | Complete MCP tool signatures (the API contract) |
+| `docs/MCP_SIGNATURES.md` | Complete MCP tool signatures (the API contract) |
 | `agent_debug_automation/README.md` | Orchestration layer usage, session model, cross-link tool semantics |
-| `agent_debug_automation/Tech_Note.md` | Internal design: process management, signal mapping, ranking heuristics, where to change behavior |
+| `agent_debug_automation/docs/Tech_Note.md` | Internal design: process management, signal mapping, ranking heuristics, where to change behavior |
 | `waveform_explorer/README.md` | Waveform query commands, FSDB notes, build/run instructions |
-| `waveform_explorer/Tech_Note.md` | C++ internals: WaveDatabase, AgentAPI, lazy FSDB loading, path normalization |
+| `waveform_explorer/docs/Tech_Note.md` | C++ internals: WaveDatabase, AgentAPI, lazy FSDB loading, path normalization |
 | `standalone_trace/README.md` | `rtl_trace` CLI usage: compile, trace, find, hier, serve |
-| `standalone_trace/Tech_Note.md` | C++ internals: graph DB format, compile-time indexing, memory optimization |
-| `standalone_trace/LOCALTEST.md` | Local bring-up guide with Cores-VeeR-EH1 example |
-| `failure_history.md` | Regression history for past FSDB/waveform bugs |
+| `standalone_trace/docs/Tech_Note.md` | C++ internals: graph DB format, compile-time indexing, memory optimization |
+| `standalone_trace/docs/LOCALTEST.md` | Local bring-up guide with Cores-VeeR-EH1 example |
+| `docs/failure_history.md` | Regression history for past FSDB/waveform bugs |
 
 ## Key Source Files
 
@@ -76,7 +86,7 @@ cd standalone_trace && ctest --test-dir build --output-on-failure
 | File | Purpose |
 |---|---|
 | `agent_debug_automation_mcp.py` | Thin compatibility wrapper that re-exports the split MCP implementation and supports both direct-script and `-m` startup |
-| `tests/test_cross_linking.py` | Cross-link regression (timer_tb VCD + optional NVDLA FSDB) |
+| `tests/test_cross_linking.py` | Cross-link regression (timer_tb VCD + generated cross-link fixture FSDB/DB via `test_cases/make_fixture.sh`) |
 
 ### `waveform_explorer/`
 

@@ -7,10 +7,13 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Source VCS environment
-source ~/my_env/vcs.bash
+# Source VCS environment only if the site setup script exists; otherwise rely
+# on vcs already being on PATH (VCS steps are skipped when it is not).
+if [ -f ~/my_env/vcs.bash ]; then
+    source ~/my_env/vcs.bash
+fi
 
-RTL_TRACE="${RTL_TRACE:-/home/qsun/AI_PROJ/auto_waveform_debugger/standalone_trace/build/rtl_trace}"
+RTL_TRACE="${RTL_TRACE:-$(cd "$SCRIPT_DIR/../.." && pwd)/standalone_trace/build/rtl_trace}"
 
 echo "=========================================="
 echo "Test Case 12: Multi-Cone Reconvergent"
@@ -18,7 +21,11 @@ echo "=========================================="
 
 # Step 1: VCS compilation
 echo "[Step 1] Running VCS compilation..."
-vcs -full64 -f files.f -top multi_cone_top -l vcs.log -sverilog +v2k 2>&1 && echo "VCS compilation PASSED!" || echo "VCS compilation FAILED!"
+if command -v vcs >/dev/null 2>&1; then
+    vcs -full64 -f files.f -top multi_cone_top -l vcs.log -sverilog +v2k 2>&1 && echo "VCS compilation PASSED!" || echo "VCS compilation FAILED!"
+else
+    echo "vcs not found on PATH, skipping VCS compilation step..."
+fi
 
 # Step 2: rtl_trace compile
 echo "[Step 2] Running rtl_trace compile..."

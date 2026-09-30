@@ -1,5 +1,10 @@
 # Failure History
 
+> Note: this is a historical log. The NVDLA data it references (the `test_cases/wave.fsdb` from the NVDLA run,
+> the NVDLA signal paths, and the `/home/qsun/AI_PROJ/...` paths below) no longer exists on this machine. The
+> equivalent regression now lives in `test_cases/tc27_history_failure_regression`, which runs against the small
+> generated fixture built by `test_cases/make_fixture.sh`.
+
 This file records previously failing waveform queries that should remain covered by regression tests.
 
 Waveform used for reproduction:

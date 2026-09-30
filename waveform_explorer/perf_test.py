@@ -2,11 +2,12 @@ import time
 import json
 import subprocess
 import os
+from pathlib import Path
 
 # Paths
 CLI_PATH = os.path.join(os.path.dirname(__file__), "build", "wave_agent_cli")
 VCD_PATH = os.path.join(os.path.dirname(__file__), "timer_tb.vcd")
-LARGE_VCD_PATH = "/home/qsun/AI_PROJ/auto_waveform_debugger/Cores-VeeR-EH1/sim.vcd"
+LARGE_VCD_PATH = str(Path(__file__).resolve().parents[1] / "Cores-VeeR-EH1" / "sim.vcd")
 
 def run_cli(vcd_path: str, cmd: str, args: dict = None):
     query = {"cmd": cmd, "args": args or {}}

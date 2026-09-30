@@ -6,10 +6,10 @@ Verifies absolute and cycle-relative sampling in `trace_with_snapshot`.
 
 ## Test Configuration
 
-- **Signal:** `top.mem0_rd_bw_mon.clk`
-- **Time:** `399970000`
+- **Signal:** `top.hs_mon.ready_in`
+- **Time:** `175000`
 - **Mode:** `drivers`
-- **Clock:** `top.mem0_rd_bw_mon.clk`
+- **Clock:** `top.hs_mon.clk`
 - **Sample Offsets:** `[-1000, 0, 1000]`
 - **Cycle Offsets:** `[-1, 0, 1]`
 
@@ -25,6 +25,7 @@ Expected:
 - `waveform.cycle_offset_samples.samples` exists for valid cycle times
 
 Clock-specific:
-- Cycle `0` corresponds to `399970000`
+- Cycle `0` corresponds to `175000`
 - Cycle `-1` is previous posedge
 - Cycle `1` is next posedge
+- Fixture clock period is `10000` ps, so cycle times are `165000`, `175000`, `185000`

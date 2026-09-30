@@ -4,14 +4,15 @@ Test Case 22: Cross-Link Snapshot and Cycle Sampling
 Phase 7: Snapshot And Cycle Sampling
 """
 
-import os
 import sys
 import unittest
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT_DIR))
+sys.path.insert(0, str(ROOT_DIR / "test_cases"))
 
+import cross_link_common as fx  # noqa: E402
 from agent_debug_automation import agent_debug_automation_mcp as mcp_mod
 
 
@@ -22,22 +23,18 @@ class SnapshotCycleSamplingTests(unittest.TestCase):
     def setUpClass(cls):
         cls.test_cases_dir = Path(__file__).resolve().parent
         cls.root_dir = Path(__file__).resolve().parents[1]
-        cls.db_path = str(cls.root_dir / "rtl_trace.db")
-        cls.waveform_path = str(cls.root_dir / "wave.fsdb")
-        cls.rtl_trace_bin = str(cls.root_dir.parent / "standalone_trace" / "build" / "rtl_trace")
-        cls.wave_cli_bin = str(cls.root_dir.parent / "waveform_explorer" / "build" / "wave_agent_cli")
-        cls.signal = "top.mem0_rd_bw_mon.clk"
-        cls.time = 399970000
-        cls.clock_path = "top.mem0_rd_bw_mon.clk"
+        cls.db_path = fx.DB_PATH
+        cls.waveform_path = fx.WAVE_PATH
+        cls.rtl_trace_bin = fx.RTL_TRACE_BIN
+        cls.wave_cli_bin = fx.WAVE_CLI_BIN
+        cls.signal = fx.READY
+        cls.time = fx.T_REF
+        cls.clock_path = fx.CLK
         cls.sample_offsets = [-1000, 0, 1000]
         cls.cycle_offsets = [-1, 0, 1]
 
-        for path, name in [(cls.db_path, "rtl_trace.db"), 
-                           (cls.waveform_path, "wave.fsdb"),
-                           (cls.rtl_trace_bin, "rtl_trace"),
-                           (cls.wave_cli_bin, "wave_agent_cli")]:
-            if not os.path.exists(path):
-                raise FileNotFoundError(f"{name} not found: {path}")
+        # Build the fixture on demand (no-op when up to date)
+        fx.ensure_fixture()
 
     def setUp(self):
         mcp_mod.wave_signal_resolution_cache.clear()
@@ -68,31 +65,27 @@ class SnapshotCycleSamplingTests(unittest.TestCase):
         # Check absolute_offset_samples
         self.assertIn("absolute_offset_samples", waveform,
                      "Missing waveform.absolute_offset_samples")
-        print(f"  absolute_offset_samples: {list(waveform.get('absolute_offset_samples', {}).keys())}")
+        absolute = waveform.get("absolute_offset_samples", {})
+        print(f"  absolute_offset_samples: {list(absolute.keys())}")
+        self.assertEqual(sorted(int(k) for k in absolute.keys()),
+                         [self.time + off for off in self.sample_offsets])
 
-        # Check cycle_offset_samples
+        # Check cycle_offset_samples (the fixture clock has a 10 ns period)
         cycle_data = waveform.get("cycle_offset_samples", {})
-        if cycle_data:
-            self.assertIn("clock_path", cycle_data, "Missing cycle_offset_samples.clock_path")
-            self.assertIn("resolved_clock_path", cycle_data,
-                         "Missing cycle_offset_samples.resolved_clock_path")
-            self.assertIn("cycle_times", cycle_data, "Missing cycle_offset_samples.cycle_times")
-            self.assertIn("samples", cycle_data, "Missing cycle_offset_samples.samples")
-
-            cycle_times = cycle_data.get("cycle_times", {})
-            print(f"  cycle_times keys: {list(cycle_times.keys())}")
-            print(f"  resolved_clock_path: {cycle_data.get('resolved_clock_path')}")
-
-            # Check cycle 0 corresponds to requested time
-            if 0 in cycle_times:
-                cycle_0_time = cycle_times[0]
-                if cycle_0_time is not None:
-                    print(f"  cycle 0 time: {cycle_0_time}")
-                    # Cycle 0 should be at or near the requested time
-                    self.assertEqual(cycle_0_time, self.time,
-                                   f"Cycle 0 should be at {self.time}, got {cycle_0_time}")
-        else:
-            print("  [WARN] No cycle data returned (clock edge may not have been found)")
+        self.assertTrue(cycle_data, "No cycle data returned (clock edge not found)")
+        self.assertIn("clock_path", cycle_data, "Missing cycle_offset_samples.clock_path")
+        self.assertIn("resolved_clock_path", cycle_data,
+                     "Missing cycle_offset_samples.resolved_clock_path")
+        self.assertIn("cycle_times", cycle_data, "Missing cycle_offset_samples.cycle_times")
+        self.assertIn("samples", cycle_data, "Missing cycle_offset_samples.samples")
+        cycle_times = cycle_data.get("cycle_times", {})
+        print(f"  cycle_times: {cycle_times}")
+        print(f"  resolved_clock_path: {cycle_data.get('resolved_clock_path')}")
+        # Cycle 0 is the requested time; +/-1 are one clock period (10000 ps) away.
+        self.assertEqual(cycle_times.get(0), self.time,
+                         f"Cycle 0 should be at {self.time}, got {cycle_times.get(0)}")
+        self.assertEqual(cycle_times.get(-1), self.time - 10000)
+        self.assertEqual(cycle_times.get(1), self.time + 10000)
 
         print(f"  [PASS] Test 7.1: Snapshot and cycle sampling")
 

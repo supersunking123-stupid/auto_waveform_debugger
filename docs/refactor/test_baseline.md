@@ -78,7 +78,7 @@ Test cases tc16–tc27: Cross-link integration tests (require rtl_trace.db + wav
 
 ```bash
 cd standalone_trace && ctest --test-dir build --output-on-failure
-cd /home/qsun/AI_PROJ/auto_waveform_debugger
+cd <repo root>
 .venv/bin/python3 -m unittest waveform_explorer.tests.test_signal_overview
 .venv/bin/python3 -m unittest waveform_explorer.tests.test_waveform_commands
 .venv/bin/python3 -m unittest agent_debug_automation.tests.test_cross_linking

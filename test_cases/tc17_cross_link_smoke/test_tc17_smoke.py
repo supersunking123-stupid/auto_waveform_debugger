@@ -7,7 +7,6 @@ Validates the four main cross-link tools with basic smoke tests.
 """
 
 import json
-import os
 import sys
 import unittest
 from pathlib import Path
@@ -15,7 +14,9 @@ from pathlib import Path
 # Add project root to path
 ROOT_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT_DIR))
+sys.path.insert(0, str(ROOT_DIR / "test_cases"))
 
+import cross_link_common as fx  # noqa: E402
 from agent_debug_automation import agent_debug_automation_mcp as mcp_mod
 
 
@@ -27,23 +28,18 @@ class CrossLinkSmokeTests(unittest.TestCase):
         """Set up test fixtures."""
         cls.test_cases_dir = Path(__file__).resolve().parent
         cls.root_dir = Path(__file__).resolve().parents[1]
-        cls.db_path = str(cls.root_dir / "rtl_trace.db")
-        cls.waveform_path = str(cls.root_dir / "wave.fsdb")
-        cls.rtl_trace_bin = str(cls.root_dir.parent / "standalone_trace" / "build" / "rtl_trace")
-        cls.wave_cli_bin = str(cls.root_dir.parent / "waveform_explorer" / "build" / "wave_agent_cli")
+        cls.db_path = fx.DB_PATH
+        cls.waveform_path = fx.WAVE_PATH
+        cls.rtl_trace_bin = fx.RTL_TRACE_BIN
+        cls.wave_cli_bin = fx.WAVE_CLI_BIN
 
         # Focus point for smoke tests
-        cls.signal = "top.mem0_rd_bw_mon.ready_in"
-        cls.time = 399970000
+        cls.signal = fx.READY
+        cls.time = fx.T_REF
         cls.mode = "drivers"
 
-        # Verify assets exist
-        for path, name in [(cls.db_path, "rtl_trace.db"), 
-                           (cls.waveform_path, "wave.fsdb"),
-                           (cls.rtl_trace_bin, "rtl_trace"),
-                           (cls.wave_cli_bin, "wave_agent_cli")]:
-            if not os.path.exists(path):
-                raise FileNotFoundError(f"{name} not found: {path}")
+        # Build the fixture on demand (no-op when up to date)
+        fx.ensure_fixture()
 
     def setUp(self):
         """Clear caches before each test."""
@@ -188,13 +184,7 @@ class CrossLinkSmokeTests(unittest.TestCase):
         )
         print(f"  status: {result.get('status')}")
 
-        # Edge cause may return WARN if no edge found
-        if result.get("status") == "error":
-            msg = result.get("message", "")
-            if "no anyedge edge found" in msg:
-                print(f"  [WARN] Test 2.4: No edge found for signal (expected for inactive signals)")
-                return
-
+        # fx.T_REF is a real ready_in edge in the fixture, so an edge must be found.
         self.assertEqual(result.get("status"), "success",
                         f"explain_edge_cause failed: {result.get('message')}")
 
@@ -213,6 +203,7 @@ class CrossLinkSmokeTests(unittest.TestCase):
             self.assertIn("value_before_edge", edge_context, "Missing edge_context.value_before_edge")
             self.assertIn("value_at_edge", edge_context, "Missing edge_context.value_at_edge")
 
+        self.assertEqual(time_context.get("resolved_edge_time"), self.time)
         print(f"  requested_time: {time_context.get('requested_time')}")
         print(f"  resolved_edge_time: {time_context.get('resolved_edge_time')}")
         print(f"  [PASS] Test 2.4: explain_edge_cause")

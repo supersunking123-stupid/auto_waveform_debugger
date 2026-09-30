@@ -2,13 +2,14 @@
 """
 Cross-Link Test Harness and Report Generator
 
-Runs all cross-link test cases (tc16-tc26) and generates:
+Runs all cross-link test cases (tc16-tc27) against the regenerable fixture
+(test_cases/make_fixture.sh builds it on demand) and generates:
 1. Markdown test report
 2. Summary table (CSV)
 3. Bug list (JSON)
 
 Usage:
-    python run_cross_link_tests.py [--output-dir OUTPUT_DIR]
+    ../.venv/bin/python3 run_cross_link_tests.py [--output-dir OUTPUT_DIR]
 """
 
 import argparse
@@ -22,19 +23,23 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 # Test case definitions
+# Fixture signals/times come from cross_link_common.py (fixture: make_fixture.sh)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cross_link_common as fx  # noqa: E402
+
 TEST_CASES = [
-    {"id": "tc16", "dir": "tc16_cross_link_backend_sanity", "name": "Backend Sanity", "phase": 1, "signal": "top.mem0_rd_bw_mon.clk", "time": 399970000},
-    {"id": "tc17", "dir": "tc17_cross_link_smoke", "name": "Cross-Link Smoke", "phase": 2, "signal": "top.mem0_rd_bw_mon.ready_in", "time": 399970000},
-    {"id": "tc18", "dir": "tc18_cross_link_edge_correctness", "name": "Edge Correctness", "phase": 3, "signal": "top.mem0_rd_bw_mon.clk", "time": 399970000},
-    {"id": "tc19", "dir": "tc19_cross_link_direction_ranking", "name": "Direction Ranking", "phase": 4, "signal": "top.mem0_rd_bw_mon.clk", "time": 399970000},
-    {"id": "tc20", "dir": "tc20_cross_link_closeness_ranking", "name": "Closeness Ranking", "phase": 5, "signal": "top.mem0_rd_bw_mon.clk", "time": 399970000},
-    {"id": "tc21", "dir": "tc21_cross_link_stuck_classification", "name": "Stuck Classification", "phase": 6, "signal": "top.mem0_rd_bw_mon.ready_in", "time": 399970000},
-    {"id": "tc22", "dir": "tc22_cross_link_snapshot_sampling", "name": "Snapshot Sampling", "phase": 7, "signal": "top.mem0_rd_bw_mon.clk", "time": 399970000},
-    {"id": "tc23", "dir": "tc23_cross_link_mapping_robustness", "name": "Mapping Robustness", "phase": 8, "signal": "top.mem0_rd_bw_mon.clk", "time": 399970000},
-    {"id": "tc24", "dir": "tc24_cross_link_unmapped_handling", "name": "Unmapped Handling", "phase": 9, "signal": "top.mem0_rd_bw_mon.ready_in", "time": 399970000},
-    {"id": "tc25", "dir": "tc25_cross_link_performance", "name": "Performance", "phase": 10, "signal": "top.mem0_rd_bw_mon.ready_in", "time": 399970000},
-    {"id": "tc26", "dir": "tc26_cross_link_non_clock_active", "name": "Non-Clock Active", "phase": 11, "signal": "varies", "time": "varies"},
-    {"id": "tc27", "dir": "tc27_history_failure_regression", "name": "History Failure Regression", "phase": 12, "signal": "CQ signals", "time": "784000000-800000000"},
+    {"id": "tc16", "dir": "tc16_cross_link_backend_sanity", "name": "Backend Sanity", "phase": 1, "signal": fx.CLK, "time": fx.T_REF},
+    {"id": "tc17", "dir": "tc17_cross_link_smoke", "name": "Cross-Link Smoke", "phase": 2, "signal": fx.READY, "time": fx.T_REF},
+    {"id": "tc18", "dir": "tc18_cross_link_edge_correctness", "name": "Edge Correctness", "phase": 3, "signal": fx.CLK, "time": fx.T_REF},
+    {"id": "tc19", "dir": "tc19_cross_link_direction_ranking", "name": "Direction Ranking", "phase": 4, "signal": fx.CLK, "time": fx.T_REF},
+    {"id": "tc20", "dir": "tc20_cross_link_closeness_ranking", "name": "Closeness Ranking", "phase": 5, "signal": fx.CLK, "time": fx.T_REF},
+    {"id": "tc21", "dir": "tc21_cross_link_stuck_classification", "name": "Stuck Classification", "phase": 6, "signal": fx.READY, "time": fx.T_STUCK},
+    {"id": "tc22", "dir": "tc22_cross_link_snapshot_sampling", "name": "Snapshot Sampling", "phase": 7, "signal": fx.READY, "time": fx.T_REF},
+    {"id": "tc23", "dir": "tc23_cross_link_mapping_robustness", "name": "Mapping Robustness", "phase": 8, "signal": fx.CLK, "time": fx.T_REF},
+    {"id": "tc24", "dir": "tc24_cross_link_unmapped_handling", "name": "Unmapped Handling", "phase": 9, "signal": fx.FIFO_RD_DATA, "time": fx.T_REF},
+    {"id": "tc25", "dir": "tc25_cross_link_performance", "name": "Performance", "phase": 10, "signal": fx.READY, "time": fx.T_REF},
+    {"id": "tc26", "dir": "tc26_cross_link_non_clock_active", "name": "Non-Clock Active", "phase": 11, "signal": fx.READY, "time": fx.T_REF},
+    {"id": "tc27", "dir": "tc27_history_failure_regression", "name": "History Failure Regression", "phase": 12, "signal": "packed-vector signals (fifo count/wr_ptr, src data/id)", "time": "1000000-1100000"},
 ]
 
 

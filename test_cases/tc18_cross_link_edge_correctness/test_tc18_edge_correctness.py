@@ -6,14 +6,15 @@ Phase 3: Exact-Edge Correctness Regression
 Mandatory correctness check for known-good clock edge.
 """
 
-import os
 import sys
 import unittest
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT_DIR))
+sys.path.insert(0, str(ROOT_DIR / "test_cases"))
 
+import cross_link_common as fx  # noqa: E402
 from agent_debug_automation import agent_debug_automation_mcp as mcp_mod
 
 
@@ -25,25 +26,20 @@ class ExactEdgeCorrectnessTests(unittest.TestCase):
         """Set up test fixtures."""
         cls.test_cases_dir = Path(__file__).resolve().parent
         cls.root_dir = Path(__file__).resolve().parents[1]
-        cls.db_path = str(cls.root_dir / "rtl_trace.db")
-        cls.waveform_path = str(cls.root_dir / "wave.fsdb")
-        cls.rtl_trace_bin = str(cls.root_dir.parent / "standalone_trace" / "build" / "rtl_trace")
-        cls.wave_cli_bin = str(cls.root_dir.parent / "waveform_explorer" / "build" / "wave_agent_cli")
+        cls.db_path = fx.DB_PATH
+        cls.waveform_path = fx.WAVE_PATH
+        cls.rtl_trace_bin = fx.RTL_TRACE_BIN
+        cls.wave_cli_bin = fx.WAVE_CLI_BIN
 
         # Known-good reference point (mandatory)
-        cls.signal = "top.mem0_rd_bw_mon.clk"
-        cls.time = 399970000
+        cls.signal = fx.CLK
+        cls.time = fx.T_REF
         cls.edge_type = "posedge"
         cls.direction = "backward"
         cls.mode = "drivers"
 
-        # Verify assets
-        for path, name in [(cls.db_path, "rtl_trace.db"), 
-                           (cls.waveform_path, "wave.fsdb"),
-                           (cls.rtl_trace_bin, "rtl_trace"),
-                           (cls.wave_cli_bin, "wave_agent_cli")]:
-            if not os.path.exists(path):
-                raise FileNotFoundError(f"{name} not found: {path}")
+        # Build the fixture on demand (no-op when up to date)
+        fx.ensure_fixture()
 
     def setUp(self):
         """Clear caches before each test."""
@@ -71,7 +67,7 @@ class ExactEdgeCorrectnessTests(unittest.TestCase):
         self.assertEqual(result.get("status"), "success",
                         f"explain_edge_cause failed: {result.get('message')}")
 
-        # Check resolved_edge_time == 399970000
+        # Check resolved_edge_time == the fixture reference posedge (fx.T_REF)
         time_context = result.get("time_context", {})
         resolved_edge_time = time_context.get("resolved_edge_time")
         print(f"  resolved_edge_time: {resolved_edge_time}")

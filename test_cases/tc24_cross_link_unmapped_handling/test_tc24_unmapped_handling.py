@@ -4,14 +4,15 @@ Test Case 24: Cross-Link Unmapped Signal Handling
 Phase 9: Unmapped Signal Handling
 """
 
-import os
 import sys
 import unittest
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT_DIR))
+sys.path.insert(0, str(ROOT_DIR / "test_cases"))
 
+import cross_link_common as fx  # noqa: E402
 from agent_debug_automation import agent_debug_automation_mcp as mcp_mod
 
 
@@ -22,19 +23,17 @@ class UnmappedSignalHandlingTests(unittest.TestCase):
     def setUpClass(cls):
         cls.test_cases_dir = Path(__file__).resolve().parent
         cls.root_dir = Path(__file__).resolve().parents[1]
-        cls.db_path = str(cls.root_dir / "rtl_trace.db")
-        cls.waveform_path = str(cls.root_dir / "wave.fsdb")
-        cls.rtl_trace_bin = str(cls.root_dir.parent / "standalone_trace" / "build" / "rtl_trace")
-        cls.wave_cli_bin = str(cls.root_dir.parent / "waveform_explorer" / "build" / "wave_agent_cli")
-        cls.signal = "top.mem0_rd_bw_mon.ready_in"
-        cls.time = 399970000
+        cls.db_path = fx.DB_PATH
+        cls.waveform_path = fx.WAVE_PATH
+        cls.rtl_trace_bin = fx.RTL_TRACE_BIN
+        cls.wave_cli_bin = fx.WAVE_CLI_BIN
+        # rd_data is read from the FIFO memory array, which the fixture FSDB does not
+        # dump (unpacked arrays need +mda), so its cone contains an unmapped signal.
+        cls.signal = fx.FIFO_RD_DATA
+        cls.time = fx.T_REF
 
-        for path, name in [(cls.db_path, "rtl_trace.db"), 
-                           (cls.waveform_path, "wave.fsdb"),
-                           (cls.rtl_trace_bin, "rtl_trace"),
-                           (cls.wave_cli_bin, "wave_agent_cli")]:
-            if not os.path.exists(path):
-                raise FileNotFoundError(f"{name} not found: {path}")
+        # Build the fixture on demand (no-op when up to date)
+        fx.ensure_fixture()
 
     def setUp(self):
         mcp_mod.wave_signal_resolution_cache.clear()
@@ -64,11 +63,13 @@ class UnmappedSignalHandlingTests(unittest.TestCase):
         self.assertIsInstance(unmapped, list, "unmapped_signals should be a list")
         print(f"  trace_with_snapshot unmapped_signals count: {len(unmapped)}")
 
+        self.assertTrue(unmapped, "Expected at least one unmapped signal in the rd_data cone")
         # Check structure of unmapped entries
-        for entry in unmapped[:3]:
+        for entry in unmapped:
             self.assertIn("signal", entry, "Missing 'signal' in unmapped entry")
             self.assertIn("reason", entry, "Missing 'reason' in unmapped entry")
             print(f"    - {entry.get('signal')}: {entry.get('reason')}")
+        self.assertIn("top.dut.u_fifo.mem", [e.get("signal") for e in unmapped])
 
         # Test explain_signal_at_time
         explain_result = mcp_mod.explain_signal_at_time(
@@ -81,17 +82,14 @@ class UnmappedSignalHandlingTests(unittest.TestCase):
             wave_cli_bin=self.wave_cli_bin,
         )
         self.assertEqual(explain_result.get("status"), "success")
-
         explain_unmapped = explain_result.get("unmapped_signals", [])
         print(f"  explain_signal_at_time unmapped_signals count: {len(explain_unmapped)}")
+        self.assertTrue(explain_unmapped, "explain_signal_at_time should also report unmapped signals")
 
-        # Verify tool still returns success even with unmapped signals
+        # Tools still return success while reporting the unmapped signals, and
+        # the mapped part of the cone is still usable.
         print(f"  Tool returned success with {len(unmapped)} unmapped signals")
-
-        if not unmapped:
-            print("  [WARN] No unmapped signals found -- test is not fully exercising its purpose")
-            print("  [INFO] Consider using a signal known to have unmapped cone entries")
-
+        self.assertTrue(explain_result.get("explanations", {}).get("candidate_paths"))
         print(f"  [PASS] Test 9.1: Unmapped signal handling")
 
 

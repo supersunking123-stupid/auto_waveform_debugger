@@ -6,8 +6,8 @@ Verifies that signals flipping at or nearest to T outrank signals with only gene
 
 ## Test Configuration
 
-- **Signal:** `top.mem0_rd_bw_mon.clk`
-- **Time:** `399970000`
+- **Signal:** `top.hs_mon.clk`
+- **Time:** `175000`
 - **Mode:** `drivers`
 
 ## Test 5.1: Closeness-First Ranking
@@ -23,4 +23,5 @@ Expected:
 - `most_active_near_time` ordering is dominated by `closeness_score`
 - Raw toggle count alone does not override exact closeness
 
-This is a manual inspection phase.
+The test asserts the ranking is non-empty and that `closeness_score` is
+non-increasing over `ranking.all_signals` (first entry has the maximum).

@@ -4,14 +4,15 @@ Test Case 23: Cross-Link Mapping Robustness
 Phase 8: Structural-To-Waveform Mapping Robustness
 """
 
-import os
 import sys
 import unittest
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT_DIR))
+sys.path.insert(0, str(ROOT_DIR / "test_cases"))
 
+import cross_link_common as fx  # noqa: E402
 from agent_debug_automation import agent_debug_automation_mcp as mcp_mod
 
 
@@ -22,17 +23,13 @@ class MappingRobustnessTests(unittest.TestCase):
     def setUpClass(cls):
         cls.test_cases_dir = Path(__file__).resolve().parent
         cls.root_dir = Path(__file__).resolve().parents[1]
-        cls.db_path = str(cls.root_dir / "rtl_trace.db")
-        cls.waveform_path = str(cls.root_dir / "wave.fsdb")
-        cls.rtl_trace_bin = str(cls.root_dir.parent / "standalone_trace" / "build" / "rtl_trace")
-        cls.wave_cli_bin = str(cls.root_dir.parent / "waveform_explorer" / "build" / "wave_agent_cli")
+        cls.db_path = fx.DB_PATH
+        cls.waveform_path = fx.WAVE_PATH
+        cls.rtl_trace_bin = fx.RTL_TRACE_BIN
+        cls.wave_cli_bin = fx.WAVE_CLI_BIN
 
-        for path, name in [(cls.db_path, "rtl_trace.db"), 
-                           (cls.waveform_path, "wave.fsdb"),
-                           (cls.rtl_trace_bin, "rtl_trace"),
-                           (cls.wave_cli_bin, "wave_agent_cli")]:
-            if not os.path.exists(path):
-                raise FileNotFoundError(f"{name} not found: {path}")
+        # Build the fixture on demand (no-op when up to date)
+        fx.ensure_fixture()
 
     def setUp(self):
         mcp_mod.wave_signal_resolution_cache.clear()
@@ -43,7 +40,7 @@ class MappingRobustnessTests(unittest.TestCase):
         """Test 8.1: Exact mapping"""
         print("\n[Test 8.1] Exact mapping")
 
-        signal = "top.mem0_rd_bw_mon.clk"
+        signal = fx.CLK
         mapped = mcp_mod._map_signal_to_waveform(
             self.waveform_path, signal, wave_cli_bin=self.wave_cli_bin
         )
@@ -60,8 +57,8 @@ class MappingRobustnessTests(unittest.TestCase):
         """Test 8.2: Leading TOP. variant"""
         print("\n[Test 8.2] TOP. normalization")
 
-        base_signal = "top.mem0_rd_bw_mon.clk"
-        top_variant = "TOP.top.mem0_rd_bw_mon.clk"
+        base_signal = fx.CLK
+        top_variant = "TOP.top.hs_mon.clk"
 
         # Test base signal
         mapped_base = mcp_mod._map_signal_to_waveform(
@@ -98,23 +95,23 @@ class MappingRobustnessTests(unittest.TestCase):
         """Test 8.3: Bit-select to bus fallback"""
         print("\n[Test 8.3] Bit-select to bus fallback")
 
-        # Use the known bit-select signal from NVDLA design
-        bit_select_signal = "top.nvdla_top.nvdla_core2cvsram_ar_arid[7:0]"
-        
-        print(f"  Testing bit-select signal: {bit_select_signal}")
-        
-        # Test direct mapping of bit-select signal
-        mapped = mcp_mod._map_signal_to_waveform(
-            self.waveform_path, bit_select_signal, wave_cli_bin=self.wave_cli_bin
-        )
-        print(f"  signal: {bit_select_signal}")
-        print(f"  mapped: {mapped}")
-        
-        # Assert that mapping returns a non-empty result (either exact or via fallback)
-        self.assertIsNotNone(
-            mapped,
-            f"Bit-select signal {bit_select_signal} should resolve (exact or fallback)",
-        )
+        # The FSDB stores the 8-bit burst id as a packed vector `id_in[7:0]`.
+        bus = fx.ID + "[7:0]"
+        cases = [
+            (bus, bus),                # explicit packed range: exact match
+            (fx.ID + "[3]", bus),      # single-bit select falls back to the bus
+            (fx.ID, bus),              # bare name resolves to the packed vector
+        ]
+        for signal, expected in cases:
+            mapped = mcp_mod._map_signal_to_waveform(
+                self.waveform_path, signal, wave_cli_bin=self.wave_cli_bin
+            )
+            print(f"  signal: {signal} -> mapped: {mapped}")
+            self.assertIsNotNone(
+                mapped,
+                f"Signal {signal} should resolve (exact or fallback)",
+            )
+            self.assertEqual(mapped, expected, f"Unexpected mapping for {signal}")
 
         print(f"  [PASS] Test 8.3: Bit-select to bus fallback")
 

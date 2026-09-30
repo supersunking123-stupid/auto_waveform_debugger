@@ -1,7 +1,8 @@
 # Local Test on Cores-VeeR-EH1
 
 This guide shows how to test `standalone_trace/rtl_trace` against the
-`Cores-VeeR-EH1` design in the same workspace.
+`Cores-VeeR-EH1` design in the same workspace. In the commands below,
+`<repo root>` is the top of your `auto_waveform_debugger` checkout.
 
 ## Do I need to run Step 1 / Step 2 every trial?
 
@@ -17,7 +18,7 @@ Usually no.
 ## 1) Build `rtl_trace`
 
 ```bash
-cd /home/qsun/AI_PROJ/auto_waveform_debugger/standalone_trace
+cd <repo root>/standalone_trace
 cmake -B build -GNinja .
 ninja -C build
 ```
@@ -25,7 +26,7 @@ ninja -C build
 ## 2) Prepare `simview.flist` in Cores-VeeR-EH1
 
 ```bash
-cd /home/qsun/AI_PROJ/auto_waveform_debugger/Cores-VeeR-EH1
+cd <repo root>/Cores-VeeR-EH1
 RV_ROOT=$PWD make -f tools/Makefile snapshots/default/simview.flist
 ```
 
@@ -36,8 +37,8 @@ This generates:
 ## 3) Compile trace DB
 
 ```bash
-cd /home/qsun/AI_PROJ/auto_waveform_debugger/Cores-VeeR-EH1
-/home/qsun/AI_PROJ/auto_waveform_debugger/standalone_trace/build/rtl_trace compile \
+cd <repo root>/Cores-VeeR-EH1
+../standalone_trace/build/rtl_trace compile \
   --db /tmp/veer_trace.db \
   --single-unit \
   --libraries-inherit-macros \
@@ -57,7 +58,7 @@ Expected summary:
 Drivers example:
 
 ```bash
-/home/qsun/AI_PROJ/auto_waveform_debugger/standalone_trace/build/rtl_trace trace \
+../standalone_trace/build/rtl_trace trace \
   --db /tmp/veer_trace.db \
   --mode drivers \
   --signal tb_top.bridge.clk
@@ -66,7 +67,7 @@ Drivers example:
 Loads example:
 
 ```bash
-/home/qsun/AI_PROJ/auto_waveform_debugger/standalone_trace/build/rtl_trace trace \
+../standalone_trace/build/rtl_trace trace \
   --db /tmp/veer_trace.db \
   --mode loads \
   --signal tb_top.bridge.m_awvalid
@@ -78,7 +79,7 @@ For `--mode loads`, expression endpoints can include:
 JSON output example:
 
 ```bash
-/home/qsun/AI_PROJ/auto_waveform_debugger/standalone_trace/build/rtl_trace trace \
+../standalone_trace/build/rtl_trace trace \
   --db /tmp/veer_trace.db \
   --mode drivers \
   --signal tb_top.bridge.clk \
@@ -88,7 +89,7 @@ JSON output example:
 Use traversal controls:
 
 ```bash
-/home/qsun/AI_PROJ/auto_waveform_debugger/standalone_trace/build/rtl_trace trace \
+../standalone_trace/build/rtl_trace trace \
   --db /tmp/veer_trace.db \
   --mode drivers \
   --signal tb_top.bridge.clk \
@@ -101,7 +102,7 @@ Use traversal controls:
 Signal search example:
 
 ```bash
-/home/qsun/AI_PROJ/auto_waveform_debugger/standalone_trace/build/rtl_trace find \
+../standalone_trace/build/rtl_trace find \
   --db /tmp/veer_trace.db \
   --query "tb_top.bridge.m_awvalid"
 ```
@@ -112,4 +113,4 @@ Signal search example:
 - You can use `compile --incremental` for repeated runs with unchanged inputs.
 - DB format is `RTL_TRACE_DB_V4` (tool can still read V1 / V2 / V3).
 - For built-in automated semantic regression, run:
-  - `ctest --test-dir /home/qsun/AI_PROJ/auto_waveform_debugger/standalone_trace/build --output-on-failure`
+  - (from `<repo root>`) `ctest --test-dir standalone_trace/build --output-on-failure`
