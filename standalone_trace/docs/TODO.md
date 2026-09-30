@@ -197,7 +197,8 @@ default against `=0`).
   without3quiet pairs. The prototype is on `item5-e2`, not retained here.
   Default remains1; no new default is recommended from invalid timing data.
 - **E3a inconclusive compile gate:** mmap v5 and command-specific indexes preserve
-  output. Warm Lumion trace median1.786s ->0.803s; RSS5,523,320 ->3,406,104kB.
+  output. Source-correct warm Lumion trace median 1.8609 s -> 0.8430 s;
+  RSS 5,523,320 -> 3,405,920 kB. Assignment text was populated and compared.
   Literal find also exceeds the30% gain threshold; serve metrics do not regress.
   Compile timings exhausted6attempts without3quiet pairs. The prototype remains
   on `item5-e3a`; this branch keeps the existing loader/writer.

@@ -453,24 +453,34 @@ E2's default1thread and8thread compile comparisons each obtained0quiet pairs in
 no compile gain or regression decision follows from their diagnostic numbers.
 Default thread count remains1.
 
-E3a paired warm query measurements,3alternating repetitions perquery:
+E3a warm measurements used three alternating pairs per query. Both processes ran
+from the matching source directory. Assignment text was populated and compared.
+The second source-correct confirmation is the primary measurement:
 
 | Operation | Reference median (range) | E3a median (range) |
 |---|---|---|
-| trace drivers wall |1.7963s (1.7962–1.8468)|0.8239s (0.8108–0.8269)|
-| trace max RSS |5,523,320kB|3,405,920kB|
-| literal find wall |1.8421s (1.8419–1.8539)|0.2283s (0.2283–0.2294)|
-| literal find max RSS |5,522,936kB|2,230,832kB|
-| serve startup |1.7046s (1.6936–1.7372)|1.0168s (1.0157–1.0450)|
-| serve regex |0.7304s (0.7114–0.7340)|0.6786s (0.6761–0.6787)|
+| trace drivers wall | 1.8609 s (1.8596–1.8787) | 0.8430 s (0.8203–0.8443) |
+| trace max RSS | 5,523,320 kB | 3,405,920 kB |
+| literal find wall | 1.8592 s (1.8473–1.8667) | 0.2397 s (0.2395–0.2443) |
+| literal find max RSS | 5,522,936 kB | 2,230,832 kB |
+| serve startup | 1.7251 s (1.7100–1.7336) | 1.0538 s (1.0276–1.0712) |
+| serve regex | 0.7352 s (0.7345–0.7396) | 0.6762 s (0.6721–0.6868) |
 
-A clean warm confirmation measured trace1.786s (1.771–1.817) ->0.803s
-(0.799–0.831), RSS5,523,320 ->3,406,104kB. Serve startup1.696 ->1.015s.
-All48saved artifacts match, including every serve repetition/exchange.
-The confirmation monitor saw only the persistent desktop renderer; no external
-batch job. Query measurements were serialized with worker builds/tests held.
+Trace wall fell 54.7%; trace RSS fell 38.3%. Literal find exceeded the 30% gain
+threshold. Serve metrics stayed within the allowed regression. All 48 saved
+artifacts matched, including every serve repetition and assignment text.
+The host monitor recorded 27 samples with only desktop activity and no external
+batch job. Worker builds and tests were held during the confirmation.
+Evidence: `/tmp/item5_q_e3a_sourcecwd_warm_confirm2`,
+`/tmp/item5_logs/query_measured_summary.json` (`sourcecwd_warm_confirmation2`), and
+`/tmp/item5_logs/query_sourcecwd_warm2_noise_summary.json`.
 
-Full49query T0 baseline runs are diagnostic only because external waveform-decoder
-activity was found in their host record. E3a's independent paired-query gain exceeds
-30% for both trace and literal find. Its compile regression gate is inconclusive,
-so the prototype is not retained. Warm trace<1.0s closes the E3b v6 gate.
+Earlier query runs from the repository root lacked assignment text because the DB
+stores relative source paths. Those timings are superseded by this confirmation.
+The source-correct cold pair and full-corpus T0 timings are diagnostic only:
+external Python jobs were present in their host records. Their output checks
+remain valid. Future full-corpus checks use the immutable patched source snapshot
+at `/tmp/item5_corpus/lumion_source_snapshot`.
+
+E3a's compile regression gate remains inconclusive, so the prototype is not
+retained. Warm trace below 1.0 s closes the E3b v6 gate.
