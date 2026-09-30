@@ -68,6 +68,19 @@ add_executable(canonical_path_test tests/canonical_path_test.cc)
 target_include_directories(canonical_path_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME canonical_path_test COMMAND canonical_path_test)
 
+add_executable(endpoint_dedup_test tests/endpoint_dedup_test.cc)
+target_include_directories(endpoint_dedup_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(endpoint_dedup_test PRIVATE slang::slang)
+add_test(NAME endpoint_dedup_test COMMAND endpoint_dedup_test)
+
+add_test(
+  NAME endpoint_dedup_regression
+  COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/endpoint_dedup_regression.py
+          --rtl-trace $<TARGET_FILE:rtl_trace>
+          --source-dir ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
 add_test(
   NAME multidim_axes_regression
   COMMAND ${Python3_EXECUTABLE}

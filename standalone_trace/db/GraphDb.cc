@@ -7,6 +7,7 @@
 #include "db/GraphDbInternals.h"
 #include "db/ParallelTopK.h"
 #include "db/CanonicalPath.h"
+#include "db/EndpointDedup.h"
 #include "compile/CompileData.h"
 #include "AssignmentUtils.h"
 
@@ -2474,6 +2475,7 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
     trace_cache.body_cache_limit = limit;
   }
   EndpointMergeScratch merge_scratch;
+  EndpointDedupScratch<> dedup_scratch;
 
   // Reserve pool to guarantee stable string_view keys — must not reallocate.
   // Heuristic: ~1 unique string per signal + ~0.5 per endpoint for file/path/direction.
@@ -2747,12 +2749,16 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
   double t_build_signal_record_s = 0.0;
   double t_compact_global_s = 0.0;
   double t_merge_s = 0.0;
+  double t_dedup_s = 0.0;
   double t_emit_driver_s = 0.0;
   double t_emit_load_s = 0.0;
   double t_cache_clear_s = 0.0;
   size_t build_driver_endpoint_count = 0;
   size_t build_load_endpoint_count = 0;
   size_t inferred_assignment_lhs_count = 0;
+  size_t dedup_driver_count = 0;
+  size_t dedup_load_count = 0;
+  size_t dedup_peak_list_size = 0;
   signal_count = 0;
   for (size_t bucket_index = 0; bucket_index < buckets->size(); ++bucket_index) {
     const std::vector<size_t> &bucket = (*buckets)[bucket_index];
@@ -2829,6 +2835,14 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
       MergeEndpointBitRangesInPlace(rec.loads, merge_scratch);
       if (profile_save_graph) t_merge_s += elapsed_seconds(t_merge_start, Clock::now());
 
+      // Global compaction sees the original load count. Dedup only complete,
+      // post-merge records within each list; never normalize refs or encodings.
+      const auto t_dedup_start = profile_save_graph ? Clock::now() : Clock::time_point{};
+      dedup_peak_list_size = std::max({dedup_peak_list_size, rec.drivers.size(), rec.loads.size()});
+      dedup_driver_count += DeduplicateEndpointsInPlace(rec.drivers, dedup_scratch);
+      dedup_load_count += DeduplicateEndpointsInPlace(rec.loads, dedup_scratch);
+      if (profile_save_graph) t_dedup_s += elapsed_seconds(t_dedup_start, Clock::now());
+
       GraphSignalRecord &gs = graph.signals[sig_id];
       gs.driver_begin = static_cast<uint32_t>(graph.endpoints.size());
       gs.driver_count = static_cast<uint32_t>(rec.drivers.size());
@@ -2876,6 +2890,7 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
   const auto t_cache_clear_start = profile_save_graph ? Clock::now() : Clock::time_point{};
   ClearTraceCompileCache(trace_cache);
   if (profile_save_graph) t_cache_clear_s += elapsed_seconds(t_cache_clear_start, Clock::now());
+  dedup_scratch.Release();
   const auto t_build_end = Clock::now();
   LogMemPhase("SaveGraphDb:AfterBuildLoop endpoints=" + std::to_string(graph.endpoints.size()) +
               " signal_refs=" + std::to_string(graph.signal_refs.size()));
@@ -2901,6 +2916,7 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
                   fmt_duration(t_build_signal_record_s) +
                   " compact_global_s=" + fmt_duration(t_compact_global_s) +
                   " merge_s=" + fmt_duration(t_merge_s) +
+                  " dedup_s=" + fmt_duration(t_dedup_s) +
                   " emit_drivers_s=" + fmt_duration(t_emit_driver_s) +
                   " emit_loads_s=" + fmt_duration(t_emit_load_s) +
                   " cache_clear_s=" + fmt_duration(t_cache_clear_s));
@@ -2917,7 +2933,10 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
                   std::to_string(build_driver_endpoint_count) +
                   " load_endpoints=" + std::to_string(build_load_endpoint_count) +
                   " signal_refs=" + std::to_string(graph.signal_refs.size()) +
-                  " inferred_assignment_lhs=" + std::to_string(inferred_assignment_lhs_count));
+                  " inferred_assignment_lhs=" + std::to_string(inferred_assignment_lhs_count) +
+                  " dedup_drivers_removed=" + std::to_string(dedup_driver_count) +
+                  " dedup_loads_removed=" + std::to_string(dedup_load_count) +
+                  " dedup_peak_list=" + std::to_string(dedup_peak_list_size));
     }
   }
 
@@ -3936,7 +3955,8 @@ bool ParseDefinesPlus(std::string_view tok, std::vector<std::string> &out) {
 // epoch 1. Epoch 2: endpoint bit-range merge fix (66c78ff).
 // Epoch 3: logical declared-axis metadata for multidimensional selectors (E4b).
 // Epoch 4: persist merged-range provenance for root-only display narrowing (E4c).
-constexpr int kCompileSemanticsEpoch = 4;
+// Epoch 5: stable full-field endpoint duplicate removal after compaction/merge (E4d).
+constexpr int kCompileSemanticsEpoch = 5;
 
 std::string ComputeCompileFingerprint(const std::vector<std::string> &passthrough_args) {
   std::vector<std::string> parts;

@@ -77,15 +77,7 @@ class CanonicalTracer {
 
  private:
   static bool SameEndpoint(const EndpointRecord &a, const EndpointRecord &b) {
-    return a.kind == b.kind && a.path == b.path && a.file == b.file && a.path_id == b.path_id &&
-           a.file_id == b.file_id && a.line == b.line && a.direction == b.direction &&
-           a.assignment_text == b.assignment_text && a.has_assignment_range == b.has_assignment_range &&
-           a.assignment_start == b.assignment_start && a.assignment_end == b.assignment_end &&
-           a.bit_map == b.bit_map && a.bit_map_approximate == b.bit_map_approximate &&
-           a.bit_map_logical_axes == b.bit_map_logical_axes &&
-           a.bit_map_merged == b.bit_map_merged &&
-           a.lhs_signal_ids == b.lhs_signal_ids && a.rhs_signal_ids == b.rhs_signal_ids &&
-           a.lhs_signals == b.lhs_signals && a.rhs_signals == b.rhs_signals;
+    return SameEndpointFields(a, b);
   }
   std::string DescribeEndpoint(const EndpointRecord &e) const {
     auto ids = [&](const std::vector<uint32_t> &v) {
