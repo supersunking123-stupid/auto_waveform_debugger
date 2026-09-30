@@ -46,22 +46,24 @@ using TraceResult = std::variant<const slang::ast::PortSymbol *, ExprTraceResult
 struct TraceCompileCache;
 
 void CollectTraceableSymbols(const slang::ast::RootSymbol &root,
-                             std::vector<SignalCompileItem> &out);
+                             std::vector<SignalCompileItem> &out,
+                             std::vector<std::string> &out_paths);
 void CollectInstanceHierarchy(const slang::ast::RootSymbol &root,
                               const slang::SourceManager &sm,
                               TraceDb &db,
                               CompileContext &compile_ctx);
 void BuildHierarchyFromSignals(TraceDb &db);
 slang::flat_hash_map<std::string_view, size_t> BuildSubtreeSignalCounts(
-    const std::vector<SignalCompileItem> &signals);
+    const std::vector<std::string> &signal_paths);
 std::vector<PartitionRecord> PlanHierarchyPartitions(
     const TraceDb &hier_db, const slang::flat_hash_map<std::string_view, size_t> &subtree_counts,
     size_t budget, CompileLogger *logger);
 std::vector<std::vector<size_t>> BucketSignalsByPartitions(
-    const std::vector<SignalCompileItem> &signals,
+    const std::vector<std::string> &signal_paths,
     const std::vector<PartitionRecord> &parts);
 bool SaveGraphDb(const std::string &db_path,
                  std::vector<SignalCompileItem> &signals,
+                 std::vector<std::string> &signal_paths,
                  const slang::SourceManager &sm,
                  const TraceDb &hier_db,
                  const std::vector<std::vector<size_t>> *buckets,
@@ -78,7 +80,8 @@ bool IsIgnoredCompileDiag(const slang::Diagnostic &diag, const slang::SourceMana
 bool HasBlockingCompileDiagnostics(slang::ast::Compilation &compilation,
                                    const slang::DiagnosticEngine &diagEngine,
                                    bool relax_defparam);
-void DecomposeStructMembers(std::vector<SignalCompileItem> &signals, int max_depth);
+void DecomposeStructMembers(std::vector<SignalCompileItem> &signals, std::vector<std::string> &paths,
+                            int max_depth);
 
 } // namespace rtl_trace
 
@@ -414,6 +417,7 @@ int RunCompile(int argc, char *argv[]) {
   const slang::ast::RootSymbol &root = compilation->getRoot();
   const slang::SourceManager &sm = *compilation->getSourceManager();
   std::vector<SignalCompileItem> signals;
+  std::vector<std::string> signal_paths;  // parallel to `signals`; released inside SaveGraphDb
   // RTL_TRACE_SIGNALS_RESERVE=<n> overrides the initial signal-vector capacity
   // (default 2000000). Debug/test knob: a tiny value forces reallocation so
   // sanitizers can exercise code that must tolerate vector growth.
@@ -426,10 +430,10 @@ int RunCompile(int argc, char *argv[]) {
   signals.reserve(signals_reserve);
   logger.Log("step: collect traceable symbols");
   LogMem("MemBeforeCollectSymbols");
-  CollectTraceableSymbols(root, signals);
+  CollectTraceableSymbols(root, signals, signal_paths);
   LogMem("MemAfterCollectTraceableSymbols signals=" + std::to_string(signals.size()) +
          " capacity=" + std::to_string(signals.capacity()));
-  DecomposeStructMembers(signals, 2);
+  DecomposeStructMembers(signals, signal_paths, 2);
   LogMem("MemAfterDecomposeStructMembers signals=" + std::to_string(signals.size()) +
          " capacity=" + std::to_string(signals.capacity()));
   LogMem("MemAfterCollectSymbols");
@@ -448,7 +452,7 @@ int RunCompile(int argc, char *argv[]) {
   std::vector<std::vector<size_t>> buckets;
   if (partition_budget > 0) {
     logger.Log("step: plan partitions");
-    const auto subtree_counts = BuildSubtreeSignalCounts(signals);
+    const auto subtree_counts = BuildSubtreeSignalCounts(signal_paths);
     parts = PlanHierarchyPartitions(hier_db, subtree_counts, partition_budget, &logger);
     logger.Log("planned partitions: " + std::to_string(parts.size()));
     for (size_t i = 0; i < parts.size(); ++i) {
@@ -456,7 +460,7 @@ int RunCompile(int argc, char *argv[]) {
                  " depth=" + std::to_string(parts[i].depth) +
                  " subtree_signals=" + std::to_string(parts[i].signal_count));
     }
-    buckets = BucketSignalsByPartitions(signals, parts);
+    buckets = BucketSignalsByPartitions(signal_paths, parts);
   } else {
     buckets.resize(1);
     for (size_t i = 0; i < signals.size(); ++i)
@@ -466,8 +470,8 @@ int RunCompile(int argc, char *argv[]) {
   logger.Log("step: emit db");
   size_t written_signal_count = 0;
   LogMem("MemBeforeSaveGraphDb");
-  if (!SaveGraphDb(db_path, signals, sm, hier_db, &buckets, written_signal_count, compile_ctx, low_mem,
-                   &logger)) {
+  if (!SaveGraphDb(db_path, signals, signal_paths, sm, hier_db, &buckets, written_signal_count, compile_ctx,
+                   low_mem, &logger)) {
     std::cerr << "Failed to write DB: " << db_path << "\n";
     return 1;
   }

@@ -231,6 +231,30 @@ Run-to-run variance for the default config is small (wall 3:35â€“3:45, RSS 27.8â
   Attribution work is tracked in `PLAN.md`/follow-up sections.
 - The last doubling of `graph.endpoints` (19.0M -> 38.07M capacity) adds ~0.5 GB to the peak.
 
+### Smaller compile-memory items (TODO item 3, 2026-09-30)
+
+Ref tables derived after the build loop, compact global-net sinks stored as string ids,
+`SignalCompileItem::path` removed (see `TODO.md`, "Done / dropped"). Same session, same machine
+load, both DBs and `.meta` `cmp`-identical to the reference DB:
+
+| Binary | Wall | User | Sys | Max RSS |
+| --- | --- | --- | --- | --- |
+| HEAD (`490e5ec`) | 1:36.89 | 92.2s | 4.6s | 27,729,112 kB (26.44 GiB) |
+| item 3 | 1:34.65 | 90.1s | 4.5s | 27,062,888 kB (25.81 GiB) |
+
+Accumulators at the end of the build loop (`RTL_TRACE_MEM_PROGRESS=1`, `acct build_done`):
+
+| Accumulator | HEAD | item 3 |
+| --- | --- | --- |
+| load/driver/assign-lhs ref pairs (37.6M pairs) | 349 MB reserved, 301 MB touched | 0 (derived at finalize) |
+| compact global nets (514 nets, 1.67M sinks) | 536 MB | 18 MB (35,430 pooled paths) |
+| compile-side signal table (`sizeof(SignalCompileItem)`) | 305 MB (80 B) | 153 MB (40 B) |
+| accounted total | 5,213 MB | 4,193 MB |
+
+In the instrumented runs the loop RSS was 0.3-0.8 GB lower through the first 3.2M signals; the peak
+moved from a transient at ~3.2M signals (26,887 MB) to the end of the loop (26,377 MB). Finalize
+got faster (`refs_s` 1.9 s -> 0.5 s, `global_nets_s` 0.27 s -> 0.02 s).
+
 ### Query behaviour on the Lumion DB (baseline DB)
 
 | Operation | Cost |
@@ -251,10 +275,10 @@ All are off by default and do not change the DB unless noted.
 | Variable | Effect |
 | --- | --- |
 | `RTL_TRACE_SAVE_GRAPH_PROFILE=1` | `save_graph_db` time breakdown (`build_graph phases`, counts, `finalize phases`) plus a `signal_record breakdown` line: `index_build_s` (per-body trace index builds, includes first-touch AST binding), `bodies_built/bodies_distinct/bodies_rebuilt` (rebuilds = index evicted from the body cache and built again), `resolve_s`, `symbol_path_less_s`. These overlap (nested inside `signal_record_s`). |
-| `RTL_TRACE_MEM_PROGRESS=1` | Periodic lines from the main per-signal loop (every 100k signals and for any signal with >100k loads): `[Memory] progress ...` (RSS, container sizes/capacities, cache sizes), `[Memory] acct ...` (byte estimate of every accumulator vs RSS = "unaccounted", i.e. mostly slang AST), `[Memory] proc ...` (`mallinfo2` glibc arena and `/proc/self/smaps_rollup`, with mimalloc-region vs other anonymous mappings), plus a final `peak_loads_signal=` line with the RSS delta around that signal. Tunable with `RTL_TRACE_MEM_PROGRESS_EVERY=<n>` / `RTL_TRACE_MEM_PROGRESS_BIG_LOADS=<n>`. Costs a `/proc` read per signal (a few percent wall). |
+| `RTL_TRACE_MEM_PROGRESS=1` | Periodic lines from the main per-signal loop (every 100k signals and for any signal with >100k loads): `[Memory] progress ...` (RSS, container sizes/capacities, cache sizes, `inferred_lhs_refs`, compact global-net `compact_sinks` / `pooled_sinks`), `[Memory] acct ...` (byte estimate of every accumulator vs RSS = "unaccounted", i.e. mostly slang AST), `[Memory] proc ...` (`mallinfo2` glibc arena and `/proc/self/smaps_rollup`, with mimalloc-region vs other anonymous mappings), plus a final `peak_loads_signal=` line with the RSS delta around that signal. Tunable with `RTL_TRACE_MEM_PROGRESS_EVERY=<n>` / `RTL_TRACE_MEM_PROGRESS_BIG_LOADS=<n>`. Costs a `/proc` read per signal (a few percent wall). |
 | `RTL_TRACE_MI_STATS=1` | Adds `[Memory] mi <phase> ...` lines (mimalloc `mi_process_info`, then `mi_collect(true)` and re-read) after each `SaveGraphDb` phase, and, **only together with `RTL_TRACE_MEM_PROGRESS=1`**, `[Memory] micensus ...` lines (before the build loop, every progress interval and after the loop): a `mi_heap_visit_blocks` census of live vs page-committed bytes per block size class (the 4096-byte class is slang's `BumpAllocator` segments, i.e. the AST). `RTL_TRACE_MI_STATS=2` (also requires `RTL_TRACE_MEM_PROGRESS=1`) additionally prints the full `mi_stats` as `[MiStats]` lines. Without `RTL_TRACE_MEM_PROGRESS=1`, `RTL_TRACE_MI_STATS` prints only the per-phase `[Memory] mi ...` lines. Set `MIMALLOC_VISIT_ABANDONED=1` in the environment to also census abandoned pages. Note `mi_process_info` "rss/commit" is a commit counter, not RSS; trust `micensus` and `[Memory] proc`. Requires a mimalloc build. |
 | `RTL_TRACE_BODY_CACHE=<n>` | Number of per-body trace indexes kept by the build loop (default 4096; 256 before; `--low-mem` always 4). Pure time/memory trade, never changes the DB. |
 | `RTL_TRACE_ENDPOINTS_PER_SIGNAL=<n>` | Untouched-virtual reservation of `graph.endpoints` / `signal_refs` / ref-pair vectors as a multiple of the signal count (default 8) so they do not double-and-copy. Never changes the DB. |
-| `RTL_TRACE_KEEP_SIGNAL_PATHS=1` | Keep the `SignalCompileItem::path` strings during the build loop (default: freed after they were interned; the loop reads paths from `graph.strings`). A/B measurement only. |
+| `RTL_TRACE_KEEP_SIGNAL_PATHS=1` | Keep the compile-side signal path vector (parallel to `SignalCompileItem`, which has no path field) during the build loop (default: freed after the bucket sort; the loop reads paths from `graph.strings`). A/B measurement only. |
 | `RTL_TRACE_SIGNALS_RESERVE=<n>` | Initial capacity of the compile-time signal vector (default 2000000). A tiny value forces reallocation, for sanitizer runs. |
 | `RTL_TRACE_FIX_ENDPOINT_MERGE=1` | Uses `MergeEndpointBitRangesInPlaceStable`. **Changes DB output**: endpoints that share path/file/line/text/lhs/rhs and have adjacent or overlapping bit ranges now merge (default merging is defeated by a moved-from grouping key). |

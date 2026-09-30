@@ -1565,9 +1565,11 @@ bool ShouldCompactGlobalNet(std::string_view path, size_t load_count) {
   return load_count >= kCompactGlobalNetThreshold && LooksLikeClockOrResetName(path);
 }
 
-std::vector<std::string> ExtractCompactSinkPaths(const std::string &source, const GraphDb &graph,
-                                                 const std::vector<EndpointRecord> &loads) {
-  std::vector<std::string> sinks;
+// Sorted, deduplicated sink paths of a compacted global net. The views point into graph.strings and
+// into `loads`, so they are valid only while `loads` is alive and unchanged.
+std::vector<std::string_view> ExtractCompactSinkPaths(const std::string &source, const GraphDb &graph,
+                                                      const std::vector<EndpointRecord> &loads) {
+  std::vector<std::string_view> sinks;
   sinks.reserve(loads.size());
   for (const EndpointRecord &e : loads) {
     bool has_lhs_refs = false;
@@ -1948,15 +1950,29 @@ EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManag
 }
 
 void CollectTraceableSymbols(const slang::ast::RootSymbol &root,
-                             std::vector<SignalCompileItem> &out) {
+                             std::vector<SignalCompileItem> &out,
+                             std::vector<std::string> &out_paths) {
+  // Collected as (path, item) pairs so the sort/unique below behaves exactly as when the path was a
+  // SignalCompileItem field (same comparisons in the same order => same surviving duplicates and
+  // order), then split into the two parallel output vectors.
+  struct CollectedSignal {
+    std::string path;
+    SignalCompileItem item;
+  };
+  std::vector<CollectedSignal> collected;
+  collected.reserve(out.capacity());
   auto collect_from_scope = [&](const slang::ast::Scope &scope) {
     for (const auto &net : scope.membersOfType<slang::ast::NetSymbol>()) {
-      out.push_back(SignalCompileItem{std::string(net.getHierarchicalPath()), &net,
-                                      GetContainingInstance(&net)});
+      SignalCompileItem item;
+      item.sym = &net;
+      item.body = GetContainingInstance(&net);
+      collected.push_back(CollectedSignal{std::string(net.getHierarchicalPath()), item});
     }
     for (const auto &var : scope.membersOfType<slang::ast::VariableSymbol>()) {
-      out.push_back(SignalCompileItem{std::string(var.getHierarchicalPath()), &var,
-                                      GetContainingInstance(&var)});
+      SignalCompileItem item;
+      item.sym = &var;
+      item.body = GetContainingInstance(&var);
+      collected.push_back(CollectedSignal{std::string(var.getHierarchicalPath()), item});
     }
   };
 
@@ -1994,19 +2010,24 @@ void CollectTraceableSymbols(const slang::ast::RootSymbol &root,
     collect_from_scope(top->body);
     visit_structural(visit_structural, top->body);
   }
-  std::sort(out.begin(), out.end(), [](const SignalCompileItem &lhs, const SignalCompileItem &rhs) {
+  std::sort(collected.begin(), collected.end(), [](const CollectedSignal &lhs, const CollectedSignal &rhs) {
     return lhs.path < rhs.path;
   });
-  out.erase(std::unique(out.begin(), out.end(),
-                        [](const SignalCompileItem &lhs, const SignalCompileItem &rhs) {
-                          return lhs.path == rhs.path;
-                        }),
-            out.end());
+  collected.erase(std::unique(collected.begin(), collected.end(),
+                              [](const CollectedSignal &lhs, const CollectedSignal &rhs) {
+                                return lhs.path == rhs.path;
+                              }),
+                  collected.end());
+  for (const CollectedSignal &c : collected) out.push_back(c.item);
+  // Same headroom as `out` (the caller's reserve policy) for the struct members appended later.
+  out_paths.reserve(out.capacity());
+  for (CollectedSignal &c : collected) out_paths.push_back(std::move(c.path));
 }
 
 // --- Struct member decomposition (Level 2) ---
 
 void DecomposePackedStructFields(std::vector<SignalCompileItem> &signals,
+                                  std::vector<std::string> &paths,
                                   uint32_t parent_idx,
                                   int max_depth,
                                   int current_depth,
@@ -2016,7 +2037,7 @@ void DecomposePackedStructFields(std::vector<SignalCompileItem> &signals,
   // a `const SignalCompileItem&` dangling for the next loop iteration.
   const slang::ast::Symbol *const parent_sym = signals[parent_idx].sym;
   if (parent_sym == nullptr) return;
-  const std::string parent_path = signals[parent_idx].path;
+  const std::string parent_path = paths[parent_idx];
   const slang::ast::InstanceBodySymbol *const parent_body = signals[parent_idx].body;
 
   const auto *vs = parent_sym->as_if<slang::ast::ValueSymbol>();
@@ -2034,7 +2055,6 @@ void DecomposePackedStructFields(std::vector<SignalCompileItem> &signals,
     const uint64_t field_width = field_type.getBitWidth();
 
     SignalCompileItem item;
-    item.path = parent_path + "." + std::string(field.name);
     item.sym = parent_sym;   // reuse parent's AST symbol for BuildSignalRecord
     item.body = parent_body;
     item.parent_signal_idx = parent_idx;
@@ -2043,17 +2063,19 @@ void DecomposePackedStructFields(std::vector<SignalCompileItem> &signals,
     item.struct_depth = current_depth;
 
     const uint32_t child_idx = static_cast<uint32_t>(signals.size());
-    signals.push_back(std::move(item));
+    signals.push_back(item);
+    paths.push_back(parent_path + "." + std::string(field.name));
 
     // Recurse into nested packed structs
     if (current_depth < max_depth &&
         field_type.kind == slang::ast::SymbolKind::PackedStructType) {
-      DecomposePackedStructFields(signals, child_idx, max_depth, current_depth + 1, field_offset);
+      DecomposePackedStructFields(signals, paths, child_idx, max_depth, current_depth + 1, field_offset);
     }
   }
 }
 
-void DecomposeStructMembers(std::vector<SignalCompileItem> &signals, int max_depth) {
+void DecomposeStructMembers(std::vector<SignalCompileItem> &signals, std::vector<std::string> &paths,
+                            int max_depth) {
   const size_t original_count = signals.size();
   for (size_t i = 0; i < original_count; ++i) {
     const SignalCompileItem &item = signals[i];
@@ -2066,7 +2088,7 @@ void DecomposeStructMembers(std::vector<SignalCompileItem> &signals, int max_dep
     const slang::ast::Type &canonical = vs->getType().getCanonicalType();
     if (canonical.kind != slang::ast::SymbolKind::PackedStructType) continue;
 
-    DecomposePackedStructFields(signals, static_cast<uint32_t>(i), max_depth, 1, 0);
+    DecomposePackedStructFields(signals, paths, static_cast<uint32_t>(i), max_depth, 1, 0);
   }
 }
 
@@ -2182,10 +2204,10 @@ bool IsUnderHierarchyRoot(const std::string &signal, const std::string &root) {
 }
 
 slang::flat_hash_map<std::string_view, size_t> BuildSubtreeSignalCounts(
-    const std::vector<SignalCompileItem> &signals) {
+    const std::vector<std::string> &signal_paths) {
   slang::flat_hash_map<std::string_view, size_t> counts;
-  for (const SignalCompileItem &signal : signals) {
-    std::string_view inst = ParentPath(signal.path);
+  for (const std::string &signal_path : signal_paths) {
+    std::string_view inst = ParentPath(signal_path);
     while (!inst.empty()) {
       counts[inst] += 1;
       inst = ParentPath(inst);
@@ -2249,11 +2271,11 @@ std::vector<PartitionRecord> PlanHierarchyPartitions(
 }
 
 std::vector<std::vector<size_t>> BucketSignalsByPartitions(
-    const std::vector<SignalCompileItem> &signals, const std::vector<PartitionRecord> &parts) {
+    const std::vector<std::string> &signal_paths, const std::vector<PartitionRecord> &parts) {
   std::vector<std::vector<size_t>> buckets(parts.size());
   if (parts.empty()) {
     buckets.resize(1);
-    for (size_t i = 0; i < signals.size(); ++i)
+    for (size_t i = 0; i < signal_paths.size(); ++i)
       buckets[0].push_back(i);
     return buckets;
   }
@@ -2266,8 +2288,8 @@ std::vector<std::vector<size_t>> BucketSignalsByPartitions(
     return parts[a].root < parts[b].root;
   });
 
-  for (size_t i = 0; i < signals.size(); ++i) {
-    const std::string &sig = signals[i].path;
+  for (size_t i = 0; i < signal_paths.size(); ++i) {
+    const std::string &sig = signal_paths[i];
     size_t chosen = parts.size();
     for (size_t idx : order) {
       if (IsUnderHierarchyRoot(sig, parts[idx].root)) {
@@ -2286,8 +2308,9 @@ std::vector<std::vector<size_t>> BucketSignalsByPartitions(
 }
 
 bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &signals,
-                 const slang::SourceManager &sm, const TraceDb &hier_db,
-                 const std::vector<std::vector<size_t>> *buckets, size_t &signal_count,
+                 std::vector<std::string> &signal_paths, const slang::SourceManager &sm,
+                 const TraceDb &hier_db, const std::vector<std::vector<size_t>> *buckets,
+                 size_t &signal_count,
                  CompileContext &compile_ctx, bool low_mem, CompileLogger *logger) {
   using Clock = std::chrono::steady_clock;
   auto fmt_seconds = [](const Clock::time_point &start, const Clock::time_point &end) {
@@ -2316,10 +2339,22 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
 
   GraphDb graph;
   slang::flat_hash_map<std::string_view, uint32_t> string_index;
-  std::vector<std::pair<uint32_t, uint32_t>> load_refs_flat;
-  std::vector<std::pair<uint32_t, uint32_t>> driver_refs_flat;
-  std::vector<std::pair<uint32_t, uint32_t>> assignment_lhs_refs_flat;
-  slang::flat_hash_map<std::string, GlobalNetRecord> compact_global_nets;
+  // The load / driver / assignment-lhs reverse-ref tables are derived after the build loop from
+  // graph.endpoints + graph.signal_refs (see build_path_refs below). Only assignment-lhs refs inferred
+  // from assignment text are collected here: they intern new strings, which must happen in loop order.
+  std::vector<std::pair<uint32_t, uint32_t>> inferred_lhs_refs;  // (lhs path id, signal id)
+  // Compacted global nets. A sink is stored as a graph string id when its path is already interned,
+  // else as kPooledSink | index into sink_pool (one copy per distinct path, interned at finalize in the
+  // same order as before, so the DB does not change).
+  constexpr uint32_t kPooledSink = 0x80000000u;
+  struct CompactGlobalNet {
+    std::string category;
+    std::vector<uint32_t> sinks;
+  };
+  slang::flat_hash_map<std::string, CompactGlobalNet> compact_global_nets;
+  std::deque<std::string> sink_pool;  // stable addresses: sink_pool_index holds views into it
+  slang::flat_hash_map<std::string_view, uint32_t> sink_pool_index;
+  size_t compact_sink_count = 0;
   TraceCompileCache trace_cache;
   {
     // Per-body trace indexes are pure functions of the (already bound) body, so the cache size only trades
@@ -2350,9 +2385,6 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
     const size_t per_sig = (eps != nullptr && *eps != '\0') ? std::max<size_t>(1, std::strtoull(eps, nullptr, 10)) : 8;
     graph.endpoints.reserve(signals.size() * per_sig);
     graph.signal_refs.reserve(signals.size() * per_sig * 3);
-    load_refs_flat.reserve(std::max<size_t>(5000000, signals.size() * 4));
-    driver_refs_flat.reserve(std::max<size_t>(5000000, signals.size() * 3));
-    assignment_lhs_refs_flat.reserve(std::max<size_t>(5000000, signals.size() * 5));
   }
   // string_index is a hash table (touches all its pages once populated), so size it to the strings that
   // will really be interned: one per signal, one per hierarchy node, plus a slack for file/text strings.
@@ -2430,7 +2462,7 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
   slang::flat_hash_map<const slang::ast::Symbol *, uint32_t> symbol_path_ids;
   symbol_path_ids.reserve(signals.size());
   for (size_t i = 0; i < signals.size(); ++i) {
-    graph.signals[i].name_str_id = intern(signals[i].path);
+    graph.signals[i].name_str_id = intern(signal_paths[i]);
     // Member signals reuse the parent's Symbol*, so they must NOT be inserted
     // into symbol_path_ids — otherwise the last member overwrites the parent's
     // path, corrupting LHS/RHS resolution for all sibling endpoints.
@@ -2452,10 +2484,10 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
 
   auto sort_bucket_for_locality = [&](std::vector<size_t> &bucket) {
     std::sort(bucket.begin(), bucket.end(), [&](size_t lhs, size_t rhs) {
-      const std::string_view lhs_parent = ParentPath(signals[lhs].path);
-      const std::string_view rhs_parent = ParentPath(signals[rhs].path);
+      const std::string_view lhs_parent = ParentPath(signal_paths[lhs]);
+      const std::string_view rhs_parent = ParentPath(signal_paths[rhs]);
       if (lhs_parent != rhs_parent) return lhs_parent < rhs_parent;
-      return signals[lhs].path < signals[rhs].path;
+      return signal_paths[lhs] < signal_paths[rhs];
     });
   };
 
@@ -2475,13 +2507,13 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
   buckets = &processing_buckets;
   LogMemPhase("SaveGraphDb:AfterBucketSort buckets=" + std::to_string(processing_buckets.size()));
 
-  // The signal path strings are now duplicated in graph.strings (graph.signals[i].name_str_id) and the
-  // bucket sort above was their last reader. Release the SignalCompileItem copies (~0.9 GB on Lumion);
-  // the build loop reads paths back from graph.strings (a reserved vector, never reallocated).
-  // RTL_TRACE_KEEP_SIGNAL_PATHS=1 keeps them (A/B measurement only).
+  // The signal paths are now duplicated in graph.strings (graph.signals[i].name_str_id) and the bucket
+  // sort above was their last reader. Release the compile-side path vector as a whole (~1 GB on Lumion:
+  // string headers + heap); the build loop reads paths back from graph.strings (a reserved vector,
+  // never reallocated). RTL_TRACE_KEEP_SIGNAL_PATHS=1 keeps it (A/B measurement only).
   const bool release_signal_paths = !EnvFlagEnabled("RTL_TRACE_KEEP_SIGNAL_PATHS");
   if (release_signal_paths) {
-    for (SignalCompileItem &it : signals) std::string().swap(it.path);
+    std::vector<std::string>().swap(signal_paths);
     LogMemPhase("SaveGraphDb:AfterReleaseSignalPaths");
   }
 
@@ -2521,14 +2553,12 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
               << " endpoints(size/cap)=" << cap_str(graph.endpoints.size(), graph.endpoints.capacity())
               << " signal_refs=" << cap_str(graph.signal_refs.size(), graph.signal_refs.capacity())
               << " strings=" << cap_str(graph.strings.size(), graph.strings.capacity())
-              << " load_refs=" << cap_str(load_refs_flat.size(), load_refs_flat.capacity())
-              << " driver_refs=" << cap_str(driver_refs_flat.size(), driver_refs_flat.capacity())
-              << " assign_lhs_refs="
-              << cap_str(assignment_lhs_refs_flat.size(), assignment_lhs_refs_flat.capacity())
+              << " inferred_lhs_refs=" << cap_str(inferred_lhs_refs.size(), inferred_lhs_refs.capacity())
               << " body_caches=" << trace_cache.body_caches.size() << " (index_ready=" << body_index_ready
               << ") trace_results=" << trace_results
               << " compact_global_nets=" << compact_global_nets.size()
-              << " compact_sink_bytes=" << compact_sink_bytes << extra << "\n";
+              << " compact_sink_bytes=" << compact_sink_bytes << " compact_sinks=" << compact_sink_count
+              << " pooled_sinks=" << sink_pool.size() << extra << "\n";
     std::cout.flush();
   };
 
@@ -2539,9 +2569,10 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
   auto mem_accounting_line = [&](const char *tag) {
     if (!acct_static_done) {
       acct_static_done = true;
-      double sig_tab = static_cast<double>(signals.capacity()) * sizeof(SignalCompileItem);
+      double sig_tab = static_cast<double>(signals.capacity()) * sizeof(SignalCompileItem) +
+                       static_cast<double>(signal_paths.capacity()) * sizeof(std::string);
       double sig_heap = 0;
-      for (const SignalCompileItem &it : signals) sig_heap += static_cast<double>(StrHeap(it.path));
+      for (const std::string &p : signal_paths) sig_heap += static_cast<double>(StrHeap(p));
       double bucket_b = 0;
       for (const auto &b : processing_buckets) bucket_b += static_cast<double>(b.capacity()) * sizeof(size_t);
       double hier_tab = FlatMapTableBytes(hier_db.hierarchy);
@@ -2570,14 +2601,14 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
     const double spid = FlatMapTableBytes(symbol_path_ids);
     const double gsig = static_cast<double>(graph.signals.capacity()) * sizeof(GraphSignalRecord);
     const double refs =
-        static_cast<double>(load_refs_flat.capacity() + driver_refs_flat.capacity() + assignment_lhs_refs_flat.capacity()) *
-        sizeof(std::pair<uint32_t, uint32_t>);
-    double cg = FlatMapTableBytes(compact_global_nets);
+        static_cast<double>(inferred_lhs_refs.capacity()) * sizeof(std::pair<uint32_t, uint32_t>);
+    double cg = FlatMapTableBytes(compact_global_nets) + FlatMapTableBytes(sink_pool_index) +
+                static_cast<double>(sink_pool.size()) * sizeof(std::string);
     for (const auto &kv : compact_global_nets) {
       cg += static_cast<double>(StrHeap(kv.first) + StrHeap(kv.second.category));
-      cg += static_cast<double>(kv.second.sinks.capacity()) * sizeof(std::string);
-      for (const std::string &sk : kv.second.sinks) cg += static_cast<double>(StrHeap(sk));
+      cg += static_cast<double>(kv.second.sinks.capacity()) * sizeof(uint32_t);
     }
+    for (const std::string &sk : sink_pool) cg += static_cast<double>(StrHeap(sk));
     const double total = ep_cap + sr_cap + str_heap + str_tab + sidx + spid + gsig + refs + cg + acct_static_bytes;
     std::cout << "[Memory] acct " << tag << " signals_done=" << mem_progress_done
               << " endpoints(live/cap)=" << Mb1(ep_live) << "/" << Mb1(ep_cap) << "MB signal_refs_cap=" << Mb1(sr_cap)
@@ -2645,13 +2676,31 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
       }
       const auto t_compact_global_start = profile_save_graph ? Clock::now() : Clock::time_point{};
       if (ShouldCompactGlobalNet(item_path, rec.loads.size())) {
-        GlobalNetRecord g;
-        g.category = ClassifyGlobalNetCategory(item_path);
-        g.sinks = ExtractCompactSinkPaths(item_path, graph, rec.loads);
-        if (!g.sinks.empty()) {
-          if (mem_progress) {
-            for (const std::string &sink : g.sinks) compact_sink_bytes += sink.size();
+        const std::vector<std::string_view> sink_paths = ExtractCompactSinkPaths(item_path, graph, rec.loads);
+        if (!sink_paths.empty()) {
+          CompactGlobalNet g;
+          g.category = ClassifyGlobalNetCategory(item_path);
+          g.sinks.reserve(sink_paths.size());
+          for (const std::string_view sink : sink_paths) {
+            if (mem_progress) compact_sink_bytes += sink.size();
+            if (const auto it = string_index.find(sink); it != string_index.end()) {
+              if ((it->second & kPooledSink) != 0) return false;  // > 2^31 strings: cannot tag
+              g.sinks.push_back(it->second);
+              continue;
+            }
+            uint32_t pool_idx = 0;
+            if (const auto pit = sink_pool_index.find(sink); pit != sink_pool_index.end()) {
+              pool_idx = pit->second;
+            } else {
+              if (sink_pool.size() >= kPooledSink) return false;
+              pool_idx = static_cast<uint32_t>(sink_pool.size());
+              // Key on the pool's own copy: `sink` may point into rec.loads, which is about to go.
+              sink_pool.emplace_back(sink);
+              sink_pool_index.emplace(std::string_view(sink_pool.back()), pool_idx);
+            }
+            g.sinks.push_back(kPooledSink | pool_idx);
           }
+          compact_sink_count += g.sinks.size();
           compact_global_nets.emplace(item_path, std::move(g));
           rec.loads.clear();
         }
@@ -2672,14 +2721,7 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
       gs.driver_count = static_cast<uint32_t>(rec.drivers.size());
       build_driver_endpoint_count += rec.drivers.size();
       const auto t_emit_driver_start = profile_save_graph ? Clock::now() : Clock::time_point{};
-      for (const EndpointRecord &e : rec.drivers) {
-        append_endpoint(e);
-        const uint32_t driver_path_id =
-            (e.path_id != std::numeric_limits<uint32_t>::max()) ? e.path_id : intern(e.path);
-        if (driver_path_id != std::numeric_limits<uint32_t>::max()) {
-          driver_refs_flat.push_back({driver_path_id, static_cast<uint32_t>(sig_id)});
-        }
-      }
+      for (const EndpointRecord &e : rec.drivers) append_endpoint(e);
       if (profile_save_graph) t_emit_driver_s += elapsed_seconds(t_emit_driver_start, Clock::now());
       gs.load_begin = static_cast<uint32_t>(graph.endpoints.size());
       gs.load_count = static_cast<uint32_t>(rec.loads.size());
@@ -2687,28 +2729,15 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
       const auto t_emit_load_start = profile_save_graph ? Clock::now() : Clock::time_point{};
       for (const EndpointRecord &e : rec.loads) {
         append_endpoint(e);
-        const uint32_t load_path_id =
-            (e.path_id != std::numeric_limits<uint32_t>::max()) ? e.path_id : intern(e.path);
-        if (load_path_id != std::numeric_limits<uint32_t>::max()) {
-          load_refs_flat.push_back({load_path_id, static_cast<uint32_t>(sig_id)});
-        }
-        std::vector<std::string> inferred_lhs_paths;
+        // A load without LHS signals (ge.lhs_count == 0) gets its assignment-lhs refs from the assignment
+        // text; interning them here keeps the string-id order. Loads with LHS signals are covered by
+        // build_path_refs after the loop (their LHS ids are the endpoint's signal_refs range).
         if (e.lhs_signal_ids.empty() && e.lhs_signals.empty() && !e.assignment_text.empty()) {
-          inferred_lhs_paths = InferAssignmentLhsPathsFromText(e.path, e.assignment_text);
+          const std::vector<std::string> inferred_lhs_paths =
+              InferAssignmentLhsPathsFromText(e.path, e.assignment_text);
           ++inferred_assignment_lhs_count;
           for (const std::string &lhs : inferred_lhs_paths) {
-            if (!lhs.empty()) {
-              assignment_lhs_refs_flat.push_back({intern(lhs), static_cast<uint32_t>(sig_id)});
-            }
-          }
-        } else {
-          for (uint32_t lhs_id : e.lhs_signal_ids) {
-            assignment_lhs_refs_flat.push_back({lhs_id, static_cast<uint32_t>(sig_id)});
-          }
-          for (const std::string &lhs : e.lhs_signals) {
-            if (!lhs.empty()) {
-              assignment_lhs_refs_flat.push_back({intern(lhs), static_cast<uint32_t>(sig_id)});
-            }
+            if (!lhs.empty()) inferred_lhs_refs.push_back({intern(lhs), static_cast<uint32_t>(sig_id)});
           }
         }
       }
@@ -2777,51 +2806,109 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
     }
   }
 
-  auto finalize_path_refs =
-      [&](std::vector<std::pair<uint32_t, uint32_t>> &flat_src, std::vector<GraphPathRefRange> &ranges,
-          std::vector<uint32_t> &flat) {
-        if (flat_src.empty()) return;
-        std::sort(flat_src.begin(), flat_src.end());
-        flat_src.erase(std::unique(flat_src.begin(), flat_src.end()), flat_src.end());
-        
-        flat.reserve(flat_src.size());
-        uint32_t current_path = flat_src[0].first;
-        uint32_t current_begin = 0;
-        
-        for (size_t i = 0; i < flat_src.size(); ++i) {
-          if (flat_src[i].first != current_path) {
-            GraphPathRefRange range;
-            range.path_str_id = current_path;
-            range.begin = current_begin;
-            range.count = static_cast<uint32_t>(flat.size() - current_begin);
-            ranges.push_back(range);
-            current_path = flat_src[i].first;
-            current_begin = static_cast<uint32_t>(flat.size());
-          }
-          flat.push_back(flat_src[i].second);
-        }
-        GraphPathRefRange range;
-        range.path_str_id = current_path;
-        range.begin = current_begin;
-        range.count = static_cast<uint32_t>(flat.size() - current_begin);
-        ranges.push_back(range);
-      };
+  // Reverse-ref tables (path id -> sorted unique ids of the signals whose endpoints reference it),
+  // derived from graph.endpoints / graph.signal_refs instead of (path, signal) pairs collected in the
+  // build loop. Same result as sorting + deduplicating the pairs, computed as a counting sort over the
+  // path ids: signals are visited in ascending id order, so every path's bucket fills in ascending
+  // signal order and only adjacent duplicates need dropping. One table at a time.
+  std::vector<uint32_t> ref_cursor;
+  auto build_path_refs = [&](const auto &for_each_ref, std::vector<GraphPathRefRange> &ranges,
+                             std::vector<uint32_t> &flat) {
+    const size_t num_paths = graph.strings.size();
+    ref_cursor.assign(num_paths, 0);
+    size_t total = 0;
+    for_each_ref([&](uint32_t path_id, uint32_t) {
+      ++ref_cursor[path_id];
+      ++total;
+    });
+    if (total == 0) return;
+    uint32_t running = 0;
+    for (uint32_t &c : ref_cursor) {
+      const uint32_t n = c;
+      c = running;
+      running += n;
+    }
+    std::vector<uint32_t> ids(total);
+    for_each_ref([&](uint32_t path_id, uint32_t sig) { ids[ref_cursor[path_id]++] = sig; });
+    // ref_cursor[p] is now the end of bucket p (and the start of bucket p + 1). Compact in place.
+    size_t out = 0;
+    uint32_t bucket_begin = 0;
+    for (size_t p = 0; p < num_paths; ++p) {
+      const uint32_t bucket_end = ref_cursor[p];
+      if (bucket_begin == bucket_end) continue;
+      GraphPathRefRange range;
+      range.path_str_id = static_cast<uint32_t>(p);
+      range.begin = static_cast<uint32_t>(out);
+      for (uint32_t i = bucket_begin; i < bucket_end; ++i) {
+        if (i == bucket_begin || ids[i] != ids[i - 1]) ids[out++] = ids[i];
+      }
+      range.count = static_cast<uint32_t>(out - range.begin);
+      ranges.push_back(range);
+      bucket_begin = bucket_end;
+    }
+    ids.resize(out);
+    ids.shrink_to_fit();
+    flat.swap(ids);
+  };
+  constexpr uint32_t kNoPath = std::numeric_limits<uint32_t>::max();
+  const uint32_t num_graph_signals = static_cast<uint32_t>(graph.signals.size());
   const auto t_finalize_refs_start = profile_save_graph ? Clock::now() : Clock::time_point{};
-  finalize_path_refs(load_refs_flat, graph.load_ref_ranges, graph.load_ref_signal_ids);
+  build_path_refs(
+      [&](const auto &emit) {
+        for (uint32_t sig = 0; sig < num_graph_signals; ++sig) {
+          const GraphSignalRecord &gs = graph.signals[sig];
+          for (uint32_t k = 0; k < gs.load_count; ++k) {
+            const uint32_t path_id = graph.endpoints[gs.load_begin + k].path_str_id;
+            if (path_id != kNoPath) emit(path_id, sig);
+          }
+        }
+      },
+      graph.load_ref_ranges, graph.load_ref_signal_ids);
   LogMemPhase("SaveGraphDb:AfterFinalizeLoadRefs unique_refs=" +
               std::to_string(graph.load_ref_signal_ids.size()));
-  finalize_path_refs(driver_refs_flat, graph.driver_ref_ranges, graph.driver_ref_signal_ids);
+  build_path_refs(
+      [&](const auto &emit) {
+        for (uint32_t sig = 0; sig < num_graph_signals; ++sig) {
+          const GraphSignalRecord &gs = graph.signals[sig];
+          for (uint32_t k = 0; k < gs.driver_count; ++k) {
+            const uint32_t path_id = graph.endpoints[gs.driver_begin + k].path_str_id;
+            if (path_id != kNoPath) emit(path_id, sig);
+          }
+        }
+      },
+      graph.driver_ref_ranges, graph.driver_ref_signal_ids);
   LogMemPhase("SaveGraphDb:AfterFinalizeDriverRefs unique_refs=" +
               std::to_string(graph.driver_ref_signal_ids.size()));
-  finalize_path_refs(assignment_lhs_refs_flat, graph.assignment_lhs_ref_ranges,
-                     graph.assignment_lhs_ref_signal_ids);
+  // Assignment-lhs refs of a load: its LHS signal refs (signal ids plus interned LHS path strings;
+  // empty paths never were refs), or, for a load without LHS signals, the refs inferred from the
+  // assignment text in the loop (merged in here in signal order).
+  std::sort(inferred_lhs_refs.begin(), inferred_lhs_refs.end(),
+            [](const std::pair<uint32_t, uint32_t> &a, const std::pair<uint32_t, uint32_t> &b) {
+              return a.second != b.second ? a.second < b.second : a.first < b.first;
+            });
+  build_path_refs(
+      [&](const auto &emit) {
+        size_t inferred = 0;
+        for (uint32_t sig = 0; sig < num_graph_signals; ++sig) {
+          const GraphSignalRecord &gs = graph.signals[sig];
+          for (uint32_t k = 0; k < gs.load_count; ++k) {
+            const GraphEndpointRecord &ge = graph.endpoints[gs.load_begin + k];
+            for (uint32_t r = 0; r < ge.lhs_count; ++r) {
+              const uint32_t lhs_id = graph.signal_refs[ge.lhs_begin + r];
+              if (!graph.strings[lhs_id].empty()) emit(lhs_id, sig);
+            }
+          }
+          for (; inferred < inferred_lhs_refs.size() && inferred_lhs_refs[inferred].second == sig; ++inferred)
+            emit(inferred_lhs_refs[inferred].first, sig);
+        }
+      },
+      graph.assignment_lhs_ref_ranges, graph.assignment_lhs_ref_signal_ids);
   LogMemPhase("SaveGraphDb:AfterFinalizeAssignmentLhsRefs unique_refs=" +
               std::to_string(graph.assignment_lhs_ref_signal_ids.size()));
   const double t_finalize_refs_s =
       profile_save_graph ? elapsed_seconds(t_finalize_refs_start, Clock::now()) : 0.0;
-  std::vector<std::pair<uint32_t, uint32_t>>().swap(load_refs_flat);
-  std::vector<std::pair<uint32_t, uint32_t>>().swap(driver_refs_flat);
-  std::vector<std::pair<uint32_t, uint32_t>>().swap(assignment_lhs_refs_flat);
+  std::vector<uint32_t>().swap(ref_cursor);
+  std::vector<std::pair<uint32_t, uint32_t>>().swap(inferred_lhs_refs);
   LogMemPhase("SaveGraphDb:AfterRefVectorSwaps");
 
   const auto t_build_hierarchy_start = profile_save_graph ? Clock::now() : Clock::time_point{};
@@ -2886,15 +2973,24 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
                                                      : intern(it->second.category);
     gg.sink_begin = static_cast<uint32_t>(graph.global_sinks.size());
     gg.sink_count = static_cast<uint32_t>(it->second.sinks.size());
-    for (const std::string &sink : it->second.sinks) {
-      graph.global_sinks.push_back(intern(sink));
+    for (const uint32_t sink : it->second.sinks) {
+      // intern() of an already-interned path returns its id, so only pooled paths can add strings,
+      // exactly where interning the std::string copies used to add them.
+      graph.global_sinks.push_back((sink & kPooledSink) != 0 ? intern(sink_pool[sink & ~kPooledSink])
+                                                              : sink);
     }
     graph.global_nets.push_back(gg);
   }
+  const size_t pooled_sink_paths = sink_pool.size();
+  sink_pool_index = {};
+  std::deque<std::string>().swap(sink_pool);
+  compact_global_nets = {};
   const double t_build_global_nets_s =
       profile_save_graph ? elapsed_seconds(t_build_global_nets_start, Clock::now()) : 0.0;
   LogMemPhase("SaveGraphDb:AfterGlobalNets nets=" + std::to_string(graph.global_nets.size()) +
-              " sinks=" + std::to_string(graph.global_sinks.size()));
+              " sinks=" + std::to_string(graph.global_sinks.size()) +
+              " pooled_sink_paths=" + std::to_string(pooled_sink_paths) +
+              " strings=" + std::to_string(graph.strings.size()));
 
   const auto t_string_offsets_start = profile_save_graph ? Clock::now() : Clock::time_point{};
   std::vector<uint32_t> string_offsets;
