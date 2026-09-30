@@ -1,6 +1,7 @@
-// CanonicalBodies.inc — included by GraphDb.cc after BuildSignalRecord (TODO item 4 spike).
+// CanonicalBodies.inc — included by GraphDb.cc after BuildSignalRecord.
 //
-// RTL_TRACE_CANONICAL_BODIES=1: trace through canonical instance bodies instead of binding every body.
+// Default (RTL_TRACE_CANONICAL_BODIES=0 disables it): trace through canonical instance bodies instead of binding
+// every body.
 //
 // slang elaborates one canonical body per parameter-identical module instance; every other instance's body
 // is skipped by elaboration (InstanceSymbol::getCanonicalBody() != nullptr) and is only bound lazily when the

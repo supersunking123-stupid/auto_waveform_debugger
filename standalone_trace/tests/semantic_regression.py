@@ -1045,7 +1045,7 @@ def main():
         # ===== BEGIN invalid_regex tests =====
         run_invalid_regex_tests(rtl_trace, db)
         # ===== END invalid_regex tests =====
-        # ===== BEGIN canonical_bodies tests (TODO item 4, RTL_TRACE_CANONICAL_BODIES) =====
+        # ===== BEGIN canonical_bodies tests (canonical-body tracer vs RTL_TRACE_CANONICAL_BODIES=0) =====
         run_canonical_bodies_tests(rtl_trace, src_dir, tmpdir, physical_source_path_flag)
         # ===== END canonical_bodies tests =====
 
@@ -1172,8 +1172,9 @@ def run_invalid_regex_tests(rtl_trace, db):
 
 
 # ===== BEGIN canonical_bodies tests =====
-# RTL_TRACE_CANONICAL_BODIES=1 traces signals of instances whose bodies slang skipped (instance caching) through
-# the canonical body and translates paths back. The DB must be byte-identical to the default build. The fixtures
+# By default rtl_trace traces signals of instances whose bodies slang skipped (instance caching) through the
+# canonical body and translates paths back; RTL_TRACE_CANONICAL_BODIES=0 binds every body instead. The two DBs must
+# be byte-identical. The fixtures
 # under tests/fixtures/canonical_bodies/ cover the risky cases (defparam, parameter types, generate, up/down
 # hierarchical refs, bind, interface ports/modports, virtual interfaces, multi-level sharing); each starts with
 # `// top: <name>` and optionally `// args: <extra compile args>`.
@@ -1192,7 +1193,7 @@ def run_canonical_bodies_tests(rtl_trace, src_dir, tmpdir, physical_source_path_
             raise AssertionError(f"{fx.name}: missing '// top:' header")
         for variant in ([], ["--low-mem"], ["--mfcu"]):
             dbs = {}
-            for tag, env in (("off", None), ("on", {"RTL_TRACE_CANONICAL_BODIES": "1"})):
+            for tag, env in (("off", {"RTL_TRACE_CANONICAL_BODIES": "0"}), ("on", {"RTL_TRACE_CANONICAL_BODIES": "1"})):
                 dbs[tag] = tmpdir / f"cb_{fx.stem}_{tag}.db"
                 proc = run_cmd(
                     [str(rtl_trace), "compile", "--db", str(dbs[tag]), physical_source_path_flag,
@@ -1210,7 +1211,7 @@ def run_canonical_bodies_tests(rtl_trace, src_dir, tmpdir, physical_source_path_
                 b = Path(str(dbs["on"]) + suffix).read_bytes()
                 if a != b:
                     raise AssertionError(
-                        f"{fx.name} {variant}: RTL_TRACE_CANONICAL_BODIES=1 changed the DB{suffix or ''}")
+                        f"{fx.name} {variant}: canonical-body tracing changed the DB{suffix or ''} vs RTL_TRACE_CANONICAL_BODIES=0")
     if total_redirected == 0:
         raise AssertionError("canonical_bodies: no signal was traced through a canonical body")
 # ===== END canonical_bodies tests =====

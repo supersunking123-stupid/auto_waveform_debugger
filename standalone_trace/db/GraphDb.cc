@@ -392,7 +392,7 @@ struct TraceCompileCache {
   size_t body_cache_limit = 16;
 };
 
-#include "db/CanonicalBodiesStats.inc"  // TODO item 4 spike instrumentation (RTL_TRACE_CANONICAL_STATS=1)
+#include "db/CanonicalBodiesStats.inc"  // instance-body binding statistics (RTL_TRACE_CANONICAL_STATS=1)
 
 // ScopedFileLock — local utility for SaveGraphDb file locking
 class ScopedFileLock {
@@ -1115,7 +1115,7 @@ SignalRecord BuildSignalRecord(const slang::ast::Symbol *sym, const slang::Sourc
   return rec;
 }
 
-#include "db/CanonicalBodies.inc"  // TODO item 4 spike (RTL_TRACE_CANONICAL_BODIES=1)
+#include "db/CanonicalBodies.inc"  // canonical-body tracer (default; RTL_TRACE_CANONICAL_BODIES=0 disables)
 
 std::string DirectionToString(slang::ast::ArgumentDirection dir) {
   switch (dir) {
@@ -2447,10 +2447,14 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
   LogMemPhase("SaveGraphDb:AfterPreIntern strings=" + std::to_string(graph.strings.size()) +
               " signals=" + std::to_string(graph.signals.size()));
 
-  // TODO item 4 spike: RTL_TRACE_CANONICAL_BODIES=1 traces signals of slang-skipped instance bodies on their
-  // canonical body and translates the paths back (db/CanonicalBodies.inc). Off by default.
+  // Signals of slang-skipped instance bodies are traced on their canonical body and the paths are translated
+  // back (db/CanonicalBodies.inc), so skipped bodies are never bound. RTL_TRACE_CANONICAL_BODIES=0 selects the
+  // per-body binding baseline instead (same DB; fallback and A/B checks).
+  const char *canonical_env = std::getenv("RTL_TRACE_CANONICAL_BODIES");
+  const bool use_canonical_bodies =
+      canonical_env == nullptr || !(canonical_env[0] == '0' && canonical_env[1] == '\0');
   std::unique_ptr<CanonicalTracer> canonical_tracer;
-  if (EnvFlagEnabled("RTL_TRACE_CANONICAL_BODIES")) {
+  if (use_canonical_bodies) {
     canonical_tracer = std::make_unique<CanonicalTracer>(sm, trace_cache, compile_ctx, symbol_path_ids,
                                                          graph.strings, string_index);
   }

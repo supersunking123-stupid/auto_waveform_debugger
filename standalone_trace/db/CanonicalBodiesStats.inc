@@ -1,4 +1,4 @@
-// CanonicalBodiesStats.inc — included by GraphDb.cc (TODO item 4 spike instrumentation).
+// CanonicalBodiesStats.inc — included by GraphDb.cc (diagnostics only).
 //
 // RTL_TRACE_CANONICAL_STATS=1 classifies every instance body the SaveGraphDb build loop touches:
 //   class 0 "bound"   : body visited by slang elaboration (its expressions were bound before the loop),
