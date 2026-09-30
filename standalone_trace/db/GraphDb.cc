@@ -5,6 +5,7 @@
 #include "db/EntryPoints.h"
 #include "db/GraphDbTypes.h"
 #include "db/GraphDbInternals.h"
+#include "db/ParallelTopK.h"
 #include "compile/CompileData.h"
 #include "AssignmentUtils.h"
 
@@ -44,6 +45,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <list>
 #include <memory>
 #include <optional>
 #include <regex>
@@ -52,10 +54,16 @@
 #include <string_view>
 #include <sys/file.h>
 #include <sys/resource.h>
+#include <malloc.h>
+#include <map>
 #include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <variant>
+
+#ifdef SLANG_USE_MIMALLOC
+#include <mimalloc.h>  // mi_process_info / mi_collect for RTL_TRACE_MI_STATS
+#endif
 #include <vector>
 
 namespace rtl_trace {
@@ -86,6 +94,252 @@ long GetCurrentRSSMB() {
 void LogMem(const std::string& step) {
   std::cout << "[Memory] " << step << " Current RSS: " << GetCurrentRSSMB() << "MB, Peak RSS: " << GetMaxRSSMB() << "MB\n";
 }
+
+// True when env var `name` is set to a non-empty value other than "0".
+static bool EnvFlagEnabled(const char *name) {
+  const char *v = std::getenv(name);
+  return v != nullptr && *v != '\0' && !(v[0] == '0' && v[1] == '\0');
+}
+
+// Current RSS in KiB (finer than GetCurrentRSSMB; used by progress instrumentation).
+static long GetCurrentRSSKB() {
+  std::ifstream in("/proc/self/statm");
+  long size = 0, resident = 0;
+  if (in.is_open() && (in >> size >> resident)) {
+    return resident * (sysconf(_SC_PAGE_SIZE) / 1024);
+  }
+  return 0;
+}
+
+// LogMem plus, when RTL_TRACE_MI_STATS=1 and mimalloc is linked in, mimalloc
+// process info before and after mi_collect(true). The extra lines use a
+// distinct "[Memory] mi ..." prefix; the plain LogMem line is unchanged.
+static void LogMemPhase(const std::string &step) {
+  LogMem(step);
+#ifdef SLANG_USE_MIMALLOC
+  static const bool mi_stats = EnvFlagEnabled("RTL_TRACE_MI_STATS");
+  if (mi_stats) {
+    auto read = [](size_t &rss, size_t &peak_rss, size_t &commit, size_t &peak_commit) {
+      size_t elapsed = 0, user = 0, sys = 0, faults = 0;
+      mi_process_info(&elapsed, &user, &sys, &rss, &peak_rss, &commit, &peak_commit, &faults);
+    };
+    size_t rss = 0, peak_rss = 0, commit = 0, peak_commit = 0;
+    read(rss, peak_rss, commit, peak_commit);
+    const long os_rss_before_kb = GetCurrentRSSKB();
+    mi_collect(true);
+    size_t rss2 = 0, peak_rss2 = 0, commit2 = 0, peak_commit2 = 0;
+    read(rss2, peak_rss2, commit2, peak_commit2);
+    const long os_rss_after_kb = GetCurrentRSSKB();
+    constexpr size_t kMiB = 1024 * 1024;
+    std::cout << "[Memory] mi " << step << " mi_rss=" << rss / kMiB << "MB mi_commit=" << commit / kMiB
+              << "MB mi_peak_commit=" << peak_commit / kMiB << "MB os_rss=" << os_rss_before_kb / 1024
+              << "MB | after mi_collect(true): mi_rss=" << rss2 / kMiB << "MB mi_commit=" << commit2 / kMiB
+              << "MB os_rss=" << os_rss_after_kb / 1024 << "MB\n";
+  }
+#else
+  (void)step;
+#endif
+}
+
+// --- Detailed process-memory attribution (RTL_TRACE_MEM_PROGRESS=1) ---
+
+static double MB(double bytes) { return bytes / (1024.0 * 1024.0); }
+static std::string Mb1(double bytes) {
+  std::ostringstream os;
+  os << std::fixed << std::setprecision(0) << MB(bytes);
+  return os.str();
+}
+
+// glibc malloc state + /proc/self/smaps census (which mappings hold the RSS, and whether
+// mimalloc owns them). One "[Memory] proc <tag> ..." line.
+static void LogProcMemDetail(const std::string &tag) {
+  std::ostringstream os;
+  os << "[Memory] proc " << tag;
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 33))
+  const struct mallinfo2 mi = mallinfo2();
+  os << " glibc(arena=" << Mb1(static_cast<double>(mi.arena)) << "MB hblkhd=" << Mb1(static_cast<double>(mi.hblkhd))
+     << "MB in_use=" << Mb1(static_cast<double>(mi.uordblks)) << "MB free=" << Mb1(static_cast<double>(mi.fordblks))
+     << "MB)";
+#endif
+  // smaps_rollup
+  {
+    std::ifstream in("/proc/self/smaps_rollup");
+    std::string line;
+    while (std::getline(in, line)) {
+      for (const char *key : {"Rss:", "Anonymous:", "Private_Dirty:", "Private_Clean:", "LazyFree:", "Shared_Clean:"}) {
+        if (line.rfind(key, 0) == 0) {
+          const long kb = std::strtol(line.c_str() + std::strlen(key), nullptr, 10);
+          os << " " << std::string(key, std::strlen(key) - 1) << "=" << kb / 1024 << "MB";
+        }
+      }
+    }
+  }
+  // smaps census
+  {
+    std::ifstream in("/proc/self/smaps");
+    std::string line;
+    struct Map { unsigned long start = 0, end = 0; long rss_kb = 0, anon_kb = 0; bool file = false; bool heap = false; };
+    std::vector<Map> maps;
+    Map cur;
+    bool have = false;
+    while (std::getline(in, line)) {
+      unsigned long a = 0, b = 0;
+      char perms[8] = {0};
+      int n = 0;
+      if (std::sscanf(line.c_str(), "%lx-%lx %7s %*s %*s %*s%n", &a, &b, perms, &n) >= 3 && line.find(':') > 20) {
+        if (have) maps.push_back(cur);
+        cur = Map{};
+        cur.start = a;
+        cur.end = b;
+        have = true;
+        const size_t slash = line.find_first_of("/[");
+        if (slash != std::string::npos) {
+          cur.heap = line.compare(slash, 6, "[heap]") == 0;
+          cur.file = !cur.heap && line[slash] == '/';
+        }
+      } else if (have && line.rfind("Rss:", 0) == 0) {
+        cur.rss_kb = std::strtol(line.c_str() + 4, nullptr, 10);
+      } else if (have && line.rfind("Anonymous:", 0) == 0) {
+        cur.anon_kb = std::strtol(line.c_str() + 10, nullptr, 10);
+      }
+    }
+    if (have) maps.push_back(cur);
+    double heap = 0, file = 0, anon_mi = 0, anon_other = 0;
+    size_t n_mi = 0, n_other = 0;
+    std::vector<const Map *> big_other;
+    for (const Map &m : maps) {
+      const double bytes = static_cast<double>(m.rss_kb) * 1024.0;
+      if (m.heap) { heap += bytes; continue; }
+      if (m.file) { file += bytes; continue; }
+      bool in_mi = false;
+#ifdef SLANG_USE_MIMALLOC
+      in_mi = mi_is_in_heap_region(reinterpret_cast<const void *>(m.start)) ||
+              mi_is_in_heap_region(reinterpret_cast<const void *>(m.start + (m.end - m.start) / 2));
+#endif
+      if (in_mi) { anon_mi += bytes; ++n_mi; }
+      else { anon_other += bytes; ++n_other; if (m.rss_kb > 256 * 1024) big_other.push_back(&m); }
+    }
+    os << " maps(heap=" << Mb1(heap) << "MB file=" << Mb1(file) << "MB anon_mimalloc=" << Mb1(anon_mi) << "MB/" << n_mi
+       << " anon_other=" << Mb1(anon_other) << "MB/" << n_other << ")";
+    for (const Map *m : big_other) {
+      os << " [other_anon " << std::hex << m->start << std::dec << " size=" << (m->end - m->start) / (1024 * 1024)
+         << "MB rss=" << m->rss_kb / 1024 << "MB]";
+    }
+  }
+#ifdef SLANG_USE_MIMALLOC
+  {
+    size_t elapsed = 0, user = 0, sys = 0, rss = 0, peak_rss = 0, commit = 0, peak_commit = 0, faults = 0;
+    mi_process_info(&elapsed, &user, &sys, &rss, &peak_rss, &commit, &peak_commit, &faults);
+    os << " mi_commit=" << Mb1(static_cast<double>(commit)) << "MB mi_peak_commit=" << Mb1(static_cast<double>(peak_commit))
+       << "MB";
+  }
+#endif
+  std::cout << os.str() << "\n";
+  std::cout.flush();
+}
+
+#ifdef SLANG_USE_MIMALLOC
+static void MiStatsOut(const char *msg, void *) { std::cout << "[MiStats] " << msg; }
+#endif
+#ifdef SLANG_USE_MIMALLOC
+struct MiCensus {
+  struct Cls { double live = 0, committed = 0, pages = 0; };
+  std::map<size_t, Cls> by_block_size;
+};
+static bool MiCensusVisit(const mi_heap_t *, const mi_heap_area_t *area, void *, size_t, void *arg) {
+  auto *c = static_cast<MiCensus *>(arg);
+  MiCensus::Cls &k = c->by_block_size[area->block_size];
+  k.live += static_cast<double>(area->used) * static_cast<double>(area->block_size);
+  k.committed += static_cast<double>(area->committed);
+  k.pages += 1;
+  return true;
+}
+#endif
+// Area-level (page-level) census of the mimalloc heap: live bytes vs committed bytes per block size
+// class. Covers the calling thread's heap and, if MIMALLOC_VISIT_ABANDONED=1 was set at startup,
+// abandoned pages of other/dead threads.
+static void LogMiCensus(const std::string &tag) {
+#ifdef SLANG_USE_MIMALLOC
+  auto report = [&](const char *which, const MiCensus &c) {
+    double live = 0, committed = 0, pages = 0;
+    std::vector<std::pair<double, size_t>> top;
+    for (const auto &kv : c.by_block_size) {
+      live += kv.second.live;
+      committed += kv.second.committed;
+      pages += kv.second.pages;
+      top.push_back({kv.second.live, kv.first});
+    }
+    std::sort(top.begin(), top.end(), std::greater<>());
+    std::ostringstream os;
+    os << "[Memory] micensus " << tag << " " << which << " live=" << Mb1(live) << "MB page_committed=" << Mb1(committed)
+       << "MB pages=" << static_cast<long>(pages) << " top(block_size:live/committed MB):";
+    for (size_t i = 0; i < top.size() && i < 10; ++i) {
+      const auto &k = c.by_block_size.at(top[i].second);
+      os << " " << top[i].second << ":" << Mb1(k.live) << "/" << Mb1(k.committed);
+    }
+    std::cout << os.str() << "\n";
+  };
+  MiCensus main_heap;
+  mi_heap_visit_blocks(mi_heap_get_default(), false, MiCensusVisit, &main_heap);
+  report("main_heap", main_heap);
+  if (mi_option_is_enabled(mi_option_visit_abandoned)) {
+    MiCensus ab;
+    mi_abandoned_visit_blocks(mi_subproc_main(), -1, false, MiCensusVisit, &ab);
+    report("abandoned", ab);
+  }
+  std::cout.flush();
+#else
+  (void)tag;
+#endif
+}
+
+static void LogMiStats(const std::string &tag) {
+#ifdef SLANG_USE_MIMALLOC
+  static const char *mode = std::getenv("RTL_TRACE_MI_STATS");
+  LogMiCensus(tag);
+  if (mode != nullptr && std::string(mode) == "2") {
+    std::cout << "[MiStats] ===== " << tag << " =====\n";
+    mi_stats_print_out(MiStatsOut, nullptr);
+  }
+  std::cout.flush();
+#else
+  (void)tag;
+#endif
+}
+
+// Heap bytes (beyond the std::string object itself) owned by a string.
+static size_t StrHeap(const std::string &s) {
+  return s.capacity() > 15 ? s.capacity() + 1 : 0;
+}
+template <typename Map>
+static double FlatMapTableBytes(const Map &m) {
+  // boost::unordered_flat_map: bucket_count slots of value_type plus 16 metadata bytes per 15 slots.
+  return static_cast<double>(m.bucket_count()) * (sizeof(typename Map::value_type) + 16.0 / 15.0);
+}
+
+// Fine-grained build-loop profile (only active with RTL_TRACE_SAVE_GRAPH_PROFILE).
+struct BuildLoopProfile {
+  bool on = false;
+  double index_build_s = 0;   // GetOrBuildBodyTraceIndex when the index is not yet cached (AST binding + visit)
+  double port_follow_s = 0;   // CollectPortConnectionResults (parent port connection expressions)
+  double resolve_s = 0;       // ResolveTraceResult
+  double path_less_s = 0;     // SortUniqueSymbolsByPath (formerly per-comparison SymbolPathLess)
+  size_t bodies_built = 0;
+  size_t bodies_rebuilt = 0;  // builds of a body whose index was built before and later evicted
+  std::unordered_set<const void *> bodies_seen;
+  size_t path_less_calls = 0;
+};
+static BuildLoopProfile g_build_prof;
+struct BuildProfTimer {
+  double *acc;
+  std::chrono::steady_clock::time_point t0;
+  explicit BuildProfTimer(double BuildLoopProfile::*field) : acc(g_build_prof.on ? &(g_build_prof.*field) : nullptr) {
+    if (acc != nullptr) t0 = std::chrono::steady_clock::now();
+  }
+  ~BuildProfTimer() {
+    if (acc != nullptr) *acc += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+  }
+};
 
 // --- Compile-time-only types (not in GraphDbTypes.h because they depend on slang AST) ---
 
@@ -123,12 +377,15 @@ struct PerBodyTraceCache {
   slang::flat_hash_map<const slang::ast::Statement *, SymbolRefList> statement_lhs_signals;
   BodyTraceIndex body_trace_index;
   bool body_trace_index_ready = false;
+  std::list<const slang::ast::InstanceBodySymbol *>::iterator lru_it;  // position in TraceCompileCache::lru_order
 };
 
 struct TraceCompileCache {
   slang::flat_hash_map<const slang::ast::InstanceBodySymbol *, std::unique_ptr<PerBodyTraceCache>>
       body_caches;
-  std::vector<const slang::ast::InstanceBodySymbol *> lru_order;
+  // Least recently used at the front; every PerBodyTraceCache remembers its own node so a touch is O(1)
+  // (the previous vector + std::find made each touch O(limit), which rules out a large limit).
+  std::list<const slang::ast::InstanceBodySymbol *> lru_order;
   size_t body_cache_limit = 16;
 };
 
@@ -270,9 +527,23 @@ MemberAccessInfo ResolveStructMemberAccess(const slang::ast::MemberAccessExpress
   return info;
 }
 
-bool SymbolPathLess(const slang::ast::Symbol *lhs, const slang::ast::Symbol *rhs) {
-  if (lhs == rhs) return false;
-  return lhs->getHierarchicalPath() < rhs->getHierarchicalPath();
+// Sort + de-duplicate a symbol list by hierarchical path (the order every caller previously got from
+// std::sort(..., SymbolPathLess) followed by std::unique). SymbolPathLess allocated two
+// getHierarchicalPath() strings per comparison (204M comparisons / ~100 s on Lumion, mostly case/if
+// statements repeating the same few LHS symbols hundreds of times). Here duplicates (same Symbol*) are
+// removed first, then every remaining symbol's path is computed exactly once and the paths are sorted.
+static void SortUniqueSymbolsByPath(SymbolRefList &syms) {
+  if (syms.size() < 2) return;
+  BuildProfTimer timer(&BuildLoopProfile::path_less_s);
+  if (g_build_prof.on) g_build_prof.path_less_calls += syms.size();
+  std::sort(syms.begin(), syms.end());
+  syms.erase(std::unique(syms.begin(), syms.end()), syms.end());
+  if (syms.size() < 2) return;
+  std::vector<std::pair<std::string, const slang::ast::Symbol *>> keyed;
+  keyed.reserve(syms.size());
+  for (const slang::ast::Symbol *sym : syms) keyed.emplace_back(std::string(sym->getHierarchicalPath()), sym);
+  std::sort(keyed.begin(), keyed.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
+  for (size_t i = 0; i < keyed.size(); ++i) syms[i] = keyed[i].second;
 }
 
 std::vector<std::string> MaterializeSignalPaths(const SymbolRefList &signals) {
@@ -348,7 +619,7 @@ class BodyTraceIndexBuilder : public slang::ast::ASTVisitor<BodyTraceIndexBuilde
     if (stmt.ifFalse != nullptr) {
       const auto &else_lhs = GetCachedStatementLhsSignals(*stmt.ifFalse, body_cache_);
       context_lhs.insert(context_lhs.end(), else_lhs.begin(), else_lhs.end());
-      std::sort(context_lhs.begin(), context_lhs.end(), SymbolPathLess);
+      SortUniqueSymbolsByPath(context_lhs);
       context_lhs.erase(std::unique(context_lhs.begin(), context_lhs.end()), context_lhs.end());
     }
 
@@ -379,7 +650,7 @@ class BodyTraceIndexBuilder : public slang::ast::ASTVisitor<BodyTraceIndexBuilde
       const auto &default_lhs = GetCachedStatementLhsSignals(*stmt.defaultCase, body_cache_);
       context_lhs.insert(context_lhs.end(), default_lhs.begin(), default_lhs.end());
     }
-    std::sort(context_lhs.begin(), context_lhs.end(), SymbolPathLess);
+    SortUniqueSymbolsByPath(context_lhs);
     context_lhs.erase(std::unique(context_lhs.begin(), context_lhs.end()), context_lhs.end());
 
     condition_lhs_stack_.push_back(std::move(context_lhs));
@@ -589,13 +860,6 @@ class BodyTraceIndexBuilder : public slang::ast::ASTVisitor<BodyTraceIndexBuilde
   std::vector<SymbolRefList> timed_lhs_stack_;
 };
 
-void TouchBodyTraceCache(TraceCompileCache &cache, const slang::ast::InstanceBodySymbol *body) {
-  if (body == nullptr) return;
-  auto it = std::find(cache.lru_order.begin(), cache.lru_order.end(), body);
-  if (it != cache.lru_order.end()) cache.lru_order.erase(it);
-  cache.lru_order.push_back(body);
-}
-
 PerBodyTraceCache &GetOrCreateBodyTraceCache(const slang::ast::InstanceBodySymbol &body,
                                              TraceCompileCache &cache) {
   auto it = cache.body_caches.find(&body);
@@ -603,8 +867,11 @@ PerBodyTraceCache &GetOrCreateBodyTraceCache(const slang::ast::InstanceBodySymbo
     auto [inserted_it, _] =
         cache.body_caches.emplace(&body, std::make_unique<PerBodyTraceCache>());
     it = inserted_it;
+    cache.lru_order.push_back(&body);
+    it->second->lru_it = std::prev(cache.lru_order.end());
+  } else {
+    cache.lru_order.splice(cache.lru_order.end(), cache.lru_order, it->second->lru_it);
   }
-  TouchBodyTraceCache(cache, &body);
   return *it->second;
 }
 
@@ -619,7 +886,7 @@ PerBodyTraceCache *FindBodyTraceCache(TraceCompileCache &cache,
 void TrimTraceCompileCache(TraceCompileCache &cache) {
   while (cache.body_caches.size() > cache.body_cache_limit && !cache.lru_order.empty()) {
     const slang::ast::InstanceBodySymbol *victim = cache.lru_order.front();
-    cache.lru_order.erase(cache.lru_order.begin());
+    cache.lru_order.pop_front();
     cache.body_caches.erase(victim);
   }
 }
@@ -633,6 +900,11 @@ const BodyTraceIndex &GetOrBuildBodyTraceIndex(const slang::ast::InstanceBodySym
                                                TraceCompileCache &cache) {
   PerBodyTraceCache &body_cache = GetOrCreateBodyTraceCache(body, cache);
   if (body_cache.body_trace_index_ready) return body_cache.body_trace_index;
+  BuildProfTimer timer(&BuildLoopProfile::index_build_s);
+  if (g_build_prof.on) {
+    ++g_build_prof.bodies_built;
+    if (!g_build_prof.bodies_seen.insert(&body).second) ++g_build_prof.bodies_rebuilt;
+  }
   BodyTraceIndexBuilder</*DRIVERS*/ true> driver_builder(body_cache.body_trace_index, body_cache,
                                                          body);
   body.visit(driver_builder);
@@ -721,6 +993,7 @@ std::vector<TraceResult> CollectPortConnectionResults(
   const slang::ast::InstanceSymbol *inst = GetContainingInstanceSymbol(context);
   if (inst == nullptr) return {};
 
+  BuildProfTimer timer(&BuildLoopProfile::port_follow_s);
   std::vector<TraceResult> out;
   for (const slang::ast::PortConnection *conn : inst->getPortConnections()) {
     const auto *conn_port = conn->port.template as_if<slang::ast::PortSymbol>();
@@ -814,15 +1087,19 @@ SignalRecord BuildSignalRecord(const slang::ast::Symbol *sym, const slang::Sourc
   SignalRecord rec;
   std::unordered_set<const slang::ast::Symbol *> visited_drivers;
   visited_drivers.insert(sym);
-  for (const TraceResult &r : ComputeIndexedTraceResults</*DRIVERS*/ true>(sym, cache, visited_drivers))
+  for (const TraceResult &r : ComputeIndexedTraceResults</*DRIVERS*/ true>(sym, cache, visited_drivers)) {
+    BuildProfTimer timer(&BuildLoopProfile::resolve_s);
     rec.drivers.push_back(
         std::move(ResolveTraceResult(r, sm, true, &cache, compile_ctx, symbol_path_ids)));
+  }
 
   std::unordered_set<const slang::ast::Symbol *> visited_loads;
   visited_loads.insert(sym);
-  for (const TraceResult &r : ComputeIndexedTraceResults</*DRIVERS*/ false>(sym, cache, visited_loads))
+  for (const TraceResult &r : ComputeIndexedTraceResults</*DRIVERS*/ false>(sym, cache, visited_loads)) {
+    BuildProfTimer timer(&BuildLoopProfile::resolve_s);
     rec.loads.push_back(
         std::move(ResolveTraceResult(r, sm, false, &cache, compile_ctx, symbol_path_ids)));
+  }
 
   return rec;
 }
@@ -1157,6 +1434,90 @@ void MergeEndpointBitRangesInPlace(std::vector<EndpointRecord>& endpoints, Endpo
   endpoints = std::move(out);
 }
 
+// Variant of MergeEndpointBitRangesInPlace with stable grouping keys.
+//
+// The default implementation above builds each EndpointKeyView from an
+// endpoint `e` (pointers to e.lhs_signal_ids/... and string_views into e's
+// strings) and then, in the same statement, moves `e` into the group vector.
+// That leaves the stored key pointing at a moved-from record, so
+//  * endpoints whose lhs/rhs id or name lists are non-empty never compare equal
+//    to their siblings (the stored key sees empty vectors) and are never merged,
+//  * SSO strings (path/direction/text <= 15 chars) are clobbered by the move, so
+//    the key's contents change after insertion.
+// This variant first moves every mergeable endpoint into a reserved (hence
+// non-relocating) staging vector and only then builds keys that point into the
+// staging vector, so keys stay valid for the whole grouping pass.
+//
+// Enabled only when RTL_TRACE_FIX_ENDPOINT_MERGE=1 because it intentionally
+// changes DB output (adjacent/overlapping bit ranges of the same assignment now
+// collapse into one endpoint).
+struct StagedMergeItem {
+  std::pair<int32_t, int32_t> range;
+  EndpointRecord rec;
+};
+
+void MergeEndpointBitRangesInPlaceStable(std::vector<EndpointRecord> &endpoints) {
+  bool has_mergeable = false;
+  for (const EndpointRecord &e : endpoints) {
+    if (!e.bit_map.empty() && !e.bit_map_approximate) {
+      has_mergeable = true;
+      break;
+    }
+  }
+  if (!has_mergeable) return;
+  std::vector<EndpointRecord> out;
+  out.reserve(endpoints.size());
+  std::vector<StagedMergeItem> staged;
+  staged.reserve(endpoints.size());  // must never reallocate: keys point into it
+  for (EndpointRecord &e : endpoints) {
+    if (e.bit_map.empty() || e.bit_map_approximate) {
+      out.push_back(std::move(e));
+      continue;
+    }
+    auto parsed = ParseExactBitMapText(e.bit_map);
+    if (!parsed.has_value()) {
+      out.push_back(std::move(e));
+      continue;
+    }
+    const int32_t lo = std::min(parsed->first, parsed->second);
+    const int32_t hi = std::max(parsed->first, parsed->second);
+    staged.push_back({{lo, hi}, std::move(e)});
+  }
+
+  slang::flat_hash_map<EndpointKeyView, std::vector<uint32_t>, EndpointKeyHash> groups;
+  for (size_t i = 0; i < staged.size(); ++i) {
+    groups[MakeEndpointKeyView(staged[i].rec)].push_back(static_cast<uint32_t>(i));
+  }
+
+  for (auto &[_, idxs] : groups) {
+    std::sort(idxs.begin(), idxs.end(), [&](uint32_t a, uint32_t b) {
+      const auto &ra = staged[a].range;
+      const auto &rb = staged[b].range;
+      if (ra.first != rb.first) return ra.first < rb.first;
+      if (ra.second != rb.second) return ra.second < rb.second;
+      return a < b;
+    });
+    size_t i = 0;
+    while (i < idxs.size()) {
+      int32_t cur_lo = staged[idxs[i]].range.first;
+      int32_t cur_hi = staged[idxs[i]].range.second;
+      EndpointRecord merged = std::move(staged[idxs[i]].rec);
+      ++i;
+      while (i < idxs.size()) {
+        const int32_t nxt_lo = staged[idxs[i]].range.first;
+        const int32_t nxt_hi = staged[idxs[i]].range.second;
+        if (nxt_lo > cur_hi + 1) break;
+        cur_hi = std::max(cur_hi, nxt_hi);
+        ++i;
+      }
+      merged.bit_map = FormatBitRange(cur_hi, cur_lo);
+      merged.bit_map_approximate = false;
+      out.push_back(std::move(merged));
+    }
+  }
+  endpoints = std::move(out);
+}
+
 constexpr size_t kCompactGlobalNetThreshold = 1024;
 
 static bool CaseInsensitiveContains(std::string_view haystack, std::string_view needle) {
@@ -1316,7 +1677,7 @@ SymbolRefList CollectRhsSignals(const slang::ast::AssignmentExpression *assignme
   SymbolRefList paths;
   RhsSignalCollector collector(paths);
   assignment->right().visit(collector);
-  std::sort(paths.begin(), paths.end(), SymbolPathLess);
+  SortUniqueSymbolsByPath(paths);
   paths.erase(std::unique(paths.begin(), paths.end()), paths.end());
   return paths;
 }
@@ -1346,7 +1707,7 @@ SymbolRefList CollectLhsSignals(const slang::ast::AssignmentExpression *assignme
   SymbolRefList paths;
   LhsSignalCollector collector(paths);
   assignment->left().visit(collector);
-  std::sort(paths.begin(), paths.end(), SymbolPathLess);
+  SortUniqueSymbolsByPath(paths);
   paths.erase(std::unique(paths.begin(), paths.end()), paths.end());
   return paths;
 }
@@ -1388,7 +1749,7 @@ SymbolRefList CollectLhsSignalsFromStatement(const slang::ast::Statement &stmt) 
   SymbolRefList paths;
   StatementLhsCollector collector(paths);
   stmt.visit(collector);
-  std::sort(paths.begin(), paths.end(), SymbolPathLess);
+  SortUniqueSymbolsByPath(paths);
   paths.erase(std::unique(paths.begin(), paths.end()), paths.end());
   return paths;
 }
@@ -1650,10 +2011,15 @@ void DecomposePackedStructFields(std::vector<SignalCompileItem> &signals,
                                   int max_depth,
                                   int current_depth,
                                   uint64_t cumulative_offset) {
-  const SignalCompileItem &parent = signals[parent_idx];
-  if (parent.sym == nullptr) return;
+  // Copy what we need from the parent instead of holding a reference into
+  // `signals`: the push_back below can reallocate the vector, which would leave
+  // a `const SignalCompileItem&` dangling for the next loop iteration.
+  const slang::ast::Symbol *const parent_sym = signals[parent_idx].sym;
+  if (parent_sym == nullptr) return;
+  const std::string parent_path = signals[parent_idx].path;
+  const slang::ast::InstanceBodySymbol *const parent_body = signals[parent_idx].body;
 
-  const auto *vs = parent.sym->as_if<slang::ast::ValueSymbol>();
+  const auto *vs = parent_sym->as_if<slang::ast::ValueSymbol>();
   if (vs == nullptr) return;
 
   const slang::ast::Type &canonical = vs->getType().getCanonicalType();
@@ -1668,9 +2034,9 @@ void DecomposePackedStructFields(std::vector<SignalCompileItem> &signals,
     const uint64_t field_width = field_type.getBitWidth();
 
     SignalCompileItem item;
-    item.path = parent.path + "." + std::string(field.name);
-    item.sym = parent.sym;   // reuse parent's AST symbol for BuildSignalRecord
-    item.body = parent.body;
+    item.path = parent_path + "." + std::string(field.name);
+    item.sym = parent_sym;   // reuse parent's AST symbol for BuildSignalRecord
+    item.body = parent_body;
     item.parent_signal_idx = parent_idx;
     item.member_bit_offset = field_offset;
     item.member_bit_width = field_width;
@@ -1706,7 +2072,8 @@ void DecomposeStructMembers(std::vector<SignalCompileItem> &signals, int max_dep
 
 void CollectInstanceHierarchy(const slang::ast::RootSymbol &root, const slang::SourceManager &sm,
                               TraceDb &db, CompileContext &compile_ctx) {
-  db.hierarchy.reserve(2000000);
+  // No blanket reserve here: a flat map touches (nearly) every page of a reserved table, so reserving
+  // 2M nodes cost ~0.5 GB RSS on Lumion (707k instances). The caller pre-sizes it from the signal count.
   auto note_instance = [&](const slang::ast::InstanceSymbol &inst) {
     auto &node = db.hierarchy[std::string(inst.getHierarchicalPath())];
     node.module = std::string(inst.getDefinition().name);
@@ -1918,7 +2285,7 @@ std::vector<std::vector<size_t>> BucketSignalsByPartitions(
   return buckets;
 }
 
-bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem> &signals,
+bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &signals,
                  const slang::SourceManager &sm, const TraceDb &hier_db,
                  const std::vector<std::vector<size_t>> *buckets, size_t &signal_count,
                  CompileContext &compile_ctx, bool low_mem, CompileLogger *logger) {
@@ -1938,6 +2305,8 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
     return std::chrono::duration<double>(end - start).count();
   };
   const bool profile_save_graph = (std::getenv("RTL_TRACE_SAVE_GRAPH_PROFILE") != nullptr);
+  g_build_prof.on = profile_save_graph;
+  const bool fix_endpoint_merge = EnvFlagEnabled("RTL_TRACE_FIX_ENDPOINT_MERGE");
 
   const auto t_total_start = Clock::now();
   if (logger != nullptr) {
@@ -1952,18 +2321,43 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
   std::vector<std::pair<uint32_t, uint32_t>> assignment_lhs_refs_flat;
   slang::flat_hash_map<std::string, GlobalNetRecord> compact_global_nets;
   TraceCompileCache trace_cache;
-  trace_cache.body_cache_limit = low_mem ? 4u : 256u;
+  {
+    // Per-body trace indexes are pure functions of the (already bound) body, so the cache size only trades
+    // memory against rebuild time; it never changes the DB. Lumion has 707k distinct bodies but rebuilt
+    // 3.07M indexes with the old limit of 256 (high-fanout nets sweep thousands of bodies and flush the
+    // cache); 4096 cuts that to 1.94M for ~+0.45 GB RSS (16384: 1.39M for ~+0.8 GB).
+    // RTL_TRACE_BODY_CACHE=<n> overrides.
+    size_t limit = low_mem ? 4u : 4096u;
+    if (!low_mem) {
+      const char *v = std::getenv("RTL_TRACE_BODY_CACHE");
+      if (v != nullptr && *v != '\0') limit = std::max<size_t>(1, std::strtoull(v, nullptr, 10));
+    }
+    trace_cache.body_cache_limit = limit;
+  }
   EndpointMergeGroups merge_groups;
 
   // Reserve pool to guarantee stable string_view keys — must not reallocate.
   // Heuristic: ~1 unique string per signal + ~0.5 per endpoint for file/path/direction.
   const size_t estimated_strings = signals.size() * 2 + hier_db.hierarchy.size();
+  // graph.strings must stay an upper bound (string_view keys into it); it is a plain vector, so the
+  // over-reservation is untouched virtual memory.
   graph.strings.reserve(estimated_strings);
-  graph.endpoints.reserve(signals.size() * 5);
-  string_index.reserve(estimated_strings);
-  load_refs_flat.reserve(5000000);
-  driver_refs_flat.reserve(5000000);
-  assignment_lhs_refs_flat.reserve(5000000);
+  // Untouched-virtual reservations for the big append-only vectors so they (almost) never reallocate:
+  // a doubling realloc copies the touched half (+~1 GB transient on Lumion: 21.6M endpoints, 5.7 endpoints
+  // per signal) and leaves the old buffer to be purged. RTL_TRACE_ENDPOINTS_PER_SIGNAL overrides (default 8).
+  {
+    const char *eps = std::getenv("RTL_TRACE_ENDPOINTS_PER_SIGNAL");
+    const size_t per_sig = (eps != nullptr && *eps != '\0') ? std::max<size_t>(1, std::strtoull(eps, nullptr, 10)) : 8;
+    graph.endpoints.reserve(signals.size() * per_sig);
+    graph.signal_refs.reserve(signals.size() * per_sig * 3);
+    load_refs_flat.reserve(std::max<size_t>(5000000, signals.size() * 4));
+    driver_refs_flat.reserve(std::max<size_t>(5000000, signals.size() * 3));
+    assignment_lhs_refs_flat.reserve(std::max<size_t>(5000000, signals.size() * 5));
+  }
+  // string_index is a hash table (touches all its pages once populated), so size it to the strings that
+  // will really be interned: one per signal, one per hierarchy node, plus a slack for file/text strings.
+  // Under-estimating only costs a rehash.
+  string_index.reserve(signals.size() + hier_db.hierarchy.size() + signals.size() / 16 + 4096);
 
   auto intern = [&](std::string_view sv) -> uint32_t {
     return InternString(sv, graph.strings, string_index);
@@ -2049,6 +2443,9 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
     graph.signals[i].member_bit_width = static_cast<uint32_t>(signals[i].member_bit_width);
   }
 
+  LogMemPhase("SaveGraphDb:AfterPreIntern strings=" + std::to_string(graph.strings.size()) +
+              " signals=" + std::to_string(graph.signals.size()));
+
   auto build_signal_record = [&](const slang::ast::Symbol *sym) -> SignalRecord {
     return BuildSignalRecord(sym, sm, trace_cache, compile_ctx, &symbol_path_ids);
   };
@@ -2076,6 +2473,126 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
     sort_bucket_for_locality(bucket);
   }
   buckets = &processing_buckets;
+  LogMemPhase("SaveGraphDb:AfterBucketSort buckets=" + std::to_string(processing_buckets.size()));
+
+  // The signal path strings are now duplicated in graph.strings (graph.signals[i].name_str_id) and the
+  // bucket sort above was their last reader. Release the SignalCompileItem copies (~0.9 GB on Lumion);
+  // the build loop reads paths back from graph.strings (a reserved vector, never reallocated).
+  // RTL_TRACE_KEEP_SIGNAL_PATHS=1 keeps them (A/B measurement only).
+  const bool release_signal_paths = !EnvFlagEnabled("RTL_TRACE_KEEP_SIGNAL_PATHS");
+  if (release_signal_paths) {
+    for (SignalCompileItem &it : signals) std::string().swap(it.path);
+    LogMemPhase("SaveGraphDb:AfterReleaseSignalPaths");
+  }
+
+  // --- RTL_TRACE_MEM_PROGRESS=1: periodic memory/size progress inside the main loop ---
+  const bool mem_progress = EnvFlagEnabled("RTL_TRACE_MEM_PROGRESS");
+  // Defaults: a progress line every 100k signals, and whenever one signal yields >100k loads.
+  // Overridable (mainly for testing on small designs) with
+  // RTL_TRACE_MEM_PROGRESS_EVERY=<n> and RTL_TRACE_MEM_PROGRESS_BIG_LOADS=<n>.
+  auto env_size = [](const char *name, size_t dflt) {
+    const char *v = std::getenv(name);
+    if (v == nullptr || *v == '\0') return dflt;
+    char *end = nullptr;
+    const unsigned long long x = std::strtoull(v, &end, 10);
+    return (end != v && *end == '\0' && x > 0) ? static_cast<size_t>(x) : dflt;
+  };
+  const size_t kMemProgressEvery = env_size("RTL_TRACE_MEM_PROGRESS_EVERY", 100000);
+  const size_t kMemProgressBigLoads = env_size("RTL_TRACE_MEM_PROGRESS_BIG_LOADS", 100000);
+  size_t mem_progress_done = 0;        // signals through BuildSignalRecord (members excluded)
+  size_t compact_sink_bytes = 0;       // total bytes of sink path strings in compact_global_nets
+  size_t peak_loads = 0;               // largest rec.loads.size() seen (before compaction/merge)
+  std::string peak_loads_path;
+  long peak_rss_before_kb = 0, peak_rss_after_build_kb = 0, peak_rss_after_emit_kb = 0;
+  auto cap_str = [](size_t size, size_t cap) {
+    return std::to_string(size) + "/" + std::to_string(cap);
+  };
+  auto mem_progress_line = [&](const char *tag, const std::string &extra) {
+    size_t trace_results = 0;
+    size_t body_index_ready = 0;
+    for (const auto &kv : trace_cache.body_caches) {
+      const PerBodyTraceCache &bc = *kv.second;
+      if (bc.body_trace_index_ready) ++body_index_ready;
+      for (const auto &d : bc.body_trace_index.drivers) trace_results += d.second.size();
+      for (const auto &l : bc.body_trace_index.loads) trace_results += l.second.size();
+    }
+    std::cout << "[Memory] progress " << tag << " signals_done=" << mem_progress_done
+              << " rss=" << GetCurrentRSSKB() / 1024 << "MB peak_rss=" << GetMaxRSSMB() << "MB"
+              << " endpoints(size/cap)=" << cap_str(graph.endpoints.size(), graph.endpoints.capacity())
+              << " signal_refs=" << cap_str(graph.signal_refs.size(), graph.signal_refs.capacity())
+              << " strings=" << cap_str(graph.strings.size(), graph.strings.capacity())
+              << " load_refs=" << cap_str(load_refs_flat.size(), load_refs_flat.capacity())
+              << " driver_refs=" << cap_str(driver_refs_flat.size(), driver_refs_flat.capacity())
+              << " assign_lhs_refs="
+              << cap_str(assignment_lhs_refs_flat.size(), assignment_lhs_refs_flat.capacity())
+              << " body_caches=" << trace_cache.body_caches.size() << " (index_ready=" << body_index_ready
+              << ") trace_results=" << trace_results
+              << " compact_global_nets=" << compact_global_nets.size()
+              << " compact_sink_bytes=" << compact_sink_bytes << extra << "\n";
+    std::cout.flush();
+  };
+
+  // Exact live-byte estimate of every long-lived accumulator (RTL_TRACE_MEM_PROGRESS=1).
+  // Static inputs (compile-side `signals`, hierarchy db, buckets) are measured once.
+  double acct_static_bytes = 0.0;
+  bool acct_static_done = false;
+  auto mem_accounting_line = [&](const char *tag) {
+    if (!acct_static_done) {
+      acct_static_done = true;
+      double sig_tab = static_cast<double>(signals.capacity()) * sizeof(SignalCompileItem);
+      double sig_heap = 0;
+      for (const SignalCompileItem &it : signals) sig_heap += static_cast<double>(StrHeap(it.path));
+      double bucket_b = 0;
+      for (const auto &b : processing_buckets) bucket_b += static_cast<double>(b.capacity()) * sizeof(size_t);
+      double hier_tab = FlatMapTableBytes(hier_db.hierarchy);
+      double hier_heap = 0;
+      for (const auto &kv : hier_db.hierarchy) {
+        hier_heap += static_cast<double>(StrHeap(kv.first) + StrHeap(kv.second.module) + StrHeap(kv.second.source_file));
+        hier_heap += static_cast<double>(kv.second.parameters.capacity()) * sizeof(InstanceParameterRecord);
+        for (const auto &pr : kv.second.parameters) hier_heap += static_cast<double>(StrHeap(pr.name) + StrHeap(pr.value));
+        hier_heap += static_cast<double>(kv.second.children.capacity()) * sizeof(std::string);
+        for (const auto &c : kv.second.children) hier_heap += static_cast<double>(StrHeap(c));
+      }
+      acct_static_bytes = sig_tab + sig_heap + bucket_b + hier_tab + hier_heap;
+      std::cout << "[Memory] acct static compile-signals(table=" << Mb1(sig_tab) << "MB path_heap=" << Mb1(sig_heap)
+                << "MB n=" << signals.size() << " cap=" << signals.capacity() << " sizeof=" << sizeof(SignalCompileItem)
+                << ") buckets=" << Mb1(bucket_b) << "MB hier_db(table=" << Mb1(hier_tab) << "MB heap=" << Mb1(hier_heap)
+                << "MB nodes=" << hier_db.hierarchy.size() << " bucket_count=" << hier_db.hierarchy.bucket_count()
+                << " slot=" << sizeof(std::pair<const std::string, HierNodeRecord>) << ")\n";
+    }
+    const double ep_live = static_cast<double>(graph.endpoints.size()) * sizeof(GraphEndpointRecord);
+    const double ep_cap = static_cast<double>(graph.endpoints.capacity()) * sizeof(GraphEndpointRecord);
+    const double sr_cap = static_cast<double>(graph.signal_refs.capacity()) * sizeof(uint32_t);
+    double str_heap = 0;
+    for (const std::string &x : graph.strings) str_heap += static_cast<double>(StrHeap(x));
+    const double str_tab = static_cast<double>(graph.strings.capacity()) * sizeof(std::string);
+    const double sidx = FlatMapTableBytes(string_index);
+    const double spid = FlatMapTableBytes(symbol_path_ids);
+    const double gsig = static_cast<double>(graph.signals.capacity()) * sizeof(GraphSignalRecord);
+    const double refs =
+        static_cast<double>(load_refs_flat.capacity() + driver_refs_flat.capacity() + assignment_lhs_refs_flat.capacity()) *
+        sizeof(std::pair<uint32_t, uint32_t>);
+    double cg = FlatMapTableBytes(compact_global_nets);
+    for (const auto &kv : compact_global_nets) {
+      cg += static_cast<double>(StrHeap(kv.first) + StrHeap(kv.second.category));
+      cg += static_cast<double>(kv.second.sinks.capacity()) * sizeof(std::string);
+      for (const std::string &sk : kv.second.sinks) cg += static_cast<double>(StrHeap(sk));
+    }
+    const double total = ep_cap + sr_cap + str_heap + str_tab + sidx + spid + gsig + refs + cg + acct_static_bytes;
+    std::cout << "[Memory] acct " << tag << " signals_done=" << mem_progress_done
+              << " endpoints(live/cap)=" << Mb1(ep_live) << "/" << Mb1(ep_cap) << "MB signal_refs_cap=" << Mb1(sr_cap)
+              << "MB strings(table=" << Mb1(str_tab) << "MB heap=" << Mb1(str_heap) << "MB) string_index=" << Mb1(sidx)
+              << "MB(bc=" << string_index.bucket_count() << ") symbol_path_ids=" << Mb1(spid)
+              << "MB graph.signals=" << Mb1(gsig) << "MB ref_pairs_cap=" << Mb1(refs) << "MB compact_global=" << Mb1(cg)
+              << "MB static(compile signals+hier+buckets)=" << Mb1(acct_static_bytes) << "MB => accounted_total="
+              << Mb1(total) << "MB rss=" << GetCurrentRSSKB() / 1024 << "MB unaccounted="
+              << static_cast<long>(GetCurrentRSSKB() / 1024 - MB(total)) << "MB\n";
+    LogProcMemDetail(tag);
+  };
+  if (mem_progress) {
+    mem_accounting_line("pre_loop");
+    if (EnvFlagEnabled("RTL_TRACE_MI_STATS")) LogMiStats("BeforeBuildLoop");
+  }
 
   const auto t_build_start = Clock::now();
   double t_build_signal_record_s = 0.0;
@@ -2097,6 +2614,7 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
     for (size_t sig_id : bucket) {
       const SignalCompileItem &item = signals[sig_id];
       if (item.sym == nullptr || !IsTraceable(item.sym)) continue;
+      const std::string &item_path = graph.strings[graph.signals[sig_id].name_str_id];
       // Level 2: struct member signals derive endpoints from parent at query time
       if (item.parent_signal_idx != std::numeric_limits<uint32_t>::max()) {
         ++signal_count;
@@ -2104,22 +2622,49 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
       }
 
       const auto t_signal_record_start = profile_save_graph ? Clock::now() : Clock::time_point{};
+      const long mem_rss_before_kb = mem_progress ? GetCurrentRSSKB() : 0;
       SignalRecord rec = build_signal_record(item.sym);
       if (profile_save_graph) t_build_signal_record_s += elapsed_seconds(t_signal_record_start, Clock::now());
+      bool mem_new_peak = false;
+      if (mem_progress) {
+        const long mem_rss_after_kb = GetCurrentRSSKB();
+        if (rec.loads.size() > peak_loads) {
+          mem_new_peak = true;
+          peak_loads = rec.loads.size();
+          peak_loads_path = item_path;
+          peak_rss_before_kb = mem_rss_before_kb;
+          peak_rss_after_build_kb = mem_rss_after_kb;
+        }
+        if (rec.loads.size() > kMemProgressBigLoads) {
+          mem_progress_line("big_signal",
+                            " signal=" + item_path + " loads=" + std::to_string(rec.loads.size()) +
+                                " drivers=" + std::to_string(rec.drivers.size()) +
+                                " rss_before=" + std::to_string(mem_rss_before_kb / 1024) +
+                                "MB rss_after_build=" + std::to_string(mem_rss_after_kb / 1024) + "MB");
+        }
+      }
       const auto t_compact_global_start = profile_save_graph ? Clock::now() : Clock::time_point{};
-      if (ShouldCompactGlobalNet(item.path, rec.loads.size())) {
+      if (ShouldCompactGlobalNet(item_path, rec.loads.size())) {
         GlobalNetRecord g;
-        g.category = ClassifyGlobalNetCategory(item.path);
-        g.sinks = ExtractCompactSinkPaths(item.path, graph, rec.loads);
+        g.category = ClassifyGlobalNetCategory(item_path);
+        g.sinks = ExtractCompactSinkPaths(item_path, graph, rec.loads);
         if (!g.sinks.empty()) {
-          compact_global_nets.emplace(item.path, std::move(g));
+          if (mem_progress) {
+            for (const std::string &sink : g.sinks) compact_sink_bytes += sink.size();
+          }
+          compact_global_nets.emplace(item_path, std::move(g));
           rec.loads.clear();
         }
       }
       if (profile_save_graph) t_compact_global_s += elapsed_seconds(t_compact_global_start, Clock::now());
       const auto t_merge_start = profile_save_graph ? Clock::now() : Clock::time_point{};
-      MergeEndpointBitRangesInPlace(rec.drivers, merge_groups);
-      MergeEndpointBitRangesInPlace(rec.loads, merge_groups);
+      if (fix_endpoint_merge) {
+        MergeEndpointBitRangesInPlaceStable(rec.drivers);
+        MergeEndpointBitRangesInPlaceStable(rec.loads);
+      } else {
+        MergeEndpointBitRangesInPlace(rec.drivers, merge_groups);
+        MergeEndpointBitRangesInPlace(rec.loads, merge_groups);
+      }
       if (profile_save_graph) t_merge_s += elapsed_seconds(t_merge_start, Clock::now());
 
       GraphSignalRecord &gs = graph.signals[sig_id];
@@ -2170,6 +2715,15 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
       if (profile_save_graph) t_emit_load_s += elapsed_seconds(t_emit_load_start, Clock::now());
       ++signal_count;
       TrimTraceCompileCache(trace_cache);
+      if (mem_progress) {
+        ++mem_progress_done;
+        if (mem_new_peak) peak_rss_after_emit_kb = GetCurrentRSSKB();
+        if (mem_progress_done % kMemProgressEvery == 0) {
+          mem_progress_line("periodic", "");
+          mem_accounting_line("periodic");
+          if (EnvFlagEnabled("RTL_TRACE_MI_STATS")) LogMiCensus("periodic");
+        }
+      }
     }
     if (buckets->size() > 1) {
       const auto t_cache_clear_start = profile_save_graph ? Clock::now() : Clock::time_point{};
@@ -2181,6 +2735,18 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
   ClearTraceCompileCache(trace_cache);
   if (profile_save_graph) t_cache_clear_s += elapsed_seconds(t_cache_clear_start, Clock::now());
   const auto t_build_end = Clock::now();
+  LogMemPhase("SaveGraphDb:AfterBuildLoop endpoints=" + std::to_string(graph.endpoints.size()) +
+              " signal_refs=" + std::to_string(graph.signal_refs.size()));
+  if (mem_progress) {
+    mem_progress_line("build_done", "");
+    mem_accounting_line("build_done");
+    if (EnvFlagEnabled("RTL_TRACE_MI_STATS")) LogMiStats("AfterBuildLoop");
+    std::cout << "[Memory] progress peak_loads_signal=" << peak_loads_path << " loads=" << peak_loads
+              << " rss_before=" << peak_rss_before_kb / 1024 << "MB rss_after_build="
+              << peak_rss_after_build_kb / 1024 << "MB rss_after_emit=" << peak_rss_after_emit_kb / 1024
+              << "MB delta_build=" << (peak_rss_after_build_kb - peak_rss_before_kb) / 1024
+              << "MB delta_total=" << (peak_rss_after_emit_kb - peak_rss_before_kb) / 1024 << "MB\n";
+  }
   if (logger != nullptr) {
     logger->Log("save_graph_db: build_graph done elapsed_s=" +
                 fmt_seconds(t_build_start, t_build_end) +
@@ -2194,6 +2760,15 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
                   " emit_drivers_s=" + fmt_duration(t_emit_driver_s) +
                   " emit_loads_s=" + fmt_duration(t_emit_load_s) +
                   " cache_clear_s=" + fmt_duration(t_cache_clear_s));
+      logger->Log("save_graph_db: build_graph signal_record breakdown (nested/overlapping) index_build_s=" +
+                  fmt_duration(g_build_prof.index_build_s) + " bodies_built=" +
+                  std::to_string(g_build_prof.bodies_built) + " bodies_distinct=" +
+                  std::to_string(g_build_prof.bodies_seen.size()) + " bodies_rebuilt=" +
+                  std::to_string(g_build_prof.bodies_rebuilt) +
+                  " port_follow_s=" + fmt_duration(g_build_prof.port_follow_s) +
+                  " resolve_s=" + fmt_duration(g_build_prof.resolve_s) +
+                  " symbol_path_less_s=" + fmt_duration(g_build_prof.path_less_s) +
+                  " symbol_path_sorted_elems=" + std::to_string(g_build_prof.path_less_calls));
       logger->Log("save_graph_db: build_graph counts driver_endpoints=" +
                   std::to_string(build_driver_endpoint_count) +
                   " load_endpoints=" + std::to_string(build_load_endpoint_count) +
@@ -2233,14 +2808,21 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
       };
   const auto t_finalize_refs_start = profile_save_graph ? Clock::now() : Clock::time_point{};
   finalize_path_refs(load_refs_flat, graph.load_ref_ranges, graph.load_ref_signal_ids);
+  LogMemPhase("SaveGraphDb:AfterFinalizeLoadRefs unique_refs=" +
+              std::to_string(graph.load_ref_signal_ids.size()));
   finalize_path_refs(driver_refs_flat, graph.driver_ref_ranges, graph.driver_ref_signal_ids);
+  LogMemPhase("SaveGraphDb:AfterFinalizeDriverRefs unique_refs=" +
+              std::to_string(graph.driver_ref_signal_ids.size()));
   finalize_path_refs(assignment_lhs_refs_flat, graph.assignment_lhs_ref_ranges,
                      graph.assignment_lhs_ref_signal_ids);
+  LogMemPhase("SaveGraphDb:AfterFinalizeAssignmentLhsRefs unique_refs=" +
+              std::to_string(graph.assignment_lhs_ref_signal_ids.size()));
   const double t_finalize_refs_s =
       profile_save_graph ? elapsed_seconds(t_finalize_refs_start, Clock::now()) : 0.0;
   std::vector<std::pair<uint32_t, uint32_t>>().swap(load_refs_flat);
   std::vector<std::pair<uint32_t, uint32_t>>().swap(driver_refs_flat);
   std::vector<std::pair<uint32_t, uint32_t>>().swap(assignment_lhs_refs_flat);
+  LogMemPhase("SaveGraphDb:AfterRefVectorSwaps");
 
   const auto t_build_hierarchy_start = profile_save_graph ? Clock::now() : Clock::time_point{};
   std::vector<std::string> hier_paths;
@@ -2285,6 +2867,8 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
   }
   const double t_build_hierarchy_s =
       profile_save_graph ? elapsed_seconds(t_build_hierarchy_start, Clock::now()) : 0.0;
+  LogMemPhase("SaveGraphDb:AfterHierarchy nodes=" + std::to_string(graph.hierarchy.size()) +
+              " strings=" + std::to_string(graph.strings.size()));
 
   const auto t_build_global_nets_start = profile_save_graph ? Clock::now() : Clock::time_point{};
   std::vector<std::string> global_sources;
@@ -2309,6 +2893,8 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
   }
   const double t_build_global_nets_s =
       profile_save_graph ? elapsed_seconds(t_build_global_nets_start, Clock::now()) : 0.0;
+  LogMemPhase("SaveGraphDb:AfterGlobalNets nets=" + std::to_string(graph.global_nets.size()) +
+              " sinks=" + std::to_string(graph.global_sinks.size()));
 
   const auto t_string_offsets_start = profile_save_graph ? Clock::now() : Clock::time_point{};
   std::vector<uint32_t> string_offsets;
@@ -2324,6 +2910,7 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
   string_index.clear();
   const double t_string_offsets_s =
       profile_save_graph ? elapsed_seconds(t_string_offsets_start, Clock::now()) : 0.0;
+  LogMemPhase("SaveGraphDb:AfterStringOffsets string_bytes=" + std::to_string(total_str_bytes));
 
   if (logger != nullptr && profile_save_graph) {
     logger->Log("save_graph_db: finalize phases refs_s=" + fmt_duration(t_finalize_refs_s) +
@@ -2350,6 +2937,7 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
   header.global_net_count = graph.global_nets.size();
   header.global_sink_count = graph.global_sinks.size();
 
+  LogMemPhase("SaveGraphDb:BeforeWrite");
   const auto t_write_start = Clock::now();
   ScopedFileLock db_lock;
   if (!db_lock.Acquire(db_path)) return false;
@@ -2379,6 +2967,7 @@ bool SaveGraphDb(const std::string &db_path, const std::vector<SignalCompileItem
     return false;
   }
   const auto t_write_end = Clock::now();
+  LogMemPhase("SaveGraphDb:AfterWrite");
   if (logger != nullptr) {
     logger->Log("save_graph_db: write_file done elapsed_s=" +
                 fmt_seconds(t_write_start, t_write_end));
@@ -2948,6 +3537,31 @@ size_t EditDistance(const std::string &a, const std::string &b) {
   return prev[b.size()];
 }
 
+// Levenshtein distance identical to EditDistance() whenever the result is <= bound; otherwise
+// returns some value > bound. `prev`/`cur` are caller-provided scratch rows (reused across calls).
+static size_t BoundedEditDistance(const std::string &a, const std::string &b, size_t bound,
+                                  std::vector<size_t> &prev, std::vector<size_t> &cur) {
+  const size_t diff = a.size() > b.size() ? a.size() - b.size() : b.size() - a.size();
+  if (diff > bound) return diff;
+  prev.resize(b.size() + 1);
+  cur.resize(b.size() + 1);
+  for (size_t j = 0; j <= b.size(); ++j)
+    prev[j] = j;
+  for (size_t i = 1; i <= a.size(); ++i) {
+    cur[0] = i;
+    size_t row_min = cur[0];
+    for (size_t j = 1; j <= b.size(); ++j) {
+      const size_t cost = (a[i - 1] == b[j - 1]) ? 0 : 1;
+      cur[j] = std::min({prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost});
+      row_min = std::min(row_min, cur[j]);
+    }
+    // Values never decrease along an alignment path, so the final distance is >= any row minimum.
+    if (row_min > bound) return row_min;
+    std::swap(prev, cur);
+  }
+  return prev[b.size()];
+}
+
 bool LooksLikeOptionToken(const std::string &s) {
   return !s.empty() && (s[0] == '-' || s[0] == '+');
 }
@@ -3125,20 +3739,31 @@ std::vector<std::string> ArgvToVector(int argc, char *argv[]) {
 
 std::vector<std::string> TopSuggestions(const TraceSession &session, const std::string &needle,
                                         size_t limit) {
-  std::vector<std::pair<size_t, std::string>> scored;
-  scored.reserve(session.signal_names_by_id.size());
-  for (const std::string *name : session.signal_names_by_id) {
-    scored.push_back({EditDistance(*name, needle), *name});
-  }
-  std::sort(scored.begin(), scored.end(), [](const auto &a, const auto &b) {
+  // Result is the first max(limit,1) names ordered by (edit distance, name) — as if every name
+  // were scored and fully sorted — computed with a parallel bounded top-k. Once a worker holds
+  // `keep` candidates, names that cannot beat its current worst are rejected early via a
+  // bounded edit distance (exact whenever the distance is <= the bound).
+  using Scored = std::pair<size_t, const std::string *>;
+  auto scored_less = [](const Scored &a, const Scored &b) {
     if (a.first != b.first) return a.first < b.first;
-    return a.second < b.second;
-  });
+    return *a.second < *b.second;
+  };
+  using Collector = TopKCollector<Scored, decltype(scored_less)>;
+  const size_t keep = std::max<size_t>(limit, 1);
+  const std::vector<const std::string *> &names = session.signal_names_by_id;
+  const std::vector<Scored> top = ParallelTopK<Scored>(
+      names.size(), keep, scored_less, [&](size_t begin, size_t end, Collector &out) {
+        std::vector<size_t> prev, cur;
+        for (size_t i = begin; i < end; ++i) {
+          const std::string &name = *names[i];
+          const size_t bound = out.Full() ? out.Worst().first : std::numeric_limits<size_t>::max();
+          const size_t d = BoundedEditDistance(name, needle, bound, prev, cur);
+          if (d <= bound) out.Push({d, names[i]});
+        }
+      });
   std::vector<std::string> out;
-  for (const auto &p : scored) {
-    out.push_back(p.second);
-    if (out.size() >= limit) break;
-  }
+  out.reserve(top.size());
+  for (const Scored &p : top) out.push_back(*p.second);
   return out;
 }
 

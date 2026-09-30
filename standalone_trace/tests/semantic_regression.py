@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 
 
-def run_cmd(cmd, cwd=None, expect=0):
+def run_cmd(cmd, cwd=None, expect=0, env=None):
     run_cwd = None if cwd is None else str(cwd)
-    proc = subprocess.run(cmd, cwd=run_cwd, text=True, capture_output=True)
+    run_env = None
+    if env:
+        run_env = dict(os.environ)
+        run_env.update(env)
+    proc = subprocess.run(cmd, cwd=run_cwd, text=True, capture_output=True, env=run_env)
     if proc.returncode != expect:
         raise AssertionError(
             "Command failed\n"
@@ -977,9 +982,230 @@ def main():
                     f"pkt.code drivers at cone-level 1 should not contain pkt.data: {ep}"
                 )
 
+        # 30) Signal vector reallocation during struct decomposition must not change the DB.
+        # RTL_TRACE_SIGNALS_RESERVE=1 forces `signals` to grow while
+        # DecomposePackedStructFields runs (regression for a dangling reference into
+        # the vector; run under ASan to catch it deterministically).
+        for realloc_fixture, realloc_top in (("struct_top.sv", "struct_top"),
+                                             ("struct_nested.sv", "nested_top")):
+            fx_path = src_dir / "tests" / "fixtures" / realloc_fixture
+            db_default = tmpdir / f"{realloc_top}_default.db"
+            db_realloc = tmpdir / f"{realloc_top}_realloc.db"
+            for db_path, env in ((db_default, None), (db_realloc, {"RTL_TRACE_SIGNALS_RESERVE": "1"})):
+                run_cmd(
+                    [str(rtl_trace), "compile", "--db", str(db_path), physical_source_path_flag,
+                     "--single-unit", str(fx_path), "--top", realloc_top],
+                    env=env,
+                )
+            if db_default.read_bytes() != db_realloc.read_bytes():
+                raise AssertionError(
+                    f"{realloc_fixture}: DB differs when the signal vector is forced to reallocate"
+                )
+
+        # 31) Endpoint bit-range merging.
+        # Known issue: with default settings MergeEndpointBitRangesInPlace builds its grouping
+        # key from an endpoint that is then moved-from, so endpoints carrying lhs/rhs lists never
+        # merge. RTL_TRACE_FIX_ENDPOINT_MERGE=1 selects the corrected implementation.
+        merge_fixture = src_dir / "tests" / "fixtures" / "endpoint_merge.sv"
+        merge_dbs = {}
+        for tag, env in (("default", None), ("fixed", {"RTL_TRACE_FIX_ENDPOINT_MERGE": "1"})):
+            merge_dbs[tag] = tmpdir / f"endpoint_merge_{tag}.db"
+            run_cmd(
+                [str(rtl_trace), "compile", "--db", str(merge_dbs[tag]), physical_source_path_flag,
+                 "--single-unit", str(merge_fixture), "--top", "endpoint_merge"],
+                env=env,
+            )
+        merge_default = run_trace_json(rtl_trace, merge_dbs["default"], "loads", "endpoint_merge.a")
+        merge_fixed = run_trace_json(rtl_trace, merge_dbs["fixed"], "loads", "endpoint_merge.a")
+        default_maps = sorted(e.get("bit_map") for e in merge_default.get("endpoints", []))
+        fixed_maps = sorted(e.get("bit_map") for e in merge_fixed.get("endpoints", []))
+        if fixed_maps != ["[3:0]", "[7:4]"]:
+            raise AssertionError(f"fixed merge: expected ['[3:0]', '[7:4]'], got {fixed_maps}")
+        # Documents current default behaviour (unmerged). Update when the fix becomes the default.
+        if default_maps != ["[0]", "[1]", "[2]", "[3]", "[7:4]"]:
+            raise AssertionError(f"default merge behaviour changed unexpectedly: {default_maps}")
+        # ===== BEGIN find_fastpath tests (parallel top-k find / literal prefilter / suggestions) =====
+        run_find_fastpath_tests(rtl_trace, db, tmpdir)
+        # ===== END find_fastpath tests =====
+
         print("semantic_regression: PASS")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ===== BEGIN find_fastpath tests =====
+# `rtl_trace find` scans names in parallel (bounded top-k) and prefilters regexes with a required
+# literal. These tests pin the observable behaviour: lexicographically sorted first --limit
+# matches, count == min(matches, limit), exit code 2 on no match, suggestions ordered by
+# (edit distance, name), and unchanged invalid-regex handling.
+
+FIND_FASTPATH_BIG_SV = """
+module ff_leaf(input logic clk, input logic [7:0] i_paddr, output logic [7:0] o_data);
+  logic [7:0] r_a, r_b, paddr_q, wdata_i;
+  always_ff @(posedge clk) begin r_a <= i_paddr; r_b <= r_a; paddr_q <= r_b; wdata_i <= paddr_q; end
+  assign o_data = wdata_i;
+endmodule
+module ff_mid(input logic clk, input logic [7:0] i_paddr, output logic [7:0] o_data);
+  logic [7:0] d [0:63];
+  for (genvar k = 0; k < 64; k++) begin : g_leaf
+    ff_leaf u_leaf(.clk(clk), .i_paddr(i_paddr), .o_data(d[k]));
+  end
+  assign o_data = d[0];
+endmodule
+module ff_top(input logic clk, input logic [7:0] i_paddr, output logic [7:0] o_data);
+  logic [7:0] d [0:127];
+  for (genvar m = 0; m < 128; m++) begin : g_mid
+    ff_mid u_mid(.clk(clk), .i_paddr(i_paddr), .o_data(d[m]));
+  end
+  assign o_data = d[0];
+endmodule
+"""
+
+
+def _find_raw(rtl_trace, db, query, regex=False, limit=None, fmt=None, expect=None):
+    cmd = [str(rtl_trace), "find", "--db", str(db), "--query", query]
+    if regex:
+        cmd.append("--regex")
+    if limit is not None:
+        cmd += ["--limit", str(limit)]
+    if fmt:
+        cmd += ["--format", fmt]
+    proc = subprocess.run(cmd, text=True, capture_output=True)
+    if expect is not None and proc.returncode != expect:
+        raise AssertionError(f"find rc {proc.returncode} != {expect}: {' '.join(cmd)}\n{proc.stdout}{proc.stderr}")
+    return proc
+
+
+def _find_text_names(proc):
+    return [l[len("signal "):] for l in proc.stdout.splitlines() if l.startswith("signal ")]
+
+
+def _find_check(rtl_trace, db, all_names, query, regex, limit, matcher, label):
+    """Compare find (text and json) against a pure-Python reference for the same query."""
+    import re as _re
+    expected_all = sorted(n for n in all_names if matcher(n))
+    expected = expected_all if limit is None else expected_all[:limit]
+    want_rc = 0 if expected else 2
+    txt = _find_raw(rtl_trace, db, query, regex, limit, None)
+    if txt.returncode != want_rc:
+        raise AssertionError(f"[{label}] text rc {txt.returncode} != {want_rc}\n{txt.stdout}{txt.stderr}")
+    if _find_text_names(txt) != expected:
+        raise AssertionError(f"[{label}] text matches differ: got {_find_text_names(txt)[:10]} want {expected[:10]}")
+    if f"count: {len(expected)}\n" not in txt.stdout:
+        raise AssertionError(f"[{label}] text count mismatch (want {len(expected)}):\n{txt.stdout[:300]}")
+    js = _find_raw(rtl_trace, db, query, regex, limit, "json")
+    if js.returncode != want_rc:
+        raise AssertionError(f"[{label}] json rc {js.returncode} != {want_rc}")
+    obj = json.loads(js.stdout)
+    if obj["matches"] != expected or obj["count"] != len(expected) or obj["regex"] != regex or obj["query"] != query:
+        raise AssertionError(f"[{label}] json mismatch: {js.stdout[:300]}")
+    if expected and obj["suggestions"]:
+        raise AssertionError(f"[{label}] suggestions must be empty when there are matches")
+
+
+def run_find_fastpath_tests(rtl_trace, small_db, tmpdir):
+    import re as _re
+
+    # --- small design: exact expected output -------------------------------------------------
+    proc = _find_raw(rtl_trace, small_db, "semantic_top.u_", limit=3, expect=0)
+    want = (
+        "query: semantic_top.u_\nregex: false\ncount: 3\n"
+        "signal semantic_top.u_cons.hi_nibble\nsignal semantic_top.u_cons.hit\n"
+        "signal semantic_top.u_cons.in_bus\n"
+    )
+    if proc.stdout != want:
+        raise AssertionError(f"find_fastpath substring/limit text output changed:\n{proc.stdout}")
+
+    proc = _find_raw(rtl_trace, small_db, "semantic_top.u_.*\\.in_bus$", regex=True, fmt="json", expect=0)
+    want = (
+        '{"query":"semantic_top.u_.*\\\\.in_bus$","regex":true,"count":2,'
+        '"matches":["semantic_top.u_cons.in_bus","semantic_top.u_param.in_bus"],"suggestions":[]}\n'
+    )
+    if proc.stdout != want:
+        raise AssertionError(f"find_fastpath regex json output changed:\n{proc.stdout}")
+
+    # no match -> exit 2 with edit-distance ordered suggestions (ties broken by name)
+    proc = _find_raw(rtl_trace, small_db, "semantic_top.hitt", limit=3, expect=2)
+    want = (
+        "query: semantic_top.hitt\nregex: false\ncount: 0\nsuggestions:\n"
+        "  semantic_top.hit\n  semantic_top.data\n  semantic_top.clk\n"
+    )
+    if proc.stdout != want:
+        raise AssertionError(f"find_fastpath suggestions output changed:\n{proc.stdout}")
+    proc = _find_raw(rtl_trace, small_db, "zzz.*qqq", regex=True, limit=2, fmt="json", expect=2)
+    obj = json.loads(proc.stdout)
+    if obj["count"] != 0 or obj["matches"] != [] or len(obj["suggestions"]) != 2:
+        raise AssertionError(f"find_fastpath regex no-match json unexpected: {proc.stdout}")
+
+    # invalid regex: unchanged behaviour (uncaught std::regex_error -> abnormal termination,
+    # nothing on stdout)
+    proc = _find_raw(rtl_trace, small_db, "(", regex=True)
+    if proc.returncode == 0 or "regex_error" not in proc.stderr or proc.stdout != "":
+        raise AssertionError(f"find_fastpath invalid regex behaviour changed: rc={proc.returncode} {proc.stderr}")
+    proc = _find_raw(rtl_trace, small_db, "zz(", regex=True)  # literal prefix must not mask the error
+    if proc.returncode == 0 or "regex_error" not in proc.stderr:
+        raise AssertionError("find_fastpath invalid regex with literal prefix must still fail")
+    # substring mode treats regex metacharacters literally
+    _find_raw(rtl_trace, small_db, "(", regex=False, expect=2)
+
+    # --- large synthetic design (crosses the parallel-scan threshold) -----------------------
+    big_sv = tmpdir / "find_fastpath_big.sv"
+    big_sv.write_text(FIND_FASTPATH_BIG_SV)
+    big_db = tmpdir / "find_fastpath_big.db"
+    run_cmd([str(rtl_trace), "compile", "--db", str(big_db), "--single-unit", str(big_sv), "--top", "ff_top"])
+    every = _find_raw(rtl_trace, big_db, ".", regex=True, limit=10**9, expect=0)
+    all_names = _find_text_names(every)
+    if len(all_names) < 40000:
+        raise AssertionError(f"find_fastpath big design too small for parallel path: {len(all_names)}")
+    if all_names != sorted(all_names):
+        raise AssertionError("find_fastpath: find output must be sorted")
+
+    cases = [
+        # (label, query, regex, matcher)
+        ("substr", "paddr", False, lambda n: "paddr" in n),
+        ("substr-none", "no_such_sig", False, lambda n: "no_such_sig" in n),
+        ("re-literal", "i_.*paddr", True, lambda n: _re.search("i_.*paddr", n)),
+        ("re-literal-esc", "g_mid\\[1[0-9]\\]\\.u_mid.*paddr_q", True,
+         lambda n: _re.search(r"g_mid\[1[0-9]\]\.u_mid.*paddr_q", n)),
+        ("re-anchor-class", "^ff_top\\.g_mid\\[[0-3]\\]\\.u_mid\\.d\\[\\d+\\]$", True,
+         lambda n: _re.search(r"^ff_top\.g_mid\[[0-3]\]\.u_mid\.d\[\d+\]$", n)),
+        ("re-alt", "(r_a|r_b)$", True, lambda n: _re.search("(r_a|r_b)$", n)),
+        ("re-alt-top", "wdata_i$|paddr_q$", True, lambda n: _re.search("wdata_i$|paddr_q$", n)),
+        ("re-opt-literal", "r_ab?$", True, lambda n: _re.search("r_ab?$", n)),
+        ("re-star-literal", "paddr_qx*$", True, lambda n: _re.search("paddr_qx*$", n)),
+        ("re-plus-literal", "paddr_q+$", True, lambda n: _re.search("paddr_q+$", n)),
+        ("re-brace0", "r_ab{0,1}$", True, lambda n: _re.search("r_ab{0,1}$", n)),
+        ("re-dot-any", "d.ta", True, lambda n: _re.search("d.ta", n)),
+        ("re-none", "zzzz.*qqqq", True, lambda n: _re.search("zzzz.*qqqq", n)),
+        ("re-all", ".*", True, lambda n: True),
+    ]
+    for label, query, is_regex, matcher in cases:
+        for limit in (1, 3, 1000, 10**9):
+            _find_check(rtl_trace, big_db, all_names, query, is_regex, limit, matcher, f"{label}/limit={limit}")
+
+    # suggestions on the big design: parallel bounded edit distance must equal a full sort
+    def bounded_edit_distance(a, b, bound):
+        if abs(len(a) - len(b)) > bound:
+            return bound + 1
+        prev = list(range(len(b) + 1))
+        for i in range(1, len(a) + 1):
+            cur = [i] + [0] * len(b)
+            for j in range(1, len(b) + 1):
+                cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] != b[j - 1]))
+            if min(cur) > bound:
+                return bound + 1
+            prev = cur
+        return prev[len(b)]
+
+    needle = "ff_top.g_mid[3].u_mid.g_leaf[7].u_leaf.paddr_qq"
+    proc = _find_raw(rtl_trace, big_db, needle, limit=5, expect=2)
+    sugg = [l.strip() for l in proc.stdout.split("suggestions:\n", 1)[1].splitlines()]
+    scored = sorted((d, n) for n in all_names for d in [bounded_edit_distance(n, needle, 3)] if d <= 3)
+    if len(scored) < 5:
+        raise AssertionError("find_fastpath: reference needs >= 5 names within distance 3")
+    if [n for _, n in scored[:5]] != sugg:
+        raise AssertionError(f"find_fastpath big suggestions differ: got {sugg}, want {[n for _, n in scored[:5]]}")
+# ===== END find_fastpath tests =====
 
 
 if __name__ == "__main__":

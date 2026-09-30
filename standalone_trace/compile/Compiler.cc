@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -60,7 +61,7 @@ std::vector<std::vector<size_t>> BucketSignalsByPartitions(
     const std::vector<SignalCompileItem> &signals,
     const std::vector<PartitionRecord> &parts);
 bool SaveGraphDb(const std::string &db_path,
-                 const std::vector<SignalCompileItem> &signals,
+                 std::vector<SignalCompileItem> &signals,
                  const slang::SourceManager &sm,
                  const TraceDb &hier_db,
                  const std::vector<std::vector<size_t>> *buckets,
@@ -413,17 +414,33 @@ int RunCompile(int argc, char *argv[]) {
   const slang::ast::RootSymbol &root = compilation->getRoot();
   const slang::SourceManager &sm = *compilation->getSourceManager();
   std::vector<SignalCompileItem> signals;
-  signals.reserve(2000000);
+  // RTL_TRACE_SIGNALS_RESERVE=<n> overrides the initial signal-vector capacity
+  // (default 2000000). Debug/test knob: a tiny value forces reallocation so
+  // sanitizers can exercise code that must tolerate vector growth.
+  size_t signals_reserve = 2000000;
+  if (const char *env = std::getenv("RTL_TRACE_SIGNALS_RESERVE"); env != nullptr && *env != '\0') {
+    char *end = nullptr;
+    const unsigned long long v = std::strtoull(env, &end, 10);
+    if (end != env && *end == '\0') signals_reserve = static_cast<size_t>(v);
+  }
+  signals.reserve(signals_reserve);
   logger.Log("step: collect traceable symbols");
   LogMem("MemBeforeCollectSymbols");
   CollectTraceableSymbols(root, signals);
+  LogMem("MemAfterCollectTraceableSymbols signals=" + std::to_string(signals.size()) +
+         " capacity=" + std::to_string(signals.capacity()));
   DecomposeStructMembers(signals, 2);
+  LogMem("MemAfterDecomposeStructMembers signals=" + std::to_string(signals.size()) +
+         " capacity=" + std::to_string(signals.capacity()));
   LogMem("MemAfterCollectSymbols");
   logger.Log("collected symbols: " + std::to_string(signals.size()));
 
   TraceDb hier_db;
   logger.Log("step: collect instance hierarchy");
   LogMem("MemBeforeCollectHierarchy");
+  // Instances are roughly one per ~5 signals (Lumion: 707k instances / 3.8M signals). Only a hint: the
+  // map rehashes if it is exceeded, and an over-sized hash table costs real RSS.
+  hier_db.hierarchy.reserve(signals.size() / 4 + 1024);
   CollectInstanceHierarchy(root, sm, hier_db, compile_ctx);
   LogMem("MemAfterCollectHierarchy");
 
