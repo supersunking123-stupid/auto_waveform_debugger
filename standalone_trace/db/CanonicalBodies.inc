@@ -24,12 +24,21 @@
 SymbolRefList CollectLhsSignals(const slang::ast::AssignmentExpression *assignment);
 SymbolRefList CollectRhsSignals(const slang::ast::AssignmentExpression *assignment);
 
+// Connections are cached per crossing instance, not per (instance, outer-frame) pair.
+// Identity entries matter: an external interface root still belongs to this mapping.
+struct CanonIfaceMap {
+  enum Reason { None, Unresolved, Shape, Conflict, AliasSplit, AliasMerge, Forwarding };
+  Reason reason = None;
+  std::vector<std::pair<std::string, std::string>> roots;
+};
+
 struct CanonFrame {
   const CanonFrame *outer = nullptr;
   const slang::ast::InstanceSymbol *image = nullptr;    // crossing instance, member of a body in `outer` coordinates
   const slang::ast::InstanceBodySymbol *rep = nullptr;  // canonical body standing in for image->body
   std::string_view src;                                 // hierarchical path of rep (its canonical instance)
   std::string dst;                                      // hierarchical path of image
+  const CanonIfaceMap *ifaces = nullptr;
 };
 
 struct CanonPtrPairHash {
@@ -166,6 +175,9 @@ class CanonicalTracer {
               << " excluded_crossings(kind)=" << stats_.excl_kind << " child_lookup_fail=" << stats_.child_lookup_fail
               << " port_map_fail=" << stats_.port_map_fail << " down_map_fail=" << stats_.down_map_fail
               << " xlate_anomaly=" << stats_.xlate_anomaly << " xlate_id_miss=" << stats_.xlate_id_miss
+              << " iface_unresolved=" << stats_.iface_unresolved << " iface_shape=" << stats_.iface_shape
+              << " iface_conflict=" << stats_.iface_conflict << " iface_alias_split=" << stats_.iface_alias_split
+              << " iface_alias_merge=" << stats_.iface_alias_merge << " iface_forwarding=" << stats_.iface_forwarding
               << " escape_dead=" << stats_.escape_dead << " virtual_absolute=" << stats_.virtual_absolute << "\n";
     if (verify_) {
       std::cout << "[Canon] verify signals=" << stats_.verify_signals
@@ -194,6 +206,8 @@ class CanonicalTracer {
     size_t sig_identity = 0, sig_redirected = 0, sig_broken = 0, sig_map_fail = 0, sig_no_body = 0;
     size_t excl_iface = 0, excl_kind = 0, child_lookup_fail = 0, port_map_fail = 0, down_map_fail = 0;
     size_t xlate_anomaly = 0, xlate_id_miss = 0, escape_dead = 0, virtual_absolute = 0;
+    size_t iface_unresolved = 0, iface_shape = 0, iface_conflict = 0;
+    size_t iface_alias_split = 0, iface_alias_merge = 0, iface_forwarding = 0;
     size_t verify_signals = 0, verify_mismatch = 0;
   };
 
@@ -209,6 +223,97 @@ class CanonicalTracer {
     return *rep_paths_.emplace(&body, std::make_unique<std::string>(std::move(p))).first->second;
   }
 
+  bool HasIfacePorts(const slang::ast::InstanceBodySymbol &body) {
+    auto it = iface_bodies_.find(&body);
+    if (it == iface_bodies_.end()) it = iface_bodies_.emplace(&body, CanonBodyHasIfacePort(body)).first;
+    return it->second;
+  }
+
+  CanonIfaceMap::Reason PairIfaceRoots(const slang::ast::Symbol *rep, const slang::ast::Symbol *image,
+                                      CanonIfaceMap &map) {
+    using Reason = CanonIfaceMap;
+    if (rep == nullptr || image == nullptr) return Reason::Unresolved;
+    if (rep->kind != image->kind) return Reason::Shape;
+    if (rep->kind == slang::ast::SymbolKind::InstanceArray) {
+      const auto &a = rep->as<slang::ast::InstanceArraySymbol>();
+      const auto &b = image->as<slang::ast::InstanceArraySymbol>();
+      // Slang rewireIfaceArrayIndices has already put cached connections into formal-port
+      // order, including reversed bounds. Pair those leaves, not their printed indices.
+      if (a.range != b.range || a.elements.size() != b.elements.size()) return Reason::Shape;
+      if (a.elements.empty()) return Reason::Unresolved;
+      for (size_t i = 0; i < a.elements.size(); ++i) {
+        const auto reason = PairIfaceRoots(a.elements[i], b.elements[i], map);
+        if (reason != Reason::None) return reason;
+      }
+      return Reason::None;
+    }
+    if (rep->kind != slang::ast::SymbolKind::Instance) return Reason::Unresolved;
+    const auto &a = rep->as<slang::ast::InstanceSymbol>();
+    const auto &b = image->as<slang::ast::InstanceSymbol>();
+    if (!a.isInterface() || !b.isInterface() || &a.getDefinition() != &b.getDefinition()) return Reason::Shape;
+    // These connections can refer to roots outside the connected interface itself. Root-only
+    // substitution does not model that second connection graph. Module pass-through is fine.
+    if (HasIfacePorts(a.body) || HasIfacePorts(b.body)) return Reason::Forwarding;
+    std::string src = a.getHierarchicalPath();
+    std::string dst = b.getHierarchicalPath();
+    for (const auto &root : map.roots) {
+      if (root.first == src) return root.second == dst ? Reason::None : Reason::AliasSplit;
+      if (root.second == dst) return Reason::AliasMerge;
+      // Overlapping roots must describe the same subtree relationship in both directions.
+      // Otherwise the longest match would conceal a change in the interface alias graph.
+      if ((UnderCanonicalRoot(src, root.first) && dst != root.second + src.substr(root.first.size())) ||
+          (UnderCanonicalRoot(root.first, src) && root.second != dst + root.first.substr(src.size())) ||
+          (UnderCanonicalRoot(dst, root.second) && src != root.first + dst.substr(root.second.size())) ||
+          (UnderCanonicalRoot(root.second, dst) && root.first != src + root.second.substr(dst.size())))
+        return Reason::Conflict;
+    }
+    map.roots.emplace_back(std::move(src), std::move(dst));
+    return Reason::None;
+  }
+
+  const CanonIfaceMap &IfaceMap(const slang::ast::InstanceSymbol &image) {
+    auto it = iface_maps_.find(&image);
+    if (it != iface_maps_.end()) return *it->second;
+    auto map = std::make_unique<CanonIfaceMap>();
+    const auto &rep = *image.getCanonicalBody();
+    const auto rp = rep.getPortList();
+    const auto ip = image.body.getPortList();
+    if (rep.parentInstance == nullptr || rp.size() != ip.size()) {
+      map->reason = CanonIfaceMap::Shape;
+    } else {
+      // InstanceCacheKey has already resolved these connections before accepting a crossing.
+      // getIfaceConn only reads cached symbols; never inspect a skipped body's expressions.
+      const auto rc = rep.parentInstance->getPortConnections();
+      const auto ic = image.getPortConnections();
+      auto connection = [](auto connections, const slang::ast::Symbol *port) {
+        for (const auto *conn : connections)
+          if (&conn->port == port) return conn->getIfaceConn();
+        return slang::ast::PortConnection::IfaceConn{nullptr, nullptr};
+      };
+      for (size_t i = 0; i < rp.size(); ++i) {
+        if (rp[i] == nullptr || ip[i] == nullptr || rp[i]->kind != ip[i]->kind || rp[i]->name != ip[i]->name) {
+          map->reason = CanonIfaceMap::Shape;
+          break;
+        }
+        if (rp[i]->kind != slang::ast::SymbolKind::InterfacePort) continue;
+        const auto a = connection(rc, rp[i]);
+        const auto b = connection(ic, ip[i]);
+        if (bool(a.second) != bool(b.second) || (a.second != nullptr && a.second->name != b.second->name)) {
+          map->reason = CanonIfaceMap::Shape;
+          break;
+        }
+        map->reason = PairIfaceRoots(a.first, b.first, *map);
+        if (map->reason != CanonIfaceMap::None) break;
+      }
+    }
+    if (map->reason != CanonIfaceMap::None) map->roots.clear();
+    // Longest boundary match wins. Applying only one entry avoids same-frame remapping chains.
+    std::sort(map->roots.begin(), map->roots.end(), [](const auto &a, const auto &b) {
+      return a.first.size() > b.first.size();
+    });
+    return *iface_maps_.emplace(&image, std::move(map)).first->second;
+  }
+
   bool IsCrossing(const slang::ast::InstanceSymbol &inst) {
     const slang::ast::InstanceBodySymbol *c = inst.getCanonicalBody();
     if (c == nullptr || c == &inst.body) return false;
@@ -216,11 +321,21 @@ class CanonicalTracer {
       ++stats_.excl_kind;
       return false;
     }
-    if (!no_iface_exclusion_) {
-      auto it = iface_bodies_.find(c);
-      if (it == iface_bodies_.end()) it = iface_bodies_.emplace(c, CanonBodyHasIfacePort(*c)).first;
-      if (it->second) {
+    if (HasIfacePorts(*c)) {
+      const auto reason = IfaceMap(inst).reason;
+      // This diagnostic bypass intentionally disables correctness protection for unsupported
+      // mappings. Supported maps are still used. Never retain a partially constructed map.
+      if (reason != CanonIfaceMap::None && !no_iface_exclusion_) {
         ++stats_.excl_iface;
+        switch (reason) {
+        case CanonIfaceMap::Unresolved: ++stats_.iface_unresolved; break;
+        case CanonIfaceMap::Shape: ++stats_.iface_shape; break;
+        case CanonIfaceMap::Conflict: ++stats_.iface_conflict; break;
+        case CanonIfaceMap::AliasSplit: ++stats_.iface_alias_split; break;
+        case CanonIfaceMap::AliasMerge: ++stats_.iface_alias_merge; break;
+        case CanonIfaceMap::Forwarding: ++stats_.iface_forwarding; break;
+        case CanonIfaceMap::None: break;
+        }
         return false;
       }
     }
@@ -237,6 +352,7 @@ class CanonicalTracer {
     f->rep = image.getCanonicalBody();
     f->src = RepPath(*f->rep);
     f->dst = image.getHierarchicalPath();
+    if (HasIfacePorts(*f->rep)) f->ifaces = &IfaceMap(image);
     return frames_.emplace(key, std::move(f)).first->second.get();
   }
 
@@ -502,13 +618,15 @@ class CanonicalTracer {
   std::string Xlate(std::string_view s, const CanonFrame *f) {
     std::string out(s);
     bool first = true;
+    bool external_iface = false;
     for (const CanonFrame *g = f; g != nullptr; g = g->outer) {
-      const std::string_view src = g->src;
-      if (out.size() >= src.size() && out.compare(0, src.size(), src) == 0 &&
-          (out.size() == src.size() || out[src.size()] == '.')) {
-        out = g->dst + out.substr(src.size());
-      } else if (!first || out.find('.') != std::string::npos) {
-        // Not under this frame's canonical subtree: fine for package/unit symbols (no '.'), otherwise unexpected.
+      const auto roots = g->ifaces != nullptr
+          ? std::span<const std::pair<std::string, std::string>>(g->ifaces->roots)
+          : std::span<const std::pair<std::string, std::string>>();
+      const bool mapped = ApplyCanonicalFramePath(out, g->src, g->dst, roots, external_iface);
+      if (!mapped && !external_iface && (!first || out.find('.') != std::string::npos)) {
+        // Interface roots validated by an inner frame can remain outside an outer module.
+        // Still try every outer substitution: a local interface may live in that module.
         if (out.find("::") == std::string::npos) ++stats_.xlate_anomaly;
       }
       first = false;
@@ -628,5 +746,6 @@ class CanonicalTracer {
   slang::flat_hash_map<const slang::ast::InstanceBodySymbol *, std::unique_ptr<std::string>> rep_paths_;
   slang::flat_hash_map<const slang::ast::InstanceBodySymbol *, std::unique_ptr<ChildMap>> child_maps_;
   slang::flat_hash_map<const slang::ast::InstanceBodySymbol *, bool> iface_bodies_;
+  slang::flat_hash_map<const slang::ast::InstanceSymbol *, std::unique_ptr<CanonIfaceMap>> iface_maps_;
   Stats stats_;
 };

@@ -1,7 +1,7 @@
 // top: if_top
 // TODO item 4 risk case: interface ports / modports. slang shares a body between instances whose interface
 // ports connect to *different* interface instances with the same parameters, so symbols reached through an
-// interface port differ per instance; the canonical tracer must not translate those (it excludes them).
+// interface port differ per instance; the canonical tracer maps their cached interface connections.
 interface bus_if #(parameter int W = 4) (input logic clk);
   logic [W-1:0] data;
   logic         valid;

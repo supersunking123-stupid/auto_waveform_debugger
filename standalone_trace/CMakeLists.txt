@@ -63,3 +63,7 @@ set_tests_properties(
 
 add_test(NAME assignment_utils_test COMMAND assignment_utils_test)
 add_test(NAME parallel_topk_test COMMAND parallel_topk_test)
+
+add_executable(canonical_path_test tests/canonical_path_test.cc)
+target_include_directories(canonical_path_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_test(NAME canonical_path_test COMMAND canonical_path_test)

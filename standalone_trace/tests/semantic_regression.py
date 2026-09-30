@@ -1215,11 +1215,17 @@ def run_canonical_bodies_tests(rtl_trace, src_dir, tmpdir, physical_source_path_
         header = fx.read_text().splitlines()[:4]
         top = next((l.split(":", 1)[1].strip() for l in header if l.startswith("// top:")), None)
         extra = next((l.split(":", 1)[1].split() for l in header if l.startswith("// args:")), [])
+        iface_case = next((l.split(":", 1)[1].strip() for l in header
+                           if l.startswith("// canonical-iface:")), None)
         if top is None:
             raise AssertionError(f"{fx.name}: missing '// top:' header")
         for variant in ([], ["--low-mem"], ["--mfcu"]):
             dbs = {}
-            for tag, env in (("off", {"RTL_TRACE_CANONICAL_BODIES": "0"}), ("on", {"RTL_TRACE_CANONICAL_BODIES": "1"})):
+            for tag, mode in (("off", "0"), ("on", "1")):
+                env = {"RTL_TRACE_CANONICAL_BODIES": mode,
+                       "RTL_TRACE_CANONICAL_STATS": "1",
+                       "RTL_TRACE_CANONICAL_VERIFY": "0",
+                       "RTL_TRACE_CANONICAL_ALLOW_IFACE": "0"}
                 dbs[tag] = tmpdir / f"cb_{fx.stem}_{tag}.db"
                 proc = run_cmd(
                     [str(rtl_trace), "compile", "--db", str(dbs[tag]), physical_source_path_flag,
@@ -1232,6 +1238,31 @@ def run_canonical_bodies_tests(rtl_trace, src_dir, tmpdir, physical_source_path_
                         raise AssertionError(f"{fx.name}: canonical tracer did not run")
                     stats = dict(kv.split("=", 1) for kv in line.split() if "=" in kv)
                     total_redirected += int(stats.get("redirected", "0"))
+                    for counter in ("broken", "map_fail", "child_lookup_fail", "port_map_fail",
+                                    "down_map_fail", "xlate_anomaly", "xlate_id_miss"):
+                        if stats.get(counter) != "0":
+                            raise AssertionError(f"{fx.name} {variant}: {counter}={stats.get(counter)}")
+                    if iface_case:
+                        skipped_lines = [l for l in proc.stdout.splitlines()
+                                         if "[Canon] index_build class=skip" in l]
+                        if len(skipped_lines) != 4:
+                            raise AssertionError(f"{fx.name}: missing skipped-body build counters")
+                        skipped_builds = sum(int(dict(kv.split("=", 1) for kv in l.split()
+                                                      if "=" in kv)["builds"])
+                                             for l in skipped_lines)
+                        if iface_case == "supported":
+                            if int(stats["redirected"]) <= 0:
+                                raise AssertionError(f"{fx.name} {variant}: no redirected signals")
+                            if stats.get("excluded_crossings(iface)") != "0" or skipped_builds != 0:
+                                raise AssertionError(f"{fx.name} {variant}: interface fallback or skipped builds")
+                        elif iface_case in ("alias-split", "alias-merge"):
+                            if int(stats["excluded_crossings(iface)"]) <= 0 or skipped_builds <= 0:
+                                raise AssertionError(f"{fx.name} {variant}: expected interface fallback")
+                            reason = "iface_" + iface_case.replace("-", "_")
+                            if int(stats.get(reason, "0")) <= 0:
+                                raise AssertionError(f"{fx.name} {variant}: missing {reason} exclusion")
+                        else:
+                            raise AssertionError(f"{fx.name}: unknown canonical-iface case {iface_case!r}")
             for suffix in ("", ".meta"):
                 a = Path(str(dbs["off"]) + suffix).read_bytes()
                 b = Path(str(dbs["on"]) + suffix).read_bytes()

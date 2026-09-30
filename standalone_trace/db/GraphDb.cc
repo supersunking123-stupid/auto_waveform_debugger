@@ -6,6 +6,7 @@
 #include "db/GraphDbTypes.h"
 #include "db/GraphDbInternals.h"
 #include "db/ParallelTopK.h"
+#include "db/CanonicalPath.h"
 #include "compile/CompileData.h"
 #include "AssignmentUtils.h"
 
