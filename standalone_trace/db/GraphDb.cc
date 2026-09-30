@@ -1382,7 +1382,8 @@ struct EndpointMergeKey {
            a.line == b.line && a.has_assignment_range == b.has_assignment_range &&
            a.assignment_start == b.assignment_start && a.assignment_end == b.assignment_end &&
            a.path == b.path && a.file == b.file && a.direction == b.direction &&
-           a.assignment_text == b.assignment_text && a.lhs_signal_ids == b.lhs_signal_ids &&
+           a.assignment_text == b.assignment_text && a.bit_map_logical_axes == b.bit_map_logical_axes &&
+           a.lhs_signal_ids == b.lhs_signal_ids &&
            a.rhs_signal_ids == b.rhs_signal_ids && a.lhs_signals == b.lhs_signals &&
            a.rhs_signals == b.rhs_signals;
   }
@@ -1577,6 +1578,128 @@ bool TryParseSimpleInt(std::string_view s, int64_t &out) {
   if (start >= end) return false;
   auto [ptr, ec] = std::from_chars(s.data() + start, s.data() + end, out);
   return ec == std::errc() && ptr == s.data() + end;
+}
+
+// Packed and unpacked array axes include the final packed vector dimension.
+// Struct fields retain the separate absolute-bit representation used by member records.
+size_t NumericArrayAxisCount(const slang::ast::Type &root_type) {
+  size_t count = 0;
+  const slang::ast::Type *type = &root_type;
+  while (type->isArray()) {
+    if (type->isAssociativeArray()) return 0;
+    ++count;
+    type = type->getArrayElementType();
+    if (type == nullptr) return count;
+  }
+  if (type->isPredefinedInteger() && type->getBitWidth() > 1) ++count;
+  return count;
+}
+
+std::optional<int32_t> EvalLogicalIndex(const slang::ast::Expression &expression,
+                                       const slang::ast::Symbol &symbol) {
+  slang::ast::EvalContext context(symbol);
+  const slang::ConstantValue value = expression.eval(context);
+  if (!value || !value.isInteger()) return std::nullopt;
+  const auto &integer = value.integer();
+  // SVInt::as<int32_t> accepts an unsigned 32-bit value and casts it. Guard that
+  // positive overflow explicitly, instead of interpreting e.g. 32'hffffffff as -1.
+  if (!integer.isSigned() && integer.getActiveBits() > 31) return std::nullopt;
+  return integer.as<int32_t>();
+}
+
+const slang::ast::Type *SelectorValueType(const slang::ast::Expression &expression) {
+  if (const auto *element = expression.as_if<slang::ast::ElementSelectExpression>())
+    return element->value().type;
+  if (const auto *range = expression.as_if<slang::ast::RangeSelectExpression>())
+    return range->value().type;
+  return nullptr;
+}
+
+// Ranges keep the current axis; element selections consume it. This collapses
+// m[3:1][2][0] into the declared-axis coordinates [2][0]. Unknown coordinates
+// stay symbolic on their own axis, so later known axes can still be filtered.
+std::pair<std::string, bool> DescribeLogicalAxisSelectors(
+    const std::vector<const slang::ast::Expression *> &selectors, const slang::SourceManager &sm,
+    const slang::ast::Symbol &symbol) {
+  struct Axis {
+    std::optional<std::pair<int32_t, int32_t>> range;
+    std::string symbolic;
+    bool unknown = false;
+  };
+  std::vector<Axis> axes;
+  size_t axis_index = 0;
+  for (auto iterator = selectors.rbegin(); iterator != selectors.rend(); ++iterator) {
+    const auto &expression = **iterator;
+    if (axes.size() <= axis_index) axes.resize(axis_index + 1);
+    Axis &axis = axes[axis_index];
+    const auto *type = SelectorValueType(expression);
+    std::optional<std::pair<int32_t, int32_t>> selected;
+    std::string text;
+    bool consumes_axis = false;
+    if (const auto *element = expression.as_if<slang::ast::ElementSelectExpression>()) {
+      consumes_axis = true;
+      text = GetSourceText(element->selector().sourceRange, sm);
+      if (const auto index = EvalLogicalIndex(element->selector(), symbol)) {
+        if (type != nullptr &&
+            (type->hasFixedRange() ? type->getFixedRange().containsPoint(*index) : *index >= 0))
+          selected = std::make_pair(*index, *index);
+      }
+    } else if (const auto *range = expression.as_if<slang::ast::RangeSelectExpression>()) {
+      const auto left = EvalLogicalIndex(range->left(), symbol);
+      const auto right = EvalLogicalIndex(range->right(), symbol);
+      const auto kind = range->getSelectionKind();
+      const std::string separator = kind == slang::ast::RangeSelectionKind::IndexedUp ? "+:" :
+                                    kind == slang::ast::RangeSelectionKind::IndexedDown ? "-:" : ":";
+      text = GetSourceText(range->left().sourceRange, sm) + separator +
+             GetSourceText(range->right().sourceRange, sm);
+      if (left && right && type != nullptr) {
+        std::optional<slang::ConstantRange> result;
+        if (kind == slang::ast::RangeSelectionKind::Simple)
+          result = slang::ConstantRange(*left, *right);
+        else if (*right > 0)
+          result = slang::ConstantRange::getIndexedRange(
+              *left, *right, type->hasFixedRange() && type->getFixedRange().isLittleEndian(),
+              kind == slang::ast::RangeSelectionKind::IndexedUp);
+        if (result && result->fullWidth() <= std::numeric_limits<int32_t>::max() &&
+            (!type->hasFixedRange() || type->getFixedRange().contains(*result)))
+          selected = std::make_pair(result->left, result->right);
+      }
+    } else {
+      text = GetSourceText(expression.sourceRange, sm);
+    }
+    if (!selected || axis.unknown) {
+      axis.unknown = true;
+      if (!axis.symbolic.empty()) axis.symbolic += " -> ";
+      axis.symbolic += text;
+      axis.range.reset();
+    } else {
+      if (axis.range) {
+        const int32_t low = std::max(std::min(axis.range->first, axis.range->second),
+                                     std::min(selected->first, selected->second));
+        const int32_t high = std::min(std::max(axis.range->first, axis.range->second),
+                                      std::max(selected->first, selected->second));
+        if (low > high) {
+          axis.unknown = true;
+          axis.symbolic = text;
+          axis.range.reset();
+        } else {
+          axis.range = selected->first < selected->second ? std::make_pair(low, high) :
+                                                          std::make_pair(high, low);
+        }
+      } else axis.range = selected;
+    }
+    if (consumes_axis) ++axis_index;
+  }
+  std::string bit_map;
+  bool approximate = false;
+  for (const Axis &axis : axes) {
+    if (axis.unknown || !axis.range) {
+      // The '?' distinguishes an out-of-bounds constant from an exact coordinate.
+      bit_map += "[?" + axis.symbolic + "]";
+      approximate = true;
+    } else bit_map += FormatBitRange(axis.range->first, axis.range->second);
+  }
+  return {bit_map, approximate};
 }
 
 std::pair<std::string, bool> DescribeBitSelectors(
@@ -1870,10 +1993,18 @@ EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManag
                   }
                 }
                 rec.bit_map_approximate = approximate;
+                const auto *member_type = SelectorValueType(*item.selectors.back());
+                if (member_type != nullptr && NumericArrayAxisCount(*member_type) >= 2)
+                  rec.bit_map_approximate = true;  // exact multidimensional struct filtering is unsupported
               }
             } else {
-              // Normal (non-member) case
-              auto bit_desc = DescribeBitSelectors(item.selectors, sm, *item.symbol);
+              // Ordinary multidimensional arrays carry logical declared-axis coordinates.
+              const auto *value_symbol = item.symbol->template as_if<slang::ast::ValueSymbol>();
+              rec.bit_map_logical_axes = !item.selectors.empty() && value_symbol != nullptr &&
+                  NumericArrayAxisCount(value_symbol->getType()) >= 2;
+              auto bit_desc = rec.bit_map_logical_axes
+                  ? DescribeLogicalAxisSelectors(item.selectors, sm, *item.symbol)
+                  : DescribeBitSelectors(item.selectors, sm, *item.symbol);
               rec.bit_map = std::move(bit_desc.first);
               rec.bit_map_approximate = bit_desc.second;
             }
@@ -2422,6 +2553,7 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
     append_signal_refs(e.rhs_signal_ids, e.rhs_signals, ge.rhs_begin, ge.rhs_count);
     ge.kind = (e.kind == EndpointKind::kPort) ? 1u : 0u;
     ge.bit_map_approximate = e.bit_map_approximate ? 1u : 0u;
+    ge.reserved = e.bit_map_logical_axes ? kEndpointLogicalAxes : 0u;
     ge.has_assignment_range = e.has_assignment_range ? 1u : 0u;
     graph.endpoints.push_back(ge);
   };
@@ -3355,6 +3487,7 @@ const SignalRecord &SessionSignalRecord(TraceSession &session, uint32_t id) {
     e.direction = GraphString(graph, ge.direction_str_id);
     e.bit_map = GraphString(graph, ge.bit_map_str_id);
     e.bit_map_approximate = (ge.bit_map_approximate != 0);
+    e.bit_map_logical_axes = (ge.reserved & kEndpointLogicalAxes) != 0;
     e.has_assignment_range = (ge.has_assignment_range != 0);
     e.assignment_start = ge.assignment_start;
     e.assignment_end = ge.assignment_end;
@@ -3535,23 +3668,73 @@ bool RegexMatch(const std::optional<std::regex> &re, const std::string &s) {
   return std::regex_search(s, *re);
 }
 
-bool ParseSignalQuery(const std::string &input, std::string &base_signal,
-                      std::optional<std::pair<int32_t, int32_t>> &select) {
-  static const std::regex kSelectRe(R"(^(.+)\[([0-9]+)(?::([0-9]+))?\]$)");
-  std::smatch m;
-  if (!std::regex_match(input, m, kSelectRe)) {
-    base_signal = input;
-    select.reset();
+bool ParseSignedAxis(std::string_view text, std::pair<int32_t, int32_t> &axis) {
+  const auto parse = [](std::string_view value, int32_t &out) {
+    if (value.empty()) return false;
+    if (value.front() == '+') {
+      value.remove_prefix(1);
+      if (value.empty() || value.front() == '-' || value.front() == '+') return false;
+    }
+    const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), out);
+    return error == std::errc() && end == value.data() + value.size();
+  };
+  const size_t colon = text.find(':');
+  if (colon == std::string_view::npos) {
+    if (!parse(text, axis.first)) return false;
+    axis.second = axis.first;
     return true;
   }
-  if (m.size() != 4) return false;
-  base_signal = m[1].str();
-  try {
-    const int32_t left = static_cast<int32_t>(std::stoll(m[2].str()));
-    const int32_t right = m[3].matched ? static_cast<int32_t>(std::stoll(m[3].str())) : left;
-    select = std::make_pair(left, right);
-  } catch (...) { return false; }
+  return parse(text.substr(0, colon), axis.first) && parse(text.substr(colon + 1), axis.second);
+}
+
+bool ParseSignalQuery(const std::string &input, std::string &base_signal,
+                      std::vector<std::pair<int32_t, int32_t>> &axes) {
+  axes.clear();
+  base_signal = input;
+  // Instance/generate-array indexes occur before the final dot and stay in the base.
+  const size_t dot = input.rfind('.');
+  const size_t leaf_begin = dot == std::string::npos ? 0 : dot + 1;
+  const size_t first = input.find('[', leaf_begin);
+  if (first == std::string::npos) return input.find(']', leaf_begin) == std::string::npos;
+  if (first == leaf_begin) return false;
+  base_signal = input.substr(0, first);
+  size_t position = first;
+  while (position < input.size()) {
+    if (input[position] != '[') return false;
+    const size_t close = input.find(']', position + 1);
+    if (close == std::string::npos) return false;
+    std::pair<int32_t, int32_t> axis;
+    if (!ParseSignedAxis(std::string_view(input).substr(position + 1, close - position - 1), axis))
+      return false;
+    axes.push_back(axis);
+    position = close + 1;
+  }
   return !base_signal.empty();
+}
+
+// Endpoint symbolic expressions can contain nested brackets, such as [?indices[j]].
+// Tokenize complete axes, and retain unknown axes as nullopt instead of discarding
+// the independently known coordinates in the same endpoint.
+std::optional<std::vector<std::optional<std::pair<int32_t, int32_t>>>> ParseEndpointAxes(
+    std::string_view bit_map) {
+  std::vector<std::optional<std::pair<int32_t, int32_t>>> axes;
+  size_t position = 0;
+  while (position < bit_map.size()) {
+    if (bit_map[position] != '[') return std::nullopt;
+    const size_t start = ++position;
+    size_t depth = 1;
+    while (position < bit_map.size() && depth != 0) {
+      if (bit_map[position] == '[') ++depth;
+      else if (bit_map[position] == ']') --depth;
+      if (depth != 0) ++position;
+    }
+    if (depth != 0) return std::nullopt;
+    std::pair<int32_t, int32_t> axis;
+    if (ParseSignedAxis(bit_map.substr(start, position - start), axis)) axes.push_back(axis);
+    else axes.push_back(std::nullopt);
+    ++position;
+  }
+  return axes;
 }
 
 std::optional<std::pair<int32_t, int32_t>> ParseExactBitRange(const EndpointRecord &e) {
@@ -3589,12 +3772,29 @@ bool EndpointMatchesSignalSelect(const EndpointRecord &e,
   return RangesOverlap(*endpoint_range, *select);
 }
 
+bool EndpointMatchesSignalAxes(const EndpointRecord &e,
+                               const std::vector<std::pair<int32_t, int32_t>> &axes) {
+  if (axes.empty() || e.kind == EndpointKind::kPort || e.bit_map.empty()) return true;
+  if (!e.bit_map_logical_axes) {
+    // The caller rejects unsupported multi-axis legacy encodings before output.
+    if (axes.size() > 1) return false;
+    return EndpointMatchesSignalSelect(e, axes.front());
+  }
+  const auto endpoint_axes = ParseEndpointAxes(e.bit_map);
+  if (!endpoint_axes) return true;
+  const size_t count = std::min(axes.size(), endpoint_axes->size());
+  for (size_t i = 0; i < count; ++i)
+    if ((*endpoint_axes)[i] && !RangesOverlap(axes[i], *(*endpoint_axes)[i])) return false;
+  // Missing trailing axes mean the whole remaining subarray; unknown axes are conservative.
+  return true;
+}
+
 std::string EndpointKey(const TraceDb &db, const EndpointRecord &e) {
   return std::to_string(static_cast<int>(e.kind)) + "\t" + EndpointPath(db, e) + "\t" +
          EndpointFile(db, e) + "\t" + std::to_string(e.line) + "\t" + e.direction + "\t" +
          (e.has_assignment_range ? "1" : "0") + "\t" + std::to_string(e.assignment_start) + "\t" +
          std::to_string(e.assignment_end) + "\t" + e.assignment_text + "\t" + e.bit_map + "\t" +
-         (e.bit_map_approximate ? "1" : "0");
+         (e.bit_map_approximate ? "1" : "0") + (e.bit_map_logical_axes ? "\tlogical-axes" : "");
 }
 
 size_t EditDistance(const std::string &a, const std::string &b) {
@@ -3710,7 +3910,8 @@ bool ParseDefinesPlus(std::string_view tok, std::vector<std::string> &out) {
 // Bump whenever the same sources and arguments produce different DB content, so `--incremental`
 // never reuses a DB built with older semantics. .meta files without a SEMANTICS_EPOCH line are
 // epoch 1. Epoch 2: endpoint bit-range merge fix (66c78ff).
-constexpr int kCompileSemanticsEpoch = 2;
+// Epoch 3: logical declared-axis metadata for multidimensional selectors (E4b).
+constexpr int kCompileSemanticsEpoch = 3;
 
 std::string ComputeCompileFingerprint(const std::vector<std::string> &passthrough_args) {
   std::vector<std::string> parts;

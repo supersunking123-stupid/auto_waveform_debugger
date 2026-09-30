@@ -82,6 +82,7 @@ class CanonicalTracer {
            a.assignment_text == b.assignment_text && a.has_assignment_range == b.has_assignment_range &&
            a.assignment_start == b.assignment_start && a.assignment_end == b.assignment_end &&
            a.bit_map == b.bit_map && a.bit_map_approximate == b.bit_map_approximate &&
+           a.bit_map_logical_axes == b.bit_map_logical_axes &&
            a.lhs_signal_ids == b.lhs_signal_ids && a.rhs_signal_ids == b.rhs_signal_ids &&
            a.lhs_signals == b.lhs_signals && a.rhs_signals == b.rhs_signals;
   }

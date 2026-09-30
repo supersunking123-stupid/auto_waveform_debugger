@@ -1030,7 +1030,7 @@ def main():
 
         # 31) Endpoint bit-range merging: endpoints of the same assignment with adjacent or
         # overlapping exact bit ranges collapse into one endpoint; multi-dimensional selects
-        # are left as written.
+        # preserve logical axis coordinates.
         merge_fixture = src_dir / "tests" / "fixtures" / "endpoint_merge.sv"
         merge_db = tmpdir / "endpoint_merge.db"
         run_cmd(
@@ -1053,12 +1053,12 @@ def main():
                 f"endpoint merge (generate-loop drivers): expected {expected_g_drivers}, got {g_drivers}"
             )
         m_loads = merge_bit_maps("loads", "endpoint_merge.m")
-        # m[1][0], m[1][1], m[2][0], m[2][1] as DescribeBitSelectors writes them (the old merge
-        # pass misparsed e.g. "[0][7:4]" as "[4:0]").
-        expected_m_loads = [(18, "[0][11:8]"), (18, "[0][7:4]"), (18, "[1][11:8]"), (18, "[1][7:4]")]
+        # Logical declared-axis coordinates keep the source indexes and axis order.
+        # Multidimensional selects still do not merge into a flattened bit range.
+        expected_m_loads = [(18, "[1][0]"), (18, "[1][1]"), (18, "[2][0]"), (18, "[2][1]")]
         if m_loads != expected_m_loads:
             raise AssertionError(
-                f"endpoint merge must not rewrite multi-dimensional selects: expected {expected_m_loads}, "
+                f"endpoint merge must preserve logical multi-dimensional selects: expected {expected_m_loads}, "
                 f"got {m_loads}"
             )
         # A bit query returns the merged endpoint (its range covers the selected bit).

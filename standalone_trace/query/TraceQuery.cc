@@ -156,7 +156,7 @@ TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
 
         for (const EndpointRecord &e : *active_edges) {
           const std::string &e_path = EndpointPath(db, e);
-          if (sig == opts.root_signal && !EndpointMatchesSignalSelect(e, opts.signal_select)) {
+          if (sig == opts.root_signal && !EndpointMatchesSignalAxes(e, opts.signal_select_axes)) {
             record_stop(e_path, "bit_filter", "endpoint-does-not-overlap-selected-bits", depth);
             continue;
           }
@@ -399,21 +399,91 @@ ParseStatus ParseTraceArgs(const std::vector<std::string> &args, std::optional<s
     std::cerr << "Invalid --mode: " << opts.mode << " (expected drivers|loads)\n";
     return ParseStatus::kError;
   }
-  if (!ParseSignalQuery(opts.signal, opts.root_signal, opts.signal_select)) {
-    std::cerr << "Invalid --signal syntax: " << opts.signal
-              << " (expected hier.path or hier.path[bit] or hier.path[msb:lsb])\n";
-    return ParseStatus::kError;
+  // Escaped SV names may contain arbitrary brackets. Syntax is checked after
+  // exact stored-name resolution, once the DB's names are available.
+  if (!ParseSignalQuery(opts.signal, opts.root_signal, opts.signal_select_axes)) {
+    opts.root_signal = opts.signal;
+    opts.signal_select_axes.clear();
   }
+  if (opts.signal_select_axes.size() == 1) opts.signal_select = opts.signal_select_axes.front();
   return ParseStatus::kOk;
 }
 
-int RunTraceWithSession(TraceSession &session, const TraceOptions &opts) {
+// Prefer the longest stored name before treating its remaining suffix as selectors.
+// This preserves unusual signal names with brackets as well as indexed instances.
+std::optional<TraceOptions> ResolveSignalQuery(const TraceSession &session, const TraceOptions &parsed) {
+  TraceOptions resolved = parsed;
+  if (LookupSignalId(session, parsed.signal)) {
+    resolved.root_signal = parsed.signal;
+    resolved.signal_select.reset();
+    resolved.signal_select_axes.clear();
+    return resolved;
+  }
+  size_t bracket = parsed.signal.rfind('[');
+  while (bracket != std::string::npos) {
+    const std::string prefix = parsed.signal.substr(0, bracket);
+    if (LookupSignalId(session, prefix)) {
+      std::string unused;
+      std::vector<std::pair<int32_t, int32_t>> axes;
+      if (ParseSignalQuery("signal" + parsed.signal.substr(bracket), unused, axes)) {
+        resolved.root_signal = prefix;
+        resolved.signal_select_axes = std::move(axes);
+        resolved.signal_select.reset();
+        if (resolved.signal_select_axes.size() == 1)
+          resolved.signal_select = resolved.signal_select_axes.front();
+        return resolved;
+      }
+    }
+    if (bracket == 0) break;
+    bracket = parsed.signal.rfind('[', bracket - 1);
+  }
+  if (!ParseSignalQuery(parsed.signal, resolved.root_signal, resolved.signal_select_axes))
+    return std::nullopt;
+  return resolved;
+}
+
+int RunTraceWithSession(TraceSession &session, const TraceOptions &parsed_opts) {
+  const auto resolved = ResolveSignalQuery(session, parsed_opts);
+  if (!resolved) {
+    std::cerr << "Invalid --signal syntax: " << parsed_opts.signal
+              << " (expected hier.path followed by signed [index] or [left:right] selects)\n";
+    return 1;
+  }
+  const TraceOptions &opts = *resolved;
   if (!LookupSignalId(session, opts.root_signal).has_value()) {
     std::cerr << "Signal not found: " << opts.root_signal << "\n";
     for (const std::string &s : TopSuggestions(session, opts.root_signal, 5)) {
       std::cerr << "  suggestion: " << s << "\n";
     }
     return 2;
+  }
+  if (opts.signal_select_axes.size() > 1) {
+    const uint32_t id = *LookupSignalId(session, opts.root_signal);
+    if (session.graph->signals[id].parent_signal_id != std::numeric_limits<uint32_t>::max()) {
+      std::cerr << "Multi-dimensional selects of struct members remain unsupported: "
+                << opts.root_signal << "\n";
+      return 1;
+    }
+    if (session.db.global_nets.contains(opts.root_signal) ||
+        session.db.global_sink_to_source.contains(opts.root_signal)) {
+      std::cerr << "Multi-dimensional selects of compact global nets remain unsupported: "
+                << opts.root_signal << "\n";
+      return 1;
+    }
+    const SignalRecord &record = SessionSignalRecord(session, id);
+    const auto has_legacy_coordinates = [](const std::vector<EndpointRecord> &edges) {
+      return std::any_of(edges.begin(), edges.end(), [](const EndpointRecord &endpoint) {
+        return endpoint.kind == EndpointKind::kExpr && !endpoint.bit_map.empty() &&
+               !endpoint.bit_map_logical_axes;
+      });
+    };
+    if (has_legacy_coordinates(record.drivers) || has_legacy_coordinates(record.loads)) {
+      std::cerr << "Multi-dimensional select requires logical-axis DB metadata: "
+                << opts.root_signal << "\n"
+                << "Rebuild the DB with the current compiler. Multidimensional struct members "
+                   "and nonnumeric associative arrays remain unsupported.\n";
+      return 1;
+    }
   }
   TraceRunResult result = RunTraceQuery(session, opts);
   MaterializeAssignmentTexts(session, result);

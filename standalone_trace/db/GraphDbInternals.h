@@ -54,7 +54,9 @@ std::string FormatBitRange(int32_t hi, int32_t lo);
 bool TryParseSimpleInt(std::string_view s, int64_t &out);
 bool RegexMatch(const std::optional<std::regex> &re, const std::string &s);
 bool ParseSignalQuery(const std::string &input, std::string &base_signal,
-                      std::optional<std::pair<int32_t, int32_t>> &bit_select);
+                      std::vector<std::pair<int32_t, int32_t>> &bit_select_axes);
+bool EndpointMatchesSignalAxes(const EndpointRecord &e,
+                               const std::vector<std::pair<int32_t, int32_t>> &axes);
 std::optional<std::pair<int32_t, int32_t>> ParseExactBitRange(const EndpointRecord &e);
 bool RangesOverlap(const std::pair<int32_t, int32_t> &a, const std::pair<int32_t, int32_t> &b);
 bool EndpointMatchesSignalSelect(const EndpointRecord &e,

@@ -41,6 +41,7 @@ struct EndpointRecord {
   uint32_t assignment_end = 0;
   std::string bit_map;
   bool bit_map_approximate = false;
+  bool bit_map_logical_axes = false;
   std::vector<uint32_t> lhs_signal_ids;
   std::vector<uint32_t> rhs_signal_ids;
   std::vector<std::string> lhs_signals;
@@ -100,6 +101,8 @@ struct GraphSignalRecord {
   uint32_t member_bit_offset = 0;
   uint32_t member_bit_width = 0;
 };
+
+constexpr uint8_t kEndpointLogicalAxes = 0x02;  // bit 0x01 is reserved for merged ranges.
 
 struct GraphEndpointRecord {
   uint32_t path_str_id = std::numeric_limits<uint32_t>::max();
@@ -216,6 +219,7 @@ struct TraceOptions {
   std::string signal;
   std::string root_signal;
   std::optional<std::pair<int32_t, int32_t>> signal_select;
+  std::vector<std::pair<int32_t, int32_t>> signal_select_axes;
   size_t cone_level = 1;
   bool prefer_port_hop = false;
   size_t depth_limit = 8;

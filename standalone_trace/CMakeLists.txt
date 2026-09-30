@@ -67,3 +67,11 @@ add_test(NAME parallel_topk_test COMMAND parallel_topk_test)
 add_executable(canonical_path_test tests/canonical_path_test.cc)
 target_include_directories(canonical_path_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME canonical_path_test COMMAND canonical_path_test)
+
+add_test(
+  NAME multidim_axes_regression
+  COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/multidim_axes_regression.py
+          --rtl-trace $<TARGET_FILE:rtl_trace>
+          --source-dir ${CMAKE_CURRENT_SOURCE_DIR}
+)

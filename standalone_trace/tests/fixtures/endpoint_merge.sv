@@ -3,8 +3,8 @@
 // assignment (same path/file/line/text/lhs/rhs) and collapse into a single
 // "[3:0]" load endpoint; the generate loop's per-bit drivers of `g` collapse
 // into "[3:0]" while the separate assign of g[4] stays its own endpoint.
-// Multi-dimensional selects of `m` are not single ranges and must be left as
-// written (they are neither merged nor rewritten).
+// Multi-dimensional selects of `m` keep logical declared-axis coordinates and
+// are not merged into a single flattened range.
 module endpoint_merge (
     input  logic [7:0] a,
     input  logic [3:0][3:0] m,
