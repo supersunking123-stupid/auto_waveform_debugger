@@ -101,6 +101,17 @@ std::string RequiredLiteral(const std::string &pattern) {
       lit = c;
     }
     const char q = next < n ? pattern[next] : '\0';
+    if (q == '*' || q == '+' || q == '?') {
+      // Stacked quantifiers (`q+*`, `q+?*`, `q*+`, `q+{2}`) are not ECMAScript grammar, but
+      // libstdc++ accepts them and applies the later quantifier to the earlier one (`q+*` matches
+      // the empty string). Don't guess the backend's reading: give up on prefiltering.
+      size_t after = next + 1;
+      if (after < n && pattern[after] == '?') ++after; // lazy modifier
+      if (after < n && (pattern[after] == '*' || pattern[after] == '+' || pattern[after] == '?' ||
+                        pattern[after] == '{')) {
+        return "";
+      }
+    }
     if (q == '*' || q == '?') {
       end_run(); // optional literal: not required, and it breaks adjacency
     } else if (q == '+') {

@@ -1354,6 +1354,20 @@ def run_find_fastpath_tests(rtl_trace, small_db, tmpdir):
     # substring mode treats regex metacharacters literally
     _find_raw(rtl_trace, small_db, "(", regex=False, expect=2)
 
+    # stacked quantifiers: not ECMAScript grammar, but libstdc++ accepts them and applies the later
+    # quantifier to the earlier one (`q+*` == `(q+)*`). The literal prefilter must not treat the first
+    # quantified atom as required; results must equal the explicitly grouped Python regex.
+    small_names = _find_text_names(_find_raw(rtl_trace, small_db, ".", regex=True, limit=10**9, expect=0))
+    for query, grouped in (
+        ("q+*", r"(?:q+)*"),
+        ("clk+*", r"cl(?:k+)*"),
+        ("hit+?*", r"hi(?:t+?)*"),
+        ("in_b+*us", r"in_(?:b+)*us"),
+        ("zz+*top", r"z(?:z+)*top"),
+    ):
+        _find_check(rtl_trace, small_db, small_names, query, True, None,
+                    lambda n, g=grouped: _re.search(g, n) is not None, f"stacked {query}")
+
     # --- large synthetic design (crosses the parallel-scan threshold) -----------------------
     big_sv = tmpdir / "find_fastpath_big.sv"
     big_sv.write_text(FIND_FASTPATH_BIG_SV)
