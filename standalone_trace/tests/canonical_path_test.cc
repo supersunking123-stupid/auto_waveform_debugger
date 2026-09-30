@@ -48,5 +48,16 @@ int main() {
     check(!ApplyCanonicalFramePath(path, "top.unrelated", "top.copy", {}, external), "external root untouched");
     check(path == "top.c.data" && external, "external validity persists");
   }
+  {
+    bool external = false;
+    std::string path = "top.if0.data";
+    Roots inner{{"top.if0", "top.if1"}};
+    check(ApplyCanonicalFramePath(path, "top.wrapper.rep", "top.wrapper.actual", inner, external),
+          "validate external interface in inner frame");
+    check(!ApplyCanonicalFramePath(path, "top.wrapper", "top.copy", {}, external),
+          "unrelated outer frame applies no substitution");
+    check(path == "top.if1.data" && external,
+          "validated external root survives unrelated outer frame");
+  }
   return failures ? 1 : 0;
 }

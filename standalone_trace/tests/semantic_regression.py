@@ -1255,7 +1255,8 @@ def run_canonical_bodies_tests(rtl_trace, src_dir, tmpdir, physical_source_path_
                                 raise AssertionError(f"{fx.name} {variant}: no redirected signals")
                             if stats.get("excluded_crossings(iface)") != "0" or skipped_builds != 0:
                                 raise AssertionError(f"{fx.name} {variant}: interface fallback or skipped builds")
-                        elif iface_case in ("alias-split", "alias-merge"):
+                        elif iface_case in ("alias-split", "alias-merge", "selfref",
+                                            "unresolved", "shape", "conflict", "forwarding"):
                             if int(stats["excluded_crossings(iface)"]) <= 0 or skipped_builds <= 0:
                                 raise AssertionError(f"{fx.name} {variant}: expected interface fallback")
                             reason = "iface_" + iface_case.replace("-", "_")
@@ -1269,6 +1270,31 @@ def run_canonical_bodies_tests(rtl_trace, src_dir, tmpdir, physical_source_path_
                 if a != b:
                     raise AssertionError(
                         f"{fx.name} {variant}: canonical-body tracing changed the DB{suffix or ''} vs RTL_TRACE_CANONICAL_BODIES=0")
+        # VERIFY binds actual bodies as its oracle. Keep it separate from the
+        # normal variants above, whose counters must prove skipped-body avoidance.
+        # Direct external interface field references are still absent from the
+        # baseline collectors; this oracle checks the lists they currently emit.
+        verify_db = tmpdir / f"cb_{fx.stem}_verify.db"
+        verify_proc = run_cmd(
+            [str(rtl_trace), "compile", "--db", str(verify_db), physical_source_path_flag,
+             "--single-unit", str(fx), "--top", top, *extra],
+            env={"RTL_TRACE_CANONICAL_BODIES": "1",
+                 "RTL_TRACE_CANONICAL_STATS": "0",
+                 "RTL_TRACE_CANONICAL_VERIFY": "1",
+                 "RTL_TRACE_CANONICAL_ALLOW_IFACE": "0"},
+        )
+        verify_lines = [line for line in verify_proc.stdout.splitlines()
+                        if line.startswith("[Canon] verify ")]
+        if len(verify_lines) != 1:
+            raise AssertionError(f"{fx.name}: expected one canonical VERIFY summary")
+        verify_stats = dict(kv.split("=", 1) for kv in verify_lines[0].split() if "=" in kv)
+        try:
+            verified_signals = int(verify_stats["signals"])
+            mismatched_lists = int(verify_stats["mismatched_lists"])
+        except (KeyError, ValueError) as exc:
+            raise AssertionError(f"{fx.name}: invalid VERIFY summary: {verify_lines[0]}") from exc
+        if verified_signals <= 0 or mismatched_lists != 0:
+            raise AssertionError(f"{fx.name}: canonical VERIFY failed: {verify_lines[0]}")
     if total_redirected == 0:
         raise AssertionError("canonical_bodies: no signal was traced through a canonical body")
 # ===== END canonical_bodies tests =====

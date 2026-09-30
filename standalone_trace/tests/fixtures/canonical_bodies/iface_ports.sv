@@ -1,4 +1,5 @@
 // top: if_top
+// canonical-iface: supported
 // TODO item 4 risk case: interface ports / modports. slang shares a body between instances whose interface
 // ports connect to *different* interface instances with the same parameters, so symbols reached through an
 // interface port differ per instance; the canonical tracer maps their cached interface connections.

@@ -27,7 +27,7 @@ SymbolRefList CollectRhsSignals(const slang::ast::AssignmentExpression *assignme
 // Connections are cached per crossing instance, not per (instance, outer-frame) pair.
 // Identity entries matter: an external interface root still belongs to this mapping.
 struct CanonIfaceMap {
-  enum Reason { None, Unresolved, Shape, Conflict, AliasSplit, AliasMerge, Forwarding };
+  enum Reason { None, Unresolved, Shape, Conflict, AliasSplit, AliasMerge, Forwarding, SelfRef };
   Reason reason = None;
   std::vector<std::pair<std::string, std::string>> roots;
 };
@@ -178,6 +178,7 @@ class CanonicalTracer {
               << " iface_unresolved=" << stats_.iface_unresolved << " iface_shape=" << stats_.iface_shape
               << " iface_conflict=" << stats_.iface_conflict << " iface_alias_split=" << stats_.iface_alias_split
               << " iface_alias_merge=" << stats_.iface_alias_merge << " iface_forwarding=" << stats_.iface_forwarding
+              << " iface_selfref=" << stats_.iface_selfref
               << " escape_dead=" << stats_.escape_dead << " virtual_absolute=" << stats_.virtual_absolute << "\n";
     if (verify_) {
       std::cout << "[Canon] verify signals=" << stats_.verify_signals
@@ -207,7 +208,7 @@ class CanonicalTracer {
     size_t excl_iface = 0, excl_kind = 0, child_lookup_fail = 0, port_map_fail = 0, down_map_fail = 0;
     size_t xlate_anomaly = 0, xlate_id_miss = 0, escape_dead = 0, virtual_absolute = 0;
     size_t iface_unresolved = 0, iface_shape = 0, iface_conflict = 0;
-    size_t iface_alias_split = 0, iface_alias_merge = 0, iface_forwarding = 0;
+    size_t iface_alias_split = 0, iface_alias_merge = 0, iface_forwarding = 0, iface_selfref = 0;
     size_t verify_signals = 0, verify_mismatch = 0;
   };
 
@@ -306,6 +307,21 @@ class CanonicalTracer {
         if (map->reason != CanonIfaceMap::None) break;
       }
     }
+    if (map->reason == CanonIfaceMap::None) {
+      const std::string &rep_path = RepPath(rep);
+      const std::string image_path = image.getHierarchicalPath();
+      for (const auto &root : map->roots) {
+        // A port can point down into its own module's local interface. Its source
+        // root then also matches local-body signals, so it must agree with the
+        // module rewrite. Keep consistent roots for alias checks and translation.
+        // An external source targeting an image-local interface is still valid.
+        if (UnderCanonicalRoot(root.first, rep_path) &&
+            root.second != image_path + root.first.substr(rep_path.size())) {
+          map->reason = CanonIfaceMap::SelfRef;
+          break;
+        }
+      }
+    }
     if (map->reason != CanonIfaceMap::None) map->roots.clear();
     // Longest boundary match wins. Applying only one entry avoids same-frame remapping chains.
     std::sort(map->roots.begin(), map->roots.end(), [](const auto &a, const auto &b) {
@@ -334,6 +350,7 @@ class CanonicalTracer {
         case CanonIfaceMap::AliasSplit: ++stats_.iface_alias_split; break;
         case CanonIfaceMap::AliasMerge: ++stats_.iface_alias_merge; break;
         case CanonIfaceMap::Forwarding: ++stats_.iface_forwarding; break;
+        case CanonIfaceMap::SelfRef: ++stats_.iface_selfref; break;
         case CanonIfaceMap::None: break;
         }
         return false;
