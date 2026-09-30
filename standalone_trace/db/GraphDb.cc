@@ -3706,9 +3706,15 @@ bool ParseDefinesPlus(std::string_view tok, std::vector<std::string> &out) {
 }
 
 
+// Bump whenever the same sources and arguments produce different DB content, so `--incremental`
+// never reuses a DB built with older semantics. .meta files without a SEMANTICS_EPOCH line are
+// epoch 1. Epoch 2: endpoint bit-range merge fix (66c78ff).
+constexpr int kCompileSemanticsEpoch = 2;
+
 std::string ComputeCompileFingerprint(const std::vector<std::string> &passthrough_args) {
   std::vector<std::string> parts;
   parts.push_back("rtl_trace_compile_fingerprint_v1");
+  parts.push_back("SEMANTICS_EPOCH:" + std::to_string(kCompileSemanticsEpoch));
   for (const std::string &arg : passthrough_args)
     parts.push_back("ARG:" + arg);
 

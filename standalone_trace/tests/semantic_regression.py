@@ -358,6 +358,32 @@ def main():
         )
         if "signals: incremental-cache-hit" not in inc2.stdout:
             raise AssertionError(f"incremental cache hit missing:\n{inc2.stdout}")
+        # 8b) a DB built with older compile semantics must not be reused: rewrite the .meta to the
+        # epoch-1 form (no SEMANTICS_EPOCH line, as written before the endpoint-merge fix).
+        inc_meta = Path(str(inc_db) + ".meta")
+        current_meta = inc_meta.read_text()
+        meta_lines = current_meta.splitlines(keepends=True)
+        if not any(l.startswith("SEMANTICS_EPOCH:") for l in meta_lines):
+            raise AssertionError(f"compile fingerprint lacks SEMANTICS_EPOCH:\n{current_meta}")
+        inc_meta.write_text("".join(l for l in meta_lines if not l.startswith("SEMANTICS_EPOCH:")))
+        inc3 = run_cmd(
+            [
+                str(rtl_trace),
+                "compile",
+                "--db",
+                str(inc_db),
+                "--incremental",
+                physical_source_path_flag,
+                "--single-unit",
+                str(fixture),
+                "--top",
+                "semantic_top",
+            ]
+        )
+        if "incremental-cache-hit" in inc3.stdout:
+            raise AssertionError(f"prior-epoch .meta must force a rebuild:\n{inc3.stdout}")
+        if inc_meta.read_text() != current_meta:
+            raise AssertionError("rebuild after an epoch change must rewrite the current .meta")
 
         # 9) invalid numeric args should return a parse error instead of terminating
         assert_invalid_arg(
