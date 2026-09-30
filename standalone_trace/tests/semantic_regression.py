@@ -1002,28 +1002,43 @@ def main():
                     f"{realloc_fixture}: DB differs when the signal vector is forced to reallocate"
                 )
 
-        # 31) Endpoint bit-range merging.
-        # Known issue: with default settings MergeEndpointBitRangesInPlace builds its grouping
-        # key from an endpoint that is then moved-from, so endpoints carrying lhs/rhs lists never
-        # merge. RTL_TRACE_FIX_ENDPOINT_MERGE=1 selects the corrected implementation.
+        # 31) Endpoint bit-range merging: endpoints of the same assignment with adjacent or
+        # overlapping exact bit ranges collapse into one endpoint; multi-dimensional selects
+        # are left as written.
         merge_fixture = src_dir / "tests" / "fixtures" / "endpoint_merge.sv"
-        merge_dbs = {}
-        for tag, env in (("default", None), ("fixed", {"RTL_TRACE_FIX_ENDPOINT_MERGE": "1"})):
-            merge_dbs[tag] = tmpdir / f"endpoint_merge_{tag}.db"
-            run_cmd(
-                [str(rtl_trace), "compile", "--db", str(merge_dbs[tag]), physical_source_path_flag,
-                 "--single-unit", str(merge_fixture), "--top", "endpoint_merge"],
-                env=env,
+        merge_db = tmpdir / "endpoint_merge.db"
+        run_cmd(
+            [str(rtl_trace), "compile", "--db", str(merge_db), physical_source_path_flag,
+             "--single-unit", str(merge_fixture), "--top", "endpoint_merge"],
+        )
+
+        def merge_bit_maps(mode, signal):
+            payload = run_trace_json(rtl_trace, merge_db, mode, signal)
+            return sorted((e.get("line"), e.get("bit_map")) for e in payload.get("endpoints", []))
+
+        a_loads = merge_bit_maps("loads", "endpoint_merge.a")
+        expected_a_loads = [(16, "[3:0]"), (17, "[7:4]"), (20, "[3:0]"), (22, "[4]")]
+        if a_loads != expected_a_loads:
+            raise AssertionError(f"endpoint merge (a loads): expected {expected_a_loads}, got {a_loads}")
+        g_drivers = merge_bit_maps("drivers", "endpoint_merge.g")
+        expected_g_drivers = [(20, "[3:0]"), (22, "[4]")]
+        if g_drivers != expected_g_drivers:
+            raise AssertionError(
+                f"endpoint merge (generate-loop drivers): expected {expected_g_drivers}, got {g_drivers}"
             )
-        merge_default = run_trace_json(rtl_trace, merge_dbs["default"], "loads", "endpoint_merge.a")
-        merge_fixed = run_trace_json(rtl_trace, merge_dbs["fixed"], "loads", "endpoint_merge.a")
-        default_maps = sorted(e.get("bit_map") for e in merge_default.get("endpoints", []))
-        fixed_maps = sorted(e.get("bit_map") for e in merge_fixed.get("endpoints", []))
-        if fixed_maps != ["[3:0]", "[7:4]"]:
-            raise AssertionError(f"fixed merge: expected ['[3:0]', '[7:4]'], got {fixed_maps}")
-        # Documents current default behaviour (unmerged). Update when the fix becomes the default.
-        if default_maps != ["[0]", "[1]", "[2]", "[3]", "[7:4]"]:
-            raise AssertionError(f"default merge behaviour changed unexpectedly: {default_maps}")
+        m_loads = merge_bit_maps("loads", "endpoint_merge.m")
+        # m[1][0], m[1][1], m[2][0], m[2][1] as DescribeBitSelectors writes them (the old merge
+        # pass misparsed e.g. "[0][7:4]" as "[4:0]").
+        expected_m_loads = [(18, "[0][11:8]"), (18, "[0][7:4]"), (18, "[1][11:8]"), (18, "[1][7:4]")]
+        if m_loads != expected_m_loads:
+            raise AssertionError(
+                f"endpoint merge must not rewrite multi-dimensional selects: expected {expected_m_loads}, "
+                f"got {m_loads}"
+            )
+        # A bit query returns the merged endpoint (its range covers the selected bit).
+        a2_loads = merge_bit_maps("loads", "endpoint_merge.a[2]")
+        if a2_loads != [(16, "[3:0]"), (20, "[3:0]")]:
+            raise AssertionError(f"endpoint merge (a[2] loads): got {a2_loads}")
         # ===== BEGIN find_fastpath tests (parallel top-k find / literal prefilter / suggestions) =====
         run_find_fastpath_tests(rtl_trace, db, tmpdir)
         # ===== END find_fastpath tests =====

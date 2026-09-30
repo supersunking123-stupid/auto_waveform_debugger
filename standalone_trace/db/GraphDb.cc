@@ -1328,22 +1328,28 @@ std::vector<std::string> SplitJoinedField(const std::string &field) {
   return out;
 }
 
+// Parses a bit_map that is exactly one "[N]" or "[L:R]" select. Anything else
+// (multi-dimensional "[i][j]", symbolic "[i-1]", ...) is rejected, so the
+// merge pass never rewrites such text.
 std::optional<std::pair<int32_t, int32_t>> ParseExactBitMapText(std::string_view bit_map) {
   if (bit_map.size() < 3 || bit_map.front() != '[' || bit_map.back() != ']') return std::nullopt;
   const std::string_view inside = bit_map.substr(1, bit_map.size() - 2);
-  const size_t colon = inside.find(':');
-  if (colon == std::string::npos) {
+  const auto parse_int = [](std::string_view text) -> std::optional<int32_t> {
     int32_t v = 0;
-    auto [ptr, ec] = std::from_chars(inside.data(), inside.data() + inside.size(), v);
-    if (ec != std::errc()) return std::nullopt;
-    return std::make_pair(v, v);
+    const auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), v);
+    if (ec != std::errc() || ptr != text.data() + text.size()) return std::nullopt;
+    return v;
+  };
+  const size_t colon = inside.find(':');
+  if (colon == std::string_view::npos) {
+    const auto v = parse_int(inside);
+    if (!v.has_value()) return std::nullopt;
+    return std::make_pair(*v, *v);
   }
-  int32_t l = 0, r = 0;
-  auto [ptr1, ec1] = std::from_chars(inside.data(), inside.data() + colon, l);
-  if (ec1 != std::errc()) return std::nullopt;
-  auto [ptr2, ec2] = std::from_chars(inside.data() + colon + 1, inside.data() + inside.size(), r);
-  if (ec2 != std::errc()) return std::nullopt;
-  return std::make_pair(l, r);
+  const auto l = parse_int(inside.substr(0, colon));
+  const auto r = parse_int(inside.substr(colon + 1));
+  if (!l.has_value() || !r.has_value()) return std::nullopt;
+  return std::make_pair(*l, *r);
 }
 
 std::string FormatBitRange(int32_t hi, int32_t lo) {
@@ -1351,184 +1357,135 @@ std::string FormatBitRange(int32_t hi, int32_t lo) {
   return "[" + std::to_string(hi) + ":" + std::to_string(lo) + "]";
 }
 
-struct EndpointKeyView {
-  int kind;
-  std::string_view path;
-  std::string_view file;
-  int line;
-  std::string_view direction;
-  bool range;
-  int32_t a_start;
-  int32_t a_end;
-  std::string_view a_text;
-  const std::vector<uint32_t>* lhs_ids;
-  const std::vector<uint32_t>* rhs_ids;
-  const std::vector<std::string>* lhs;
-  const std::vector<std::string>* rhs;
+// ---------------------------------------------------------------------------
+// Endpoint bit-range merging.
+//
+// Endpoints of one signal that come from the same assignment (same kind, path,
+// file, line, direction, assignment range/text and lhs/rhs signal lists) and
+// whose exact bit ranges are adjacent or overlapping collapse into one endpoint
+// with the union range: per-bit assignments and generate loops such as
+// `assign y[i] = ...` for i = 0..7 become a single `[7:0]` endpoint, and exact
+// duplicates of an endpoint are dropped.
+//
+// The pass works in place and never moves an endpoint while grouping keys
+// point into it. Output order is the input (source) order: each merged endpoint
+// takes the position of its first member, and endpoints that do not merge keep
+// their bit_map text unchanged. Hash-map iteration order is never observed.
+struct EndpointMergeKey {
+  const EndpointRecord *e;
 
-  bool operator==(const EndpointKeyView& o) const {
-    return kind == o.kind && path == o.path && file == o.file && line == o.line &&
-           direction == o.direction && range == o.range && a_start == o.a_start &&
-           a_end == o.a_end && a_text == o.a_text && *lhs_ids == *o.lhs_ids &&
-           *rhs_ids == *o.rhs_ids && *lhs == *o.lhs && *rhs == *o.rhs;
+  bool operator==(const EndpointMergeKey &o) const {
+    const EndpointRecord &a = *e;
+    const EndpointRecord &b = *o.e;
+    return a.kind == b.kind && a.path_id == b.path_id && a.file_id == b.file_id &&
+           a.line == b.line && a.has_assignment_range == b.has_assignment_range &&
+           a.assignment_start == b.assignment_start && a.assignment_end == b.assignment_end &&
+           a.path == b.path && a.file == b.file && a.direction == b.direction &&
+           a.assignment_text == b.assignment_text && a.lhs_signal_ids == b.lhs_signal_ids &&
+           a.rhs_signal_ids == b.rhs_signal_ids && a.lhs_signals == b.lhs_signals &&
+           a.rhs_signals == b.rhs_signals;
   }
 };
 
-struct EndpointKeyHash {
-  size_t operator()(const EndpointKeyView& k) const {
-    size_t h = std::hash<std::string_view>()(k.path);
-    h ^= std::hash<int>()(k.line) + 0x9e3779b9 + (h << 6) + (h >> 2);
-    h ^= std::hash<std::string_view>()(k.a_text) + 0x9e3779b9 + (h << 6) + (h >> 2);
+struct EndpointMergeKeyHash {
+  size_t operator()(const EndpointMergeKey &k) const {
+    const EndpointRecord &e = *k.e;
+    auto mix = [](size_t h, size_t v) { return h ^ (v + 0x9e3779b9 + (h << 6) + (h >> 2)); };
+    size_t h = std::hash<std::string_view>()(e.path);
+    h = mix(h, e.path_id);
+    h = mix(h, static_cast<size_t>(e.line));
+    h = mix(h, e.assignment_start);
+    h = mix(h, std::hash<std::string_view>()(e.assignment_text));
     return h;
   }
 };
 
-EndpointKeyView MakeEndpointKeyView(const EndpointRecord &e) {
-  return EndpointKeyView{
-      static_cast<int>(e.kind),
-      e.path, e.file, e.line, e.direction,
-      e.has_assignment_range, e.assignment_start, e.assignment_end, e.assignment_text,
-      &e.lhs_signal_ids, &e.rhs_signal_ids, &e.lhs_signals, &e.rhs_signals};
-}
-
-using EndpointMergeGroups = slang::flat_hash_map<EndpointKeyView, std::vector<std::pair<std::pair<int32_t, int32_t>, EndpointRecord>>, EndpointKeyHash>;
-
-void MergeEndpointBitRangesInPlace(std::vector<EndpointRecord>& endpoints, EndpointMergeGroups& groups) {
-  groups.clear();
-  // Fast path: skip entirely when no endpoints have mergeable bit maps
-  bool has_mergeable = false;
-  for (const EndpointRecord &e : endpoints) {
-    if (!e.bit_map.empty() && !e.bit_map_approximate) {
-      has_mergeable = true;
-      break;
-    }
-  }
-  if (!has_mergeable) return;
-  std::vector<EndpointRecord> out;
-  out.reserve(endpoints.size());
-  for (EndpointRecord &e : endpoints) {
-    if (e.bit_map.empty() || e.bit_map_approximate) {
-      out.push_back(std::move(e));
-      continue;
-    }
-    auto parsed = ParseExactBitMapText(e.bit_map);
-    if (!parsed.has_value()) {
-      out.push_back(std::move(e));
-      continue;
-    }
-    const int32_t lo = std::min(parsed->first, parsed->second);
-    const int32_t hi = std::max(parsed->first, parsed->second);
-    groups[MakeEndpointKeyView(e)].push_back({{lo, hi}, std::move(e)});
-  }
-
-  for (auto &[_, vec] : groups) {
-    std::sort(vec.begin(), vec.end(), [](const auto &a, const auto &b) {
-      if (a.first.first != b.first.first) return a.first.first < b.first.first;
-      return a.first.second < b.first.second;
-    });
-    size_t i = 0;
-    while (i < vec.size()) {
-      int32_t cur_lo = vec[i].first.first;
-      int32_t cur_hi = vec[i].first.second;
-      EndpointRecord merged = std::move(vec[i].second);
-      ++i;
-      while (i < vec.size()) {
-        const int32_t nxt_lo = vec[i].first.first;
-        const int32_t nxt_hi = vec[i].first.second;
-        if (nxt_lo > cur_hi + 1) break;
-        cur_hi = std::max(cur_hi, nxt_hi);
-        ++i;
-      }
-      merged.bit_map = FormatBitRange(cur_hi, cur_lo);
-      merged.bit_map_approximate = false;
-      out.push_back(std::move(merged));
-    }
-  }
-  endpoints = std::move(out);
-}
-
-// Variant of MergeEndpointBitRangesInPlace with stable grouping keys.
-//
-// The default implementation above builds each EndpointKeyView from an
-// endpoint `e` (pointers to e.lhs_signal_ids/... and string_views into e's
-// strings) and then, in the same statement, moves `e` into the group vector.
-// That leaves the stored key pointing at a moved-from record, so
-//  * endpoints whose lhs/rhs id or name lists are non-empty never compare equal
-//    to their siblings (the stored key sees empty vectors) and are never merged,
-//  * SSO strings (path/direction/text <= 15 chars) are clobbered by the move, so
-//    the key's contents change after insertion.
-// This variant first moves every mergeable endpoint into a reserved (hence
-// non-relocating) staging vector and only then builds keys that point into the
-// staging vector, so keys stay valid for the whole grouping pass.
-//
-// Enabled only when RTL_TRACE_FIX_ENDPOINT_MERGE=1 because it intentionally
-// changes DB output (adjacent/overlapping bit ranges of the same assignment now
-// collapse into one endpoint).
-struct StagedMergeItem {
-  std::pair<int32_t, int32_t> range;
-  EndpointRecord rec;
+struct EndpointMergeScratch {
+  struct Item {
+    uint32_t group = 0;
+    int32_t lo = 0;
+    int32_t hi = 0;
+    uint32_t index = 0;
+    bool ascending = false;  // written as [lo:hi] with lo < hi
+  };
+  slang::flat_hash_map<EndpointMergeKey, uint32_t, EndpointMergeKeyHash> group_of;
+  std::vector<Item> items;
+  std::vector<uint8_t> dropped;
 };
 
-void MergeEndpointBitRangesInPlaceStable(std::vector<EndpointRecord> &endpoints) {
-  bool has_mergeable = false;
-  for (const EndpointRecord &e : endpoints) {
-    if (!e.bit_map.empty() && !e.bit_map_approximate) {
-      has_mergeable = true;
-      break;
-    }
+void MergeEndpointBitRangesInPlace(std::vector<EndpointRecord> &endpoints, EndpointMergeScratch &scratch) {
+  if (endpoints.size() < 2) return;
+  auto &items = scratch.items;
+  items.clear();
+  for (size_t i = 0; i < endpoints.size(); ++i) {
+    const EndpointRecord &e = endpoints[i];
+    if (e.bit_map.empty() || e.bit_map_approximate) continue;
+    const auto parsed = ParseExactBitMapText(e.bit_map);
+    if (!parsed.has_value()) continue;
+    EndpointMergeScratch::Item item;
+    item.lo = std::min(parsed->first, parsed->second);
+    item.hi = std::max(parsed->first, parsed->second);
+    item.index = static_cast<uint32_t>(i);
+    item.ascending = parsed->first < parsed->second;
+    items.push_back(item);
   }
-  if (!has_mergeable) return;
-  std::vector<EndpointRecord> out;
-  out.reserve(endpoints.size());
-  std::vector<StagedMergeItem> staged;
-  staged.reserve(endpoints.size());  // must never reallocate: keys point into it
-  for (EndpointRecord &e : endpoints) {
-    if (e.bit_map.empty() || e.bit_map_approximate) {
-      out.push_back(std::move(e));
-      continue;
-    }
-    auto parsed = ParseExactBitMapText(e.bit_map);
-    if (!parsed.has_value()) {
-      out.push_back(std::move(e));
-      continue;
-    }
-    const int32_t lo = std::min(parsed->first, parsed->second);
-    const int32_t hi = std::max(parsed->first, parsed->second);
-    staged.push_back({{lo, hi}, std::move(e)});
-  }
+  if (items.size() < 2) return;
 
-  slang::flat_hash_map<EndpointKeyView, std::vector<uint32_t>, EndpointKeyHash> groups;
-  for (size_t i = 0; i < staged.size(); ++i) {
-    groups[MakeEndpointKeyView(staged[i].rec)].push_back(static_cast<uint32_t>(i));
+  // Group ids are assigned in order of first appearance, so the result does not
+  // depend on hash-map iteration order.
+  auto &group_of = scratch.group_of;
+  group_of.clear();
+  for (EndpointMergeScratch::Item &item : items) {
+    const auto [it, inserted] =
+        group_of.try_emplace(EndpointMergeKey{&endpoints[item.index]}, static_cast<uint32_t>(group_of.size()));
+    item.group = it->second;
   }
+  if (group_of.size() == items.size()) return;  // every mergeable endpoint is alone in its group
 
-  for (auto &[_, idxs] : groups) {
-    std::sort(idxs.begin(), idxs.end(), [&](uint32_t a, uint32_t b) {
-      const auto &ra = staged[a].range;
-      const auto &rb = staged[b].range;
-      if (ra.first != rb.first) return ra.first < rb.first;
-      if (ra.second != rb.second) return ra.second < rb.second;
-      return a < b;
-    });
-    size_t i = 0;
-    while (i < idxs.size()) {
-      int32_t cur_lo = staged[idxs[i]].range.first;
-      int32_t cur_hi = staged[idxs[i]].range.second;
-      EndpointRecord merged = std::move(staged[idxs[i]].rec);
+  std::sort(items.begin(), items.end(), [](const auto &a, const auto &b) {
+    if (a.group != b.group) return a.group < b.group;
+    if (a.lo != b.lo) return a.lo < b.lo;
+    if (a.hi != b.hi) return a.hi < b.hi;
+    return a.index < b.index;
+  });
+  auto &dropped = scratch.dropped;
+  dropped.assign(endpoints.size(), 0);
+  bool any_dropped = false;
+  size_t i = 0;
+  while (i < items.size()) {
+    const size_t run_begin = i;
+    int32_t cur_lo = items[i].lo;
+    int32_t cur_hi = items[i].hi;
+    uint32_t first_index = items[i].index;
+    bool any_ascending = items[i].ascending;
+    bool any_descending = items[i].lo != items[i].hi && !items[i].ascending;
+    ++i;
+    while (i < items.size() && items[i].group == items[run_begin].group &&
+           static_cast<int64_t>(items[i].lo) <= static_cast<int64_t>(cur_hi) + 1) {
+      cur_hi = std::max(cur_hi, items[i].hi);
+      first_index = std::min(first_index, items[i].index);
+      any_ascending = any_ascending || items[i].ascending;
+      any_descending = any_descending || (items[i].lo != items[i].hi && !items[i].ascending);
       ++i;
-      while (i < idxs.size()) {
-        const int32_t nxt_lo = staged[idxs[i]].range.first;
-        const int32_t nxt_hi = staged[idxs[i]].range.second;
-        if (nxt_lo > cur_hi + 1) break;
-        cur_hi = std::max(cur_hi, nxt_hi);
-        ++i;
-      }
-      merged.bit_map = FormatBitRange(cur_hi, cur_lo);
-      merged.bit_map_approximate = false;
-      out.push_back(std::move(merged));
     }
+    if (i - run_begin < 2) continue;  // nothing merged: keep the endpoint untouched
+    for (size_t k = run_begin; k < i; ++k) {
+      if (items[k].index != first_index) dropped[items[k].index] = 1;
+    }
+    any_dropped = true;
+    // Keep the source's range direction when every multi-bit member used [lo:hi].
+    endpoints[first_index].bit_map = (any_ascending && !any_descending && cur_lo != cur_hi)
+                                         ? "[" + std::to_string(cur_lo) + ":" + std::to_string(cur_hi) + "]"
+                                         : FormatBitRange(cur_hi, cur_lo);
   }
-  endpoints = std::move(out);
+  if (!any_dropped) return;
+  size_t out = 0;
+  for (size_t k = 0; k < endpoints.size(); ++k) {
+    if (dropped[k]) continue;
+    if (out != k) endpoints[out] = std::move(endpoints[k]);
+    ++out;
+  }
+  endpoints.resize(out);
 }
 
 constexpr size_t kCompactGlobalNetThreshold = 1024;
@@ -2342,7 +2299,6 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
   };
   const bool profile_save_graph = (std::getenv("RTL_TRACE_SAVE_GRAPH_PROFILE") != nullptr);
   g_build_prof.on = profile_save_graph;
-  const bool fix_endpoint_merge = EnvFlagEnabled("RTL_TRACE_FIX_ENDPOINT_MERGE");
 
   const auto t_total_start = Clock::now();
   if (logger != nullptr) {
@@ -2382,7 +2338,7 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
     }
     trace_cache.body_cache_limit = limit;
   }
-  EndpointMergeGroups merge_groups;
+  EndpointMergeScratch merge_scratch;
 
   // Reserve pool to guarantee stable string_view keys — must not reallocate.
   // Heuristic: ~1 unique string per signal + ~0.5 per endpoint for file/path/direction.
@@ -2728,13 +2684,8 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
       }
       if (profile_save_graph) t_compact_global_s += elapsed_seconds(t_compact_global_start, Clock::now());
       const auto t_merge_start = profile_save_graph ? Clock::now() : Clock::time_point{};
-      if (fix_endpoint_merge) {
-        MergeEndpointBitRangesInPlaceStable(rec.drivers);
-        MergeEndpointBitRangesInPlaceStable(rec.loads);
-      } else {
-        MergeEndpointBitRangesInPlace(rec.drivers, merge_groups);
-        MergeEndpointBitRangesInPlace(rec.loads, merge_groups);
-      }
+      MergeEndpointBitRangesInPlace(rec.drivers, merge_scratch);
+      MergeEndpointBitRangesInPlace(rec.loads, merge_scratch);
       if (profile_save_graph) t_merge_s += elapsed_seconds(t_merge_start, Clock::now());
 
       GraphSignalRecord &gs = graph.signals[sig_id];
