@@ -8,6 +8,7 @@ import select
 import shlex
 import subprocess
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -74,7 +75,7 @@ def _read_line_with_timeout(stream: Any, timeout_sec: float) -> str:
     raise payload
 
 
-def _stop_process(process: subprocess.Popen) -> None:
+def _terminate_process(process: subprocess.Popen) -> None:
     if process.poll() is None:
         process.terminate()
         try:
@@ -85,6 +86,9 @@ def _stop_process(process: subprocess.Popen) -> None:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 pass
+
+
+def _close_process_pipes(process: subprocess.Popen) -> None:
     for stream_name in ("stdin", "stdout", "stderr"):
         stream = getattr(process, stream_name, None)
         if stream:
@@ -92,6 +96,113 @@ def _stop_process(process: subprocess.Popen) -> None:
                 stream.close()
             except Exception:
                 pass
+
+
+def _stop_process(process: subprocess.Popen) -> None:
+    _terminate_process(process)
+    _close_process_pipes(process)
+
+
+class _StderrPump:
+    """Continuously drains a child's stderr pipe into a buffer on a daemon thread.
+
+    Without it a chatty child (e.g. serve echoing a 70 KB invalid regex) fills the pipe and
+    blocks before it can write its stdout terminator. The pump reads the raw fd under
+    ``_lock``, so a caller holding the lock that sees the pipe empty knows every byte written
+    so far is in the buffer. The text-mode wrapper around the pipe must not be read directly.
+    """
+
+    _POLL_MS = 200
+    _READ_SIZE = 65536
+
+    def __init__(self, stream: Any):
+        self._fd = stream.fileno()
+        # The pump is the only reader; non-blocking so a read under the lock can never stall.
+        os.set_blocking(self._fd, False)
+        # poll(), not select(): select() rejects descriptors >= FD_SETSIZE (1024), which a
+        # long-running server with many open files hands out. One poll object per thread,
+        # since CPython refuses concurrent poll() calls on the same object.
+        self._pump_poller = self._new_poller()
+        self._settle_poller = self._new_poller()
+        self._lock = threading.Lock()
+        self._chunks: List[bytes] = []
+        self._eof = False
+        self._error: Optional[str] = None
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="rtl-trace-serve-stderr", daemon=True)
+        self._thread.start()
+
+    def _new_poller(self) -> Any:
+        poller = select.poll()
+        poller.register(self._fd, select.POLLIN)  # POLLHUP/POLLERR/POLLNVAL are always reported
+        return poller
+
+    def _read_chunk(self) -> bytes:
+        return os.read(self._fd, self._READ_SIZE)
+
+    def _run(self) -> None:
+        try:
+            while not self._stop.is_set():
+                if not self._pump_poller.poll(self._POLL_MS):
+                    continue
+                with self._lock:
+                    try:
+                        data = self._read_chunk()
+                    except BlockingIOError:
+                        continue
+                    if not data:
+                        self._eof = True
+                        return
+                    self._chunks.append(data)
+        except Exception as exc:
+            # A real failure is not EOF: keep it visible in every later stderr result.
+            with self._lock:
+                self._error = f"{type(exc).__name__}: {exc}"
+
+    def _take_locked(self) -> str:
+        data = b"".join(self._chunks)
+        self._chunks = []
+        text = data.decode("utf-8", errors="replace")
+        if self._error is not None:
+            if text and not text.endswith("\n"):
+                text += "\n"
+            text += f"[rtl_trace serve stderr capture failed ({self._error}); later stderr is lost]\n"
+        return text
+
+    def take_settled(self, max_wait_sec: float = 5.0) -> str:
+        """Return (and clear) everything written so far, once the pump has emptied the pipe.
+
+        Called after the child wrote its stdout terminator: any stderr it wrote before that
+        is then either in the pipe or in the buffer, so waiting for the pipe to go empty
+        attributes all of it to the current response and nothing from a later one.
+        """
+        deadline = time.monotonic() + max_wait_sec
+        while True:
+            with self._lock:
+                settled = self._eof or not self._thread.is_alive() or time.monotonic() >= deadline
+                if not settled:
+                    try:
+                        settled = not self._settle_poller.poll(0)
+                    except Exception as exc:
+                        self._error = self._error or f"{type(exc).__name__}: {exc}"
+                        settled = True
+                if settled:
+                    return self._take_locked()
+            time.sleep(0.001)
+
+    def take_all(self, join_timeout_sec: float = 1.0) -> str:
+        """Wait briefly for the pump to reach EOF (child exited), then return the buffer."""
+        self._thread.join(timeout=join_timeout_sec)
+        with self._lock:
+            return self._take_locked()
+
+    def stop(self, join_timeout_sec: float = 2.0) -> None:
+        """Stop and join the thread; call before the pipe is closed so the fd is never reused."""
+        self._stop.set()
+        self._thread.join(timeout=join_timeout_sec)
+
+    def is_alive(self) -> bool:
+        return self._thread.is_alive()
 
 
 def _shell_join(args: Sequence[str]) -> str:
@@ -123,11 +234,16 @@ class RtlTraceServeSession:
             text=True,
             bufsize=1,
         )
+        # serve writes diagnostics to stderr while a query runs; drain it continuously so a
+        # large one cannot fill the pipe and block serve before it writes <<END>>.
+        self._stderr_pump: Optional[_StderrPump] = (
+            _StderrPump(self.process.stderr) if self.process.stderr is not None else None
+        )
         self.startup = self._read_until_end()
 
     def _read_until_end(self) -> Dict[str, Any]:
         if self.process.poll() is not None:
-            err = self.process.stderr.read() if self.process.stderr else ""
+            err = self._take_stderr_after_exit()
             return {"status": "error", "message": "rtl_trace serve exited", "stderr": err}
 
         if self.process.stdout is None:
@@ -140,11 +256,10 @@ class RtlTraceServeSession:
                 self.stop()
                 return {"status": "error", "message": str(exc), "stdout": "".join(out_lines)}
             if not s:
-                err = self.process.stderr.read() if self.process.stderr else ""
                 return {
                     "status": "error",
                     "message": "rtl_trace serve terminated while waiting for response",
-                    "stderr": err,
+                    "stderr": self._take_stderr_after_exit(),
                     "stdout": "".join(out_lines),
                 }
             if s.strip() == "<<END>>":
@@ -153,37 +268,27 @@ class RtlTraceServeSession:
         result: Dict[str, Any] = {"status": "success", "stdout": "".join(out_lines)}
         # serve reports per-query errors (bad regex, unknown signal, ...) on stderr and still
         # terminates the response with <<END>>; surface them instead of returning empty stdout.
-        err = self._drain_stderr()
+        err = self._take_response_stderr()
         if err:
             result["stderr"] = err
         return result
 
-    def _drain_stderr(self) -> str:
-        """Non-blocking read of whatever serve has already written to stderr.
+    def _take_response_stderr(self) -> str:
+        """Stderr serve wrote for the response whose <<END>> was just read.
 
         serve writes a query's diagnostics to stderr before it flushes <<END>> to stdout, so
-        once <<END>> has been read they are already in the pipe. Reads the raw fd (the text
-        wrapper is only used after the process exits) so the pipe cannot fill up and block serve.
+        once the pump has emptied the pipe all of them are buffered and none of the next one's.
         """
-        stream = self.process.stderr
-        if stream is None:
-            return ""
-        chunks: List[bytes] = []
-        try:
-            fd = stream.fileno()
-            while select.select([fd], [], [], 0)[0]:
-                data = os.read(fd, 65536)
-                if not data:
-                    break
-                chunks.append(data)
-        except (OSError, ValueError):
-            pass
-        return b"".join(chunks).decode("utf-8", errors="replace")
+        return self._stderr_pump.take_settled() if self._stderr_pump else ""
+
+    def _take_stderr_after_exit(self) -> str:
+        """Everything left on stderr once serve has exited or closed stdout."""
+        return self._stderr_pump.take_all() if self._stderr_pump else ""
 
     def query(self, line: str) -> Dict[str, Any]:
         with self._query_lock:
             if self.process.poll() is not None:
-                err = self.process.stderr.read() if self.process.stderr else ""
+                err = self._take_stderr_after_exit()
                 return {"status": "error", "message": "rtl_trace serve exited", "stderr": err}
 
             try:
@@ -200,7 +305,12 @@ class RtlTraceServeSession:
 
     def stop(self) -> Dict[str, Any]:
         with self._query_lock:
-            _stop_process(self.process)
+            _terminate_process(self.process)
+            # Join the pump before closing the pipes so it never selects/reads a closed
+            # (and possibly reused) fd.
+            if self._stderr_pump:
+                self._stderr_pump.stop()
+            _close_process_pipes(self.process)
         return {"status": "success"}
 
 
