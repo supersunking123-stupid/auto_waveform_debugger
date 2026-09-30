@@ -41,6 +41,11 @@ target_link_libraries(rtl_trace PRIVATE slang::slang)
 add_executable(assignment_utils_test tests/assignment_utils_test.cc AssignmentUtils.cc)
 target_include_directories(assignment_utils_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
+find_package(Threads REQUIRED)
+add_executable(parallel_topk_test tests/parallel_topk_test.cc)
+target_include_directories(parallel_topk_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(parallel_topk_test PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+
 enable_testing()
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
@@ -57,3 +62,4 @@ set_tests_properties(
 )
 
 add_test(NAME assignment_utils_test COMMAND assignment_utils_test)
+add_test(NAME parallel_topk_test COMMAND parallel_topk_test)

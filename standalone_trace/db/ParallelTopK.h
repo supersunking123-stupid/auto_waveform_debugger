@@ -95,9 +95,17 @@ std::vector<Item> ParallelTopK(size_t n, size_t limit, Less less, Scan scan) {
         next.store(n);
       }
     };
+    // A worker that fails to start (std::system_error under resource pressure) is not fatal: the
+    // chunk counter is shared, so the calling thread and the workers that did start still cover
+    // every chunk and the result is unchanged. Every started worker is joined on every path; a
+    // joinable std::thread destroyed during unwinding would call std::terminate.
     std::vector<std::thread> pool;
-    pool.reserve(threads - 1);
-    for (size_t t = 1; t < threads; ++t) pool.emplace_back(worker, t);
+    try {
+      pool.reserve(threads - 1);
+      for (size_t t = 1; t < threads; ++t) pool.emplace_back(worker, t);
+    } catch (...) {
+      // Run with the workers that started.
+    }
     worker(0);
     for (std::thread &th : pool) th.join();
     if (error) std::rethrow_exception(error);
