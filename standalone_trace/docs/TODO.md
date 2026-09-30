@@ -193,9 +193,10 @@ default against `=0`).
 - Faster one-shot queries: each CLI query reloads the whole DB (3.3 s warm, 15 s cold cache,
   5.6 GB RSS). Options: an mmap-able DB layout or lazy loading of DB sections. Until then,
   agents should use `serve`.
-- Small leftover: 15 `test_cases/*` scripts call bare `python3`; the system Python fails on
-  `str | List[str]` in `models.py`, so `run_all_tests.sh` only passes with `.venv/bin` first on
-  `PATH`. Use the repo `.venv` interpreter explicitly (or a `PYTHON` variable defaulting to it).
+- Test-script Python cleanup (E1): the reference suite passed 27/27 with a clean
+  `/usr/bin:/bin` PATH, so the earlier system-Python failure claim was stale. All 27 scripts
+  now use `PYTHON`, defaulting to the repo `.venv/bin/python3`, and fail clearly if that
+  interpreter is missing. An executable interpreter path can override `PYTHON`.
 - Endpoint-merge follow-ups (item 2):
   - A bit query on a merged range returns the whole range (`trace --signal x[5]` gives
     `bits [15:0]`, same file:line). Narrowing it back needs per-member info in the DB.

@@ -7,7 +7,17 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-RTL_TRACE="${RTL_TRACE:-$(cd "$SCRIPT_DIR/../.." && pwd)/standalone_trace/build/rtl_trace}"
+ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Project virtualenv Python (override with PYTHON=/path/to/interpreter).
+PYTHON="${PYTHON:-$ROOT_DIR/.venv/bin/python3}"
+if [ ! -x "$PYTHON" ]; then
+    echo "ERROR: Python interpreter not executable: $PYTHON" >&2
+    echo "Create the repo .venv or set PYTHON to an executable interpreter path." >&2
+    exit 1
+fi
+
+RTL_TRACE="${RTL_TRACE:-$ROOT_DIR/standalone_trace/build/rtl_trace}"
 
 echo "=========================================="
 echo "Test Case 09: Counter Chain"
@@ -20,7 +30,7 @@ echo "[Step 1] Running rtl_trace compile..."
     --top counter_chain_top \
     -f files.f
 # [CHECK] DB file exists and is non-empty
-python3 -c "
+"$PYTHON" -c "
 import os
 db='tc09.db'
 assert os.path.exists(db), f'DB file not found: {db}'
@@ -36,7 +46,7 @@ echo "[Step 2] Tracing drivers to counter output..."
     --signal "counter_chain_top.counter_out[0]" \
     --depth 5 \
     --format json > tc09_trace_drivers.json 2>/dev/null
-python3 -c "
+"$PYTHON" -c "
 import json, sys
 data = json.load(open('tc09_trace_drivers.json'))
 assert 'endpoints' in data, 'Missing endpoints'
@@ -58,7 +68,7 @@ echo "[Step 4] Tracing loads from enable..."
     --mode loads \
     --signal "counter_chain_top.enable" \
     --format json > tc09_trace_loads.json 2>/dev/null
-python3 -c "
+"$PYTHON" -c "
 import json, sys
 data = json.load(open('tc09_trace_loads.json'))
 assert 'endpoints' in data, 'Missing endpoints'

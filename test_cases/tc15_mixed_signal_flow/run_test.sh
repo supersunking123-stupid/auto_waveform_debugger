@@ -7,13 +7,23 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Project virtualenv Python (override with PYTHON=/path/to/interpreter).
+PYTHON="${PYTHON:-$ROOT_DIR/.venv/bin/python3}"
+if [ ! -x "$PYTHON" ]; then
+    echo "ERROR: Python interpreter not executable: $PYTHON" >&2
+    echo "Create the repo .venv or set PYTHON to an executable interpreter path." >&2
+    exit 1
+fi
+
 # Source VCS environment only if the site setup script exists; otherwise rely
 # on vcs already being on PATH (VCS steps are skipped when it is not).
 if [ -f ~/my_env/vcs.bash ]; then
     source ~/my_env/vcs.bash
 fi
 
-RTL_TRACE="${RTL_TRACE:-$(cd "$SCRIPT_DIR/../.." && pwd)/standalone_trace/build/rtl_trace}"
+RTL_TRACE="${RTL_TRACE:-$ROOT_DIR/standalone_trace/build/rtl_trace}"
 
 echo "=========================================="
 echo "Test Case 15: Mixed Signal Flow"
@@ -34,7 +44,7 @@ echo "[Step 2] Running rtl_trace compile (FEEDBACK_SEL=0)..."
     --top mixed_signal_flow_top \
     -f files.f
 # [CHECK] DB file exists and is non-empty
-python3 -c "
+"$PYTHON" -c "
 import os
 db='tc15.db'
 assert os.path.exists(db), f'DB file not found: {db}'
@@ -50,7 +60,7 @@ echo "[Step 3] Tracing through 8-stage pipeline..."
     --signal "mixed_signal_flow_top.pipe_data[4]" \
     --depth 10 \
     --format json > tc15_trace_pipe.json 2>/dev/null
-python3 -c "
+"$PYTHON" -c "
 import json, sys
 data = json.load(open('tc15_trace_pipe.json'))
 assert 'endpoints' in data, 'Missing endpoints'
@@ -80,7 +90,7 @@ echo "[Step 6] Tracing enable chain..."
     --signal "mixed_signal_flow_top.enable" \
     --depth 5 \
     --format json > tc15_trace_loads.json 2>/dev/null
-python3 -c "
+"$PYTHON" -c "
 import json, sys
 data = json.load(open('tc15_trace_loads.json'))
 assert 'endpoints' in data, 'Missing endpoints'

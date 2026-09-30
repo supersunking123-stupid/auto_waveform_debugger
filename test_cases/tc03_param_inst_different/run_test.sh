@@ -7,7 +7,17 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-RTL_TRACE="${RTL_TRACE:-$(cd "$SCRIPT_DIR/../.." && pwd)/standalone_trace/build/rtl_trace}"
+ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Project virtualenv Python (override with PYTHON=/path/to/interpreter).
+PYTHON="${PYTHON:-$ROOT_DIR/.venv/bin/python3}"
+if [ ! -x "$PYTHON" ]; then
+    echo "ERROR: Python interpreter not executable: $PYTHON" >&2
+    echo "Create the repo .venv or set PYTHON to an executable interpreter path." >&2
+    exit 1
+fi
+
+RTL_TRACE="${RTL_TRACE:-$ROOT_DIR/standalone_trace/build/rtl_trace}"
 
 echo "=========================================="
 echo "Test Case 03: Param Inst Different"
@@ -20,7 +30,7 @@ echo "[Step 1] Running rtl_trace compile..."
     --top param_inst_different_top \
     -f files.f
 # [CHECK] DB file exists and is non-empty
-python3 -c "
+"$PYTHON" -c "
 import os
 db='tc03.db'
 assert os.path.exists(db), f'DB file not found: {db}'
@@ -35,7 +45,7 @@ echo "[Step 2] Tracing drivers to 8-bit FIFO..."
     --mode drivers \
     --signal "param_inst_different_top.u_fifo0.mem[0]" \
     --format json > tc03_trace_drivers.json 2>/dev/null
-python3 -c "
+"$PYTHON" -c "
 import json, sys
 data = json.load(open('tc03_trace_drivers.json'))
 assert 'endpoints' in data, 'Missing endpoints'
@@ -57,7 +67,7 @@ echo "[Step 4] Tracing loads from deeper FIFO..."
     --mode loads \
     --signal "param_inst_different_top.u_fifo2.wr_data" \
     --format json > tc03_trace_loads.json 2>/dev/null
-python3 -c "
+"$PYTHON" -c "
 import json, sys
 data = json.load(open('tc03_trace_loads.json'))
 assert 'endpoints' in data, 'Missing endpoints'

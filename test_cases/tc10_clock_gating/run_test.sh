@@ -7,7 +7,17 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-RTL_TRACE="${RTL_TRACE:-$(cd "$SCRIPT_DIR/../.." && pwd)/standalone_trace/build/rtl_trace}"
+ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Project virtualenv Python (override with PYTHON=/path/to/interpreter).
+PYTHON="${PYTHON:-$ROOT_DIR/.venv/bin/python3}"
+if [ ! -x "$PYTHON" ]; then
+    echo "ERROR: Python interpreter not executable: $PYTHON" >&2
+    echo "Create the repo .venv or set PYTHON to an executable interpreter path." >&2
+    exit 1
+fi
+
+RTL_TRACE="${RTL_TRACE:-$ROOT_DIR/standalone_trace/build/rtl_trace}"
 
 echo "=========================================="
 echo "Test Case 10: Clock Gating"
@@ -20,7 +30,7 @@ echo "[Step 1] Running rtl_trace compile..."
     --top clock_gating_top \
     -f files.f
 # [CHECK] DB file exists and is non-empty
-python3 -c "
+"$PYTHON" -c "
 import os
 db='tc10.db'
 assert os.path.exists(db), f'DB file not found: {db}'
@@ -35,7 +45,7 @@ echo "[Step 2] Tracing drivers to gated clock..."
     --mode drivers \
     --signal "clock_gating_top.gated_clk[0]" \
     --format json > tc10_trace_drivers.json 2>/dev/null
-python3 -c "
+"$PYTHON" -c "
 import json, sys
 data = json.load(open('tc10_trace_drivers.json'))
 assert 'endpoints' in data, 'Missing endpoints'
@@ -50,7 +60,7 @@ echo "[Step 3] Tracing loads from global_en..."
     --mode loads \
     --signal "clock_gating_top.global_en" \
     --format json > tc10_trace_loads.json 2>/dev/null
-python3 -c "
+"$PYTHON" -c "
 import json, sys
 data = json.load(open('tc10_trace_loads.json'))
 assert 'endpoints' in data, 'Missing endpoints'
