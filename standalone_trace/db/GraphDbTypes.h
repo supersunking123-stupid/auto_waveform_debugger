@@ -6,6 +6,10 @@
 #include "slang/util/FlatMap.h"
 
 #include <chrono>
+#include <cstring>
+#include <iterator>
+#include <memory>
+#include <type_traits>
 #include <cstdint>
 #include <ctime>
 #include <fstream>
@@ -184,6 +188,51 @@ struct GraphInstanceParamRecord {
   uint8_t is_overridden = 0;
 };
 
+// Read-only POD view. v1-v5 files do not align the section after the string blob.
+// Returning records by value via memcpy avoids unaligned loads and object-lifetime UB.
+template <typename T>
+class GraphPodView {
+  static_assert(std::is_trivially_copyable_v<T>);
+ public:
+  GraphPodView() = default;
+  GraphPodView(const char *data, size_t count) : data_(data), size_(count) {}
+  explicit GraphPodView(const std::vector<T> &items)
+      : data_(reinterpret_cast<const char *>(items.data())), size_(items.size()) {}
+  size_t size() const { return size_; }
+  bool empty() const { return size_ == 0; }
+  T operator[](size_t i) const {
+    T value;
+    std::memcpy(&value, data_ + i * sizeof(T), sizeof(T));
+    return value;
+  }
+  class Iterator {
+   public:
+    using iterator_category = std::input_iterator_tag;
+    using value_type = T;
+    using difference_type = std::ptrdiff_t;
+    using pointer = void;
+    using reference = T;
+    Iterator() = default;
+    explicit Iterator(const char *data) : data_(data) {}
+    T operator*() const {
+      T value;
+      std::memcpy(&value, data_, sizeof(T));
+      return value;
+    }
+    Iterator &operator++() { data_ += sizeof(T); return *this; }
+    Iterator operator++(int) { auto old = *this; ++*this; return old; }
+    Iterator operator+(size_t n) const { return Iterator(n == 0 ? data_ : data_ + n * sizeof(T)); }
+    bool operator==(const Iterator &other) const { return data_ == other.data_; }
+   private:
+    const char *data_ = nullptr;
+  };
+  Iterator begin() const { return Iterator(data_); }
+  Iterator end() const { return Iterator(size_ == 0 ? data_ : data_ + size_ * sizeof(T)); }
+ private:
+  const char *data_ = nullptr;
+  size_t size_ = 0;
+};
+
 struct GraphDb {
   std::vector<std::string> strings;
   std::vector<GraphSignalRecord> signals;
@@ -203,6 +252,70 @@ struct GraphDb {
   std::vector<uint32_t> global_sinks;
   std::vector<GraphSignalCoordinates> coordinates;
   std::vector<GraphDeclaredAxis> declared_axes;
+  // Compiler writes use the owned vectors above. Runtime reads use immutable mappings.
+  std::shared_ptr<void> mapping;
+  GraphPodView<uint32_t> mapped_string_offsets;
+  const char *mapped_string_blob = nullptr;
+  GraphPodView<GraphSignalRecord> mapped_signals;
+  GraphPodView<GraphSignalRecord> ReadSignals() const {
+    return mapped_signals.empty() ? GraphPodView<GraphSignalRecord>(signals) : mapped_signals;
+  }
+  GraphPodView<GraphEndpointRecord> mapped_endpoints;
+  GraphPodView<GraphEndpointRecord> ReadEndpoints() const {
+    return mapped_endpoints.empty() ? GraphPodView<GraphEndpointRecord>(endpoints) : mapped_endpoints;
+  }
+  GraphPodView<uint32_t> mapped_signal_refs;
+  GraphPodView<uint32_t> ReadSignalRefs() const {
+    return mapped_signal_refs.empty() ? GraphPodView<uint32_t>(signal_refs) : mapped_signal_refs;
+  }
+  GraphPodView<GraphPathRefRange> mapped_load_ref_ranges;
+  GraphPodView<GraphPathRefRange> ReadLoadRefRanges() const {
+    return mapped_load_ref_ranges.empty() ? GraphPodView<GraphPathRefRange>(load_ref_ranges) : mapped_load_ref_ranges;
+  }
+  GraphPodView<uint32_t> mapped_load_ref_signal_ids;
+  GraphPodView<uint32_t> ReadLoadRefSignalIds() const {
+    return mapped_load_ref_signal_ids.empty() ? GraphPodView<uint32_t>(load_ref_signal_ids) : mapped_load_ref_signal_ids;
+  }
+  GraphPodView<GraphPathRefRange> mapped_driver_ref_ranges;
+  GraphPodView<GraphPathRefRange> ReadDriverRefRanges() const {
+    return mapped_driver_ref_ranges.empty() ? GraphPodView<GraphPathRefRange>(driver_ref_ranges) : mapped_driver_ref_ranges;
+  }
+  GraphPodView<uint32_t> mapped_driver_ref_signal_ids;
+  GraphPodView<uint32_t> ReadDriverRefSignalIds() const {
+    return mapped_driver_ref_signal_ids.empty() ? GraphPodView<uint32_t>(driver_ref_signal_ids) : mapped_driver_ref_signal_ids;
+  }
+  GraphPodView<GraphPathRefRange> mapped_assignment_lhs_ref_ranges;
+  GraphPodView<GraphPathRefRange> ReadAssignmentLhsRefRanges() const {
+    return mapped_assignment_lhs_ref_ranges.empty() ? GraphPodView<GraphPathRefRange>(assignment_lhs_ref_ranges) : mapped_assignment_lhs_ref_ranges;
+  }
+  GraphPodView<uint32_t> mapped_assignment_lhs_ref_signal_ids;
+  GraphPodView<uint32_t> ReadAssignmentLhsRefSignalIds() const {
+    return mapped_assignment_lhs_ref_signal_ids.empty() ? GraphPodView<uint32_t>(assignment_lhs_ref_signal_ids) : mapped_assignment_lhs_ref_signal_ids;
+  }
+  GraphPodView<GraphHierarchyRecord> mapped_hierarchy;
+  GraphPodView<GraphHierarchyRecord> ReadHierarchy() const {
+    return mapped_hierarchy.empty() ? GraphPodView<GraphHierarchyRecord>(hierarchy) : mapped_hierarchy;
+  }
+  GraphPodView<uint32_t> mapped_hierarchy_children;
+  GraphPodView<uint32_t> ReadHierarchyChildren() const {
+    return mapped_hierarchy_children.empty() ? GraphPodView<uint32_t>(hierarchy_children) : mapped_hierarchy_children;
+  }
+  GraphPodView<GraphPathRefRange> mapped_hierarchy_param_ranges;
+  GraphPodView<GraphPathRefRange> ReadHierarchyParamRanges() const {
+    return mapped_hierarchy_param_ranges.empty() ? GraphPodView<GraphPathRefRange>(hierarchy_param_ranges) : mapped_hierarchy_param_ranges;
+  }
+  GraphPodView<GraphInstanceParamRecord> mapped_hierarchy_params;
+  GraphPodView<GraphInstanceParamRecord> ReadHierarchyParams() const {
+    return mapped_hierarchy_params.empty() ? GraphPodView<GraphInstanceParamRecord>(hierarchy_params) : mapped_hierarchy_params;
+  }
+  GraphPodView<GraphGlobalNetRecord> mapped_global_nets;
+  GraphPodView<GraphGlobalNetRecord> ReadGlobalNets() const {
+    return mapped_global_nets.empty() ? GraphPodView<GraphGlobalNetRecord>(global_nets) : mapped_global_nets;
+  }
+  GraphPodView<uint32_t> mapped_global_sinks;
+  GraphPodView<uint32_t> ReadGlobalSinks() const {
+    return mapped_global_sinks.empty() ? GraphPodView<uint32_t>(global_sinks) : mapped_global_sinks;
+  }
   slang::flat_hash_map<uint32_t, size_t> load_ref_index;
   slang::flat_hash_map<uint32_t, size_t> driver_ref_index;
   slang::flat_hash_map<uint32_t, size_t> assignment_lhs_ref_index;
@@ -216,7 +329,8 @@ struct TraceSession {
   std::string db_path;
   std::string db_mtime;
   slang::flat_hash_map<std::string_view, uint32_t> signal_name_to_id;
-  std::vector<const std::string *> signal_names_by_id;
+  std::vector<std::string_view> signal_names_by_id;
+  bool signal_names_ready = false;
   slang::flat_hash_map<uint32_t, SignalRecord> materialized_signal_records;
   slang::flat_hash_map<std::string, std::string> source_file_cache;
   bool signal_index_ready = false;

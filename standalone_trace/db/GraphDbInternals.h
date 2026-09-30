@@ -25,7 +25,7 @@ std::pair<std::string_view, std::string_view> SplitPathPrefixLeaf(std::string_vi
 
 uint32_t InternString(const std::string &s, std::vector<std::string> &pool,
                       slang::flat_hash_map<std::string, uint32_t> &index);
-const std::string &GraphString(const GraphDb &db, uint32_t id);
+std::string_view GraphString(const GraphDb &db, uint32_t id);
 const std::string &EndpointPath(const TraceDb &db, const EndpointRecord &e);
 const std::string &EndpointFile(const TraceDb &db, const EndpointRecord &e);
 
@@ -77,13 +77,14 @@ bool LooksLikeClockOrResetName(std::string_view path);
 // --- Session management ---
 
 std::string StatMtimeString(const std::string &path);
+void BuildSessionSignalNames(TraceSession &session);
 void BuildSessionSignalIndex(TraceSession &session);
 void EnsureSessionHierarchy(TraceSession &session);
 void BuildSessionReverseRefs(TraceSession &session);
 bool OpenTraceSession(const std::string &db_path, TraceSession &session, uint32_t flags,
                       std::string *error = nullptr);
 std::optional<uint32_t> LookupSignalId(const TraceSession &session, std::string_view name);
-const std::string &SessionSignalName(const TraceSession &session, uint32_t id);
+std::string_view SessionSignalName(const TraceSession &session, uint32_t id);
 const SignalRecord &SessionSignalRecord(TraceSession &session, uint32_t id);
 std::vector<uint32_t> SessionBridgeRefs(const TraceSession &session, bool use_load_refs,
                                          uint32_t path_id);

@@ -129,22 +129,23 @@ std::string RequiredLiteral(const std::string &pattern) {
 } // namespace
 
 int RunFindWithSession(TraceSession &session, const FindOptions &opts) {
+  BuildSessionSignalNames(session);
   std::optional<std::regex> re;
   if (opts.regex_mode) re = std::regex(opts.query);
   const std::string literal = opts.regex_mode ? RequiredLiteral(opts.query) : std::string();
 
   // Parallel bounded top-k: equals "all matches, sorted, truncated to --limit".
-  const std::vector<const std::string *> &names = session.signal_names_by_id;
-  auto name_less = [](const std::string *a, const std::string *b) { return *a < *b; };
-  using Collector = TopKCollector<const std::string *, decltype(name_less)>;
-  const std::vector<const std::string *> top = ParallelTopK<const std::string *>(
+  const std::vector<std::string_view> &names = session.signal_names_by_id;
+  auto name_less = [](std::string_view a, std::string_view b) { return a < b; };
+  using Collector = TopKCollector<std::string_view, decltype(name_less)>;
+  const std::vector<std::string_view> top = ParallelTopK<std::string_view>(
       names.size(), opts.limit, name_less, [&](size_t begin, size_t end, Collector &out) {
         for (size_t i = begin; i < end; ++i) {
-          const std::string &name = *names[i];
+          const std::string_view name = names[i];
           bool ok;
           if (opts.regex_mode) {
             ok = (literal.empty() || name.find(literal) != std::string::npos) &&
-                 std::regex_search(name, *re);
+                 std::regex_search(name.begin(), name.end(), *re);
           } else {
             ok = (name.find(opts.query) != std::string::npos);
           }
@@ -153,7 +154,7 @@ int RunFindWithSession(TraceSession &session, const FindOptions &opts) {
       });
   std::vector<std::string> matches;
   matches.reserve(top.size());
-  for (const std::string *m : top) matches.push_back(*m);
+  for (std::string_view m : top) matches.emplace_back(m);
 
   std::vector<std::string> suggestions;
   if (matches.empty()) suggestions = TopSuggestions(session, opts.query, opts.limit);

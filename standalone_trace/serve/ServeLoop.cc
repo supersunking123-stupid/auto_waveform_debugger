@@ -176,8 +176,8 @@ int RunServe(int argc, char *argv[]) {
           std::cout << "mtime: " << session->db_mtime << "\n";
           std::cout << "signals: " << session->signal_names_by_id.size() << "\n";
           std::cout << "hier_nodes: " << session->db.hierarchy.size() << "\n";
-          const size_t load_ref_paths = session->graph->load_ref_ranges.size();
-          const size_t driver_ref_paths = session->graph->driver_ref_ranges.size();
+          const size_t load_ref_paths = session->graph->ReadLoadRefRanges().size();
+          const size_t driver_ref_paths = session->graph->ReadDriverRefRanges().size();
           std::cout << "reverse_ref_paths_loads: " << load_ref_paths << "\n";
           std::cout << "reverse_ref_paths_drivers: " << driver_ref_paths << "\n";
         }

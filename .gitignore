@@ -13,6 +13,7 @@ test_cases/**/vcs.log
 test_cases/**/rtl/
 test_cases/**/*.db
 test_cases/**/*.db.meta
+test_cases/**/*.db.lock
 test_cases/rtl_trace.db.meta
 test_cases/**/*.json
 

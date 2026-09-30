@@ -28,10 +28,10 @@ std::vector<EndpointRecord> FindFallbackDriverEndpoints(TraceSession &session, u
   if (!session.graph.has_value()) return out;
 
   const GraphDb &graph = *session.graph;
-  if (target_sig_id >= graph.signals.size()) return out;
+  if (target_sig_id >= graph.ReadSignals().size()) return out;
 
-  const uint32_t path_id = graph.signals[target_sig_id].name_str_id;
-  const std::string &target_signal = SessionSignalName(session, target_sig_id);
+  const uint32_t path_id = graph.ReadSignals()[target_sig_id].name_str_id;
+  const std::string_view target_signal = SessionSignalName(session, target_sig_id);
   const std::vector<uint32_t> source_sig_ids = SessionAssignmentLhsRefs(session, path_id);
   std::unordered_set<std::string> seen;
   for (uint32_t source_sig_id : source_sig_ids) {
@@ -119,11 +119,11 @@ TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
   std::unordered_set<std::string> stop_once;
   bool node_cap_hit = false;
 
-  auto record_stop = [&](const std::string &sig, const std::string &reason, const std::string &detail,
+  auto record_stop = [&](std::string_view sig, const std::string &reason, const std::string &detail,
                          size_t depth) {
-    const std::string key = reason + "\t" + sig + "\t" + detail;
+    const std::string key = reason + "\t" + std::string(sig) + "\t" + detail;
     if (!stop_once.insert(key).second) return;
-    result.stops.push_back(TraceStop{sig, reason, detail, depth});
+    result.stops.push_back(TraceStop{std::string(sig), reason, detail, depth});
   };
 
   auto endpoint_allowed = [&](const EndpointRecord &e) {
@@ -145,7 +145,7 @@ TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
       };
 
   walk_signal = [&](uint32_t sig_id, size_t depth, size_t cone_depth) {
-        const std::string &sig = SessionSignalName(session, sig_id);
+        const std::string_view sig = SessionSignalName(session, sig_id);
         if (depth > opts.depth_limit) {
           record_stop(sig, "depth_limit", "max-depth-reached", depth);
           return;
@@ -160,7 +160,7 @@ TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
           record_stop(sig, "cycle", "already-visited", depth);
           return;
         }
-        if (opts.stop_at_re.has_value() && std::regex_search(sig, *opts.stop_at_re)) {
+        if (opts.stop_at_re.has_value() && std::regex_search(sig.begin(), sig.end(), *opts.stop_at_re)) {
           record_stop(sig, "stop_at", "matched-stop-at-regex", depth);
           return;
         }
@@ -477,6 +477,7 @@ int RunTraceWithSession(TraceSession &session, const TraceOptions &parsed_opts) 
     return 1;
   }
   TraceOptions opts = *resolved;
+  BuildSessionReverseRefs(session);
   if (!LookupSignalId(session, opts.root_signal).has_value()) {
     std::cerr << "Signal not found: " << opts.root_signal << "\n";
     for (const std::string &s : TopSuggestions(session, opts.root_signal, 5)) {

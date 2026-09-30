@@ -58,6 +58,8 @@
 #include <string>
 #include <string_view>
 #include <sys/file.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/resource.h>
 #include <malloc.h>
 #include <map>
@@ -434,6 +436,70 @@ class ScopedFileLock {
   }
 
   int fd_ = -1;
+};
+
+// weakly_canonical does not resolve a final symlink whose target is missing.
+// Follow final symlinks first, then resolve the existing parent components.
+bool ResolveGraphDestination(const std::string &requested_path, std::filesystem::path &out) {
+  std::error_code ec;
+  auto path = std::filesystem::absolute(requested_path, ec);
+  if (ec) return false;
+  for (size_t links = 0; links < 40; ++links) {
+    const auto status = std::filesystem::symlink_status(path, ec);
+    if (ec && ec != std::errc::no_such_file_or_directory) return false;
+    if (!std::filesystem::is_symlink(status)) {
+      ec.clear();
+      out = std::filesystem::weakly_canonical(path, ec);
+      return !ec;
+    }
+    const auto target = std::filesystem::read_symlink(path, ec);
+    if (ec) return false;
+    path = target.is_absolute() ? target : path.parent_path() / target;
+  }
+  return false;
+}
+
+// Publication has a stable writer mutex, independent of the inode readers map.
+// Readers require no sidecar or directory write permission. The old inode remains
+// immutable for candidate writers. Concurrent legacy compile writers are unsupported.
+class AtomicGraphOutput {
+ public:
+  ~AtomicGraphOutput() { if (!temporary_.empty()) ::unlink(temporary_.c_str()); }
+  bool Prepare(const std::string &requested_path) {
+    std::filesystem::path destination;
+    if (!ResolveGraphDestination(requested_path, destination)) return false;
+    destination_ = destination.string();
+    if (!writer_lock_.Acquire(destination_ + ".lock")) return false;
+    struct stat old_stat;
+    const bool exists = ::stat(destination_.c_str(), &old_stat) == 0;
+    std::string pattern = destination_ + ".tmp.XXXXXX";
+    std::vector<char> name(pattern.begin(), pattern.end());
+    name.push_back('\0');
+    const int fd = ::mkstemp(name.data());
+    if (fd < 0) return false;
+    temporary_ = name.data();
+    // Preserve the destination mode. For a new DB, match ofstream's 0666/umask mode.
+    mode_t mode;
+    if (exists) mode = old_stat.st_mode & 0777;
+    else {
+      const mode_t mask = ::umask(0);
+      ::umask(mask);
+      mode = 0666 & ~mask;
+    }
+    const bool okay = ::fchmod(fd, mode) == 0;
+    ::close(fd);
+    return okay;
+  }
+  const std::string &TemporaryPath() const { return temporary_; }
+  bool Publish() {
+    if (::rename(temporary_.c_str(), destination_.c_str()) != 0) return false;
+    temporary_.clear();
+    return true;
+  }
+ private:
+  ScopedFileLock writer_lock_;
+  std::string destination_;
+  std::string temporary_;
 };
 
 // --- Compile-time forward declarations (defined later in this file) ---
@@ -1294,9 +1360,14 @@ uint32_t InternString(std::string_view sv, std::vector<std::string> &pool,
   return id;
 }
 
-const std::string &GraphString(const GraphDb &db, uint32_t id) {
-  static const std::string empty;
-  if (id >= db.strings.size()) return empty;
+std::string_view GraphString(const GraphDb &db, uint32_t id) {
+  if (db.mapping) {
+    if (id + uint64_t{1} >= db.mapped_string_offsets.size()) return {};
+    const uint32_t begin = db.mapped_string_offsets[id];
+    const uint32_t end = db.mapped_string_offsets[size_t(id) + 1];
+    return std::string_view(db.mapped_string_blob + begin, end - begin);
+  }
+  if (id >= db.strings.size()) return {};
   return db.strings[id];
 }
 
@@ -1556,7 +1627,7 @@ std::vector<std::string_view> ExtractCompactSinkPaths(const std::string &source,
     if (!e.lhs_signal_ids.empty()) {
       has_lhs_refs = true;
       for (uint32_t path_id : e.lhs_signal_ids) {
-        const std::string &path = GraphString(graph, path_id);
+        const std::string_view path = GraphString(graph, path_id);
         if (!path.empty()) sinks.push_back(path);
       }
     }
@@ -1967,8 +2038,8 @@ void InsertSortedUniqueString(std::vector<std::string> &paths, std::string value
 #ifndef NDEBUG
 bool AreSortedUniqueSignalIdsByPath(const std::vector<uint32_t> &signal_ids, const GraphDb &graph) {
   for (size_t i = 1; i < signal_ids.size(); ++i) {
-    const std::string &prev = GraphString(graph, signal_ids[i - 1]);
-    const std::string &cur = GraphString(graph, signal_ids[i]);
+    const std::string_view prev = GraphString(graph, signal_ids[i - 1]);
+    const std::string_view cur = GraphString(graph, signal_ids[i]);
     if (!(prev < cur)) return false;
   }
   return true;
@@ -3254,9 +3325,9 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
 
   LogMemPhase("SaveGraphDb:BeforeWrite");
   const auto t_write_start = Clock::now();
-  ScopedFileLock db_lock;
-  if (!db_lock.Acquire(db_path)) return false;
-  std::ofstream out(db_path, std::ios::binary | std::ios::trunc);
+  AtomicGraphOutput publication;
+  if (!publication.Prepare(db_path)) return false;
+  std::ofstream out(publication.TemporaryPath(), std::ios::binary | std::ios::trunc);
   if (!out.is_open()) return false;
   if (!WriteBinaryValue(out, header) || !WriteBinaryVector(out, string_offsets)) return false;
   for (const std::string &s : graph.strings) {
@@ -3285,6 +3356,8 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
   const uint64_t axis_count = graph.declared_axes.size();
   if (!WriteBinaryValue(out, coordinate_count) || !WriteBinaryVector(out, graph.coordinates) ||
       !WriteBinaryValue(out, axis_count) || !WriteBinaryVector(out, graph.declared_axes)) return false;
+  out.close();
+  if (out.fail() || !publication.Publish()) return false;
   const auto t_write_end = Clock::now();
   LogMemPhase("SaveGraphDb:AfterWrite");
   if (logger != nullptr) {
@@ -3322,212 +3395,189 @@ bool ValidateGraphDb(const GraphDb &graph) {
     if ((axis.flags & ~0x03u) || ((axis.flags & kAxisPacked) && !(axis.flags & kAxisFixed)) ||
         (!(axis.flags & kAxisFixed) && (axis.left != 0 || axis.right != 0))) return false;
   }
-  for (const GraphSignalRecord &gs : graph.signals) {
-    if (!ValidateGraphRange(gs.driver_begin, gs.driver_count, graph.endpoints.size())) return false;
-    if (!ValidateGraphRange(gs.load_begin, gs.load_count, graph.endpoints.size())) return false;
+  for (const GraphSignalRecord &gs : graph.ReadSignals()) {
+    if (!ValidateGraphRange(gs.driver_begin, gs.driver_count, graph.ReadEndpoints().size())) return false;
+    if (!ValidateGraphRange(gs.load_begin, gs.load_count, graph.ReadEndpoints().size())) return false;
   }
 
-  for (const GraphEndpointRecord &ge : graph.endpoints) {
-    if (!ValidateGraphRange(ge.lhs_begin, ge.lhs_count, graph.signal_refs.size())) return false;
-    if (!ValidateGraphRange(ge.rhs_begin, ge.rhs_count, graph.signal_refs.size())) return false;
+  for (const GraphEndpointRecord &ge : graph.ReadEndpoints()) {
+    if (!ValidateGraphRange(ge.lhs_begin, ge.lhs_count, graph.ReadSignalRefs().size())) return false;
+    if (!ValidateGraphRange(ge.rhs_begin, ge.rhs_count, graph.ReadSignalRefs().size())) return false;
   }
 
   auto validate_path_ref_ranges =
-      [&](const std::vector<GraphPathRefRange> &ranges, const std::vector<uint32_t> &flat_refs) {
+      [&](GraphPodView<GraphPathRefRange> ranges, GraphPodView<uint32_t> flat_refs) {
         for (const GraphPathRefRange &range : ranges) {
           if (!ValidateGraphRange(range.begin, range.count, flat_refs.size())) return false;
         }
         for (uint32_t sig_id : flat_refs) {
-          if (sig_id >= graph.signals.size()) return false;
+          if (sig_id >= graph.ReadSignals().size()) return false;
         }
         return true;
       };
 
-  if (!validate_path_ref_ranges(graph.load_ref_ranges, graph.load_ref_signal_ids)) return false;
-  if (!validate_path_ref_ranges(graph.driver_ref_ranges, graph.driver_ref_signal_ids)) return false;
-  if (!validate_path_ref_ranges(graph.assignment_lhs_ref_ranges, graph.assignment_lhs_ref_signal_ids)) return false;
+  if (!validate_path_ref_ranges(graph.ReadLoadRefRanges(), graph.ReadLoadRefSignalIds())) return false;
+  if (!validate_path_ref_ranges(graph.ReadDriverRefRanges(), graph.ReadDriverRefSignalIds())) return false;
+  if (!validate_path_ref_ranges(graph.ReadAssignmentLhsRefRanges(), graph.ReadAssignmentLhsRefSignalIds())) return false;
 
-  for (const GraphHierarchyRecord &gh : graph.hierarchy) {
-    if (!ValidateGraphRange(gh.child_begin, gh.child_count, graph.hierarchy_children.size())) return false;
+  for (const GraphHierarchyRecord &gh : graph.ReadHierarchy()) {
+    if (!ValidateGraphRange(gh.child_begin, gh.child_count, graph.ReadHierarchyChildren().size())) return false;
   }
 
-  for (const GraphPathRefRange &range : graph.hierarchy_param_ranges) {
-    if (!ValidateGraphRange(range.begin, range.count, graph.hierarchy_params.size())) return false;
+  for (const GraphPathRefRange &range : graph.ReadHierarchyParamRanges()) {
+    if (!ValidateGraphRange(range.begin, range.count, graph.ReadHierarchyParams().size())) return false;
   }
 
-  for (const GraphGlobalNetRecord &gg : graph.global_nets) {
-    if (!ValidateGraphRange(gg.sink_begin, gg.sink_count, graph.global_sinks.size())) return false;
+  for (const GraphGlobalNetRecord &gg : graph.ReadGlobalNets()) {
+    if (!ValidateGraphRange(gg.sink_begin, gg.sink_count, graph.ReadGlobalSinks().size())) return false;
   }
 
   return true;
 }
 
-bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db,
-                 std::string *error) {
-  if (error) *error = "Failed to read DB: " + db_path;
-  // A reused graph must not carry v6 declarations into a legacy load.
-  graph.coordinates.clear();
-  graph.declared_axes.clear();
-  ScopedFileLock db_lock;
-  if (!db_lock.AcquireShared(db_path)) return false;
+// Bounds are checked before any allocation or section access. No section is cast to T*.
+class GraphMappedReader {
+ public:
+  GraphMappedReader(const char *data, size_t length) : data_(data), length_(length) {}
+  template <typename T> bool ReadValue(T &value) {
+    const char *p = ReadBytes(sizeof(T));
+    if (p == nullptr) return false;
+    std::memcpy(&value, p, sizeof(T));
+    return true;
+  }
+  template <typename T> bool ReadView(GraphPodView<T> &view, uint64_t count) {
+    if (count > (length_ - position_) / sizeof(T)) return false;
+    const char *p = ReadBytes(static_cast<size_t>(count) * sizeof(T));
+    view = GraphPodView<T>(p, static_cast<size_t>(count));
+    return true;
+  }
+  const char *ReadBytes(uint64_t count) {
+    if (count > length_ - position_) return nullptr;
+    const char *p = data_ + position_;
+    position_ += static_cast<size_t>(count);
+    return p;
+  }
+ private:
+  const char *data_;
+  size_t length_;
+  size_t position_ = 0;
+};
 
-  std::ifstream in(db_path, std::ios::binary);
-  if (!in.is_open()) return false;
-
-  GraphDbFileHeader header;
-  if (!ReadBinaryValue(in, header)) return false;
-  if (std::memcmp(header.magic, kGraphDbMagic, sizeof(header.magic)) != 0) return false;
-  if (header.version != 1 && header.version != 2 && header.version != 3 && header.version != 4 &&
-      header.version != 5 && header.version != 6) {
-    if (error) *error = "unsupported DB version " + std::to_string(header.version) +
-                        " (this binary reads 1–6); recompile: " + db_path;
+bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db) {
+  // Lock the same fd that is mapped, for its lifetime. Atomic candidate writers
+  // replace this inode safely. This lease cannot make concurrent legacy compiles
+  // safe: legacy code can lock an old inode then reopen the newly renamed path.
+  const int fd = ::open(db_path.c_str(), O_RDONLY);
+  if (fd < 0) return false;
+  struct stat st;
+  if (::flock(fd, LOCK_SH) != 0 || ::fstat(fd, &st) != 0 ||
+      st.st_size < static_cast<off_t>(sizeof(GraphDbFileHeader)) ||
+      static_cast<uint64_t>(st.st_size) > std::numeric_limits<size_t>::max()) {
+    ::close(fd);
     return false;
   }
-  if (header.version == 6 && (!(header.reserved & kDbDeclaredAxes) ||
-                            (header.reserved & ~(kDbDeclaredAxes | kDbMemberDeclaredAxes)))) return false;
-
-  std::vector<uint32_t> string_offsets;
-  if (!ReadBinaryVector(in, string_offsets, static_cast<size_t>(header.string_count + 1))) return false;
-  std::string string_blob(header.string_blob_size, '\0');
-  if (header.string_blob_size != 0) {
-    in.read(string_blob.data(), static_cast<std::streamsize>(string_blob.size()));
-    if (!in.good()) return false;
+  const size_t length = static_cast<size_t>(st.st_size);
+  void *address = ::mmap(nullptr, length, PROT_READ, MAP_PRIVATE, fd, 0);
+  if (address == MAP_FAILED) { ::close(fd); return false; }
+  graph.mapping = std::shared_ptr<void>(address, [length, fd](void *p) {
+    ::munmap(p, length);
+    ::flock(fd, LOCK_UN);
+    ::close(fd);
+  });
+  GraphMappedReader in(static_cast<const char *>(address), length);
+  GraphDbFileHeader header;
+  if (!in.ReadValue(header) ||
+      std::memcmp(header.magic, kGraphDbMagic, sizeof(header.magic)) != 0 ||
+      header.version < 1 || header.version > 5 ||
+      header.string_count == std::numeric_limits<uint64_t>::max()) return false;
+  if (!in.ReadView(graph.mapped_string_offsets, header.string_count + 1)) return false;
+  graph.mapped_string_blob = in.ReadBytes(header.string_blob_size);
+  if (graph.mapped_string_blob == nullptr) return false;
+  for (size_t i = 0; i < header.string_count; ++i) {
+    const uint32_t start = graph.mapped_string_offsets[i];
+    const uint32_t end = graph.mapped_string_offsets[i + 1];
+    if (end < start || end > header.string_blob_size) return false;
   }
-  graph.strings.resize(static_cast<size_t>(header.string_count));
-  for (size_t i = 0; i < graph.strings.size(); ++i) {
-    const size_t start = string_offsets[i];
-    const size_t end = string_offsets[i + 1];
-    if (end < start || end > string_blob.size()) return false;
-    graph.strings[i] = string_blob.substr(start, end - start);
-  }
-
-  // Read signal records. v4 has 20-byte records (5 fields), v5 has 32-byte (8 fields).
   if (header.version <= 4) {
     struct GraphSignalRecordV4 {
       uint32_t name_str_id, driver_begin, driver_count, load_begin, load_count;
     };
-    std::vector<GraphSignalRecordV4> v4_signals;
-    if (!ReadBinaryVector(in, v4_signals, static_cast<size_t>(header.signal_count))) return false;
-    graph.signals.resize(v4_signals.size());
-    for (size_t i = 0; i < v4_signals.size(); ++i) {
-      graph.signals[i].name_str_id = v4_signals[i].name_str_id;
-      graph.signals[i].driver_begin = v4_signals[i].driver_begin;
-      graph.signals[i].driver_count = v4_signals[i].driver_count;
-      graph.signals[i].load_begin = v4_signals[i].load_begin;
-      graph.signals[i].load_count = v4_signals[i].load_count;
-      // parent_signal_id, member_bit_offset, member_bit_width stay at defaults (UINT32_MAX / 0)
+    GraphPodView<GraphSignalRecordV4> old_signals;
+    if (!in.ReadView(old_signals, header.signal_count)) return false;
+    graph.signals.reserve(old_signals.size());
+    for (const auto old : old_signals) {
+      GraphSignalRecord rec;
+      rec.name_str_id = old.name_str_id;
+      rec.driver_begin = old.driver_begin;
+      rec.driver_count = old.driver_count;
+      rec.load_begin = old.load_begin;
+      rec.load_count = old.load_count;
+      graph.signals.push_back(rec);
     }
-  } else {
-    if (!ReadBinaryVector(in, graph.signals, static_cast<size_t>(header.signal_count))) return false;
-  }
-  if (!ReadBinaryVector(in, graph.endpoints, static_cast<size_t>(header.endpoint_count)) ||
-      !ReadBinaryVector(in, graph.signal_refs, static_cast<size_t>(header.signal_ref_count)) ||
-      !ReadBinaryVector(in, graph.load_ref_ranges, static_cast<size_t>(header.load_ref_range_count)) ||
-      !ReadBinaryVector(in, graph.load_ref_signal_ids, static_cast<size_t>(header.load_ref_count)) ||
-      !ReadBinaryVector(in, graph.driver_ref_ranges, static_cast<size_t>(header.driver_ref_range_count)) ||
-      !ReadBinaryVector(in, graph.driver_ref_signal_ids, static_cast<size_t>(header.driver_ref_count))) {
+  } else if (!in.ReadView(graph.mapped_signals, header.signal_count)) return false;
+  if (!in.ReadView(graph.mapped_endpoints, header.endpoint_count) ||
+      !in.ReadView(graph.mapped_signal_refs, header.signal_ref_count) ||
+      !in.ReadView(graph.mapped_load_ref_ranges, header.load_ref_range_count) ||
+      !in.ReadView(graph.mapped_load_ref_signal_ids, header.load_ref_count) ||
+      !in.ReadView(graph.mapped_driver_ref_ranges, header.driver_ref_range_count) ||
+      !in.ReadView(graph.mapped_driver_ref_signal_ids, header.driver_ref_count)) return false;
+  if (header.version >= 2 &&
+      (!in.ReadView(graph.mapped_assignment_lhs_ref_ranges, header.assignment_lhs_ref_range_count) ||
+       !in.ReadView(graph.mapped_assignment_lhs_ref_signal_ids, header.assignment_lhs_ref_count)))
     return false;
-  }
-  if (header.version >= 2) {
-    if (!ReadBinaryVector(in, graph.assignment_lhs_ref_ranges,
-                          static_cast<size_t>(header.assignment_lhs_ref_range_count)) ||
-        !ReadBinaryVector(in, graph.assignment_lhs_ref_signal_ids,
-                          static_cast<size_t>(header.assignment_lhs_ref_count))) {
-      return false;
-    }
-  }
   if (header.version >= 3) {
-    if (!ReadBinaryVector(in, graph.hierarchy, static_cast<size_t>(header.hierarchy_count))) {
-      return false;
-    }
+    if (!in.ReadView(graph.mapped_hierarchy, header.hierarchy_count)) return false;
   } else {
-    std::vector<GraphHierarchyRecordV2> hierarchy_v2;
-    if (!ReadBinaryVector(in, hierarchy_v2, static_cast<size_t>(header.hierarchy_count))) {
-      return false;
-    }
-    graph.hierarchy.reserve(hierarchy_v2.size());
-    for (const GraphHierarchyRecordV2 &old_rec : hierarchy_v2) {
+    GraphPodView<GraphHierarchyRecordV2> old_hierarchy;
+    if (!in.ReadView(old_hierarchy, header.hierarchy_count)) return false;
+    graph.hierarchy.reserve(old_hierarchy.size());
+    for (const auto old : old_hierarchy) {
       GraphHierarchyRecord rec;
-      rec.path_str_id = old_rec.path_str_id;
-      rec.module_str_id = old_rec.module_str_id;
-      rec.child_begin = old_rec.child_begin;
-      rec.child_count = old_rec.child_count;
+      rec.path_str_id = old.path_str_id;
+      rec.module_str_id = old.module_str_id;
+      rec.child_begin = old.child_begin;
+      rec.child_count = old.child_count;
       graph.hierarchy.push_back(rec);
     }
   }
-  if (!ReadBinaryVector(in, graph.hierarchy_children, static_cast<size_t>(header.hierarchy_child_count)) ||
-      !ReadBinaryVector(in, graph.global_nets, static_cast<size_t>(header.global_net_count)) ||
-      !ReadBinaryVector(in, graph.global_sinks, static_cast<size_t>(header.global_sink_count))) {
-    return false;
-  }
+  if (!in.ReadView(graph.mapped_hierarchy_children, header.hierarchy_child_count) ||
+      !in.ReadView(graph.mapped_global_nets, header.global_net_count) ||
+      !in.ReadView(graph.mapped_global_sinks, header.global_sink_count)) return false;
   if (header.version >= 4) {
-    uint64_t hierarchy_param_range_count = 0;
-    uint64_t hierarchy_param_count = 0;
-    if (!ReadBinaryValue(in, hierarchy_param_range_count) ||
-        !ReadBinaryVector(in, graph.hierarchy_param_ranges,
-                          static_cast<size_t>(hierarchy_param_range_count)) ||
-        !ReadBinaryValue(in, hierarchy_param_count) ||
-        !ReadBinaryVector(in, graph.hierarchy_params,
-                          static_cast<size_t>(hierarchy_param_count))) {
+    uint64_t range_count, param_count;
+    if (!in.ReadValue(range_count) || !in.ReadView(graph.mapped_hierarchy_param_ranges, range_count) ||
+        !in.ReadValue(param_count) || !in.ReadView(graph.mapped_hierarchy_params, param_count))
       return false;
-    }
   }
-  if (header.version == 6) {
-    // Bound footer allocations by the actual remaining bytes before resizing.
-    auto read_footer_vector = [&]<typename T>(std::vector<T> &items, uint64_t maximum) {
-      uint64_t count = 0;
-      if (!ReadBinaryValue(in, count) || count > maximum) return false;
-      const auto cursor = in.tellg();
-      in.seekg(0, std::ios::end);
-      const auto end = in.tellg();
-      in.seekg(cursor);
-      if (cursor < 0 || end < cursor || count > static_cast<uint64_t>(end - cursor) / sizeof(T))
-        return false;
-      return ReadBinaryVector(in, items, static_cast<size_t>(count));
-    };
-    if (!read_footer_vector(graph.coordinates, header.signal_count) ||
-        !read_footer_vector(graph.declared_axes, std::numeric_limits<uint32_t>::max()) ||
-        in.peek() != std::char_traits<char>::eof() || in.bad()) return false;
-  }
+  // Preserve all prior content rejection rules, including unrelated sections. Mapped
+  // sections avoid copies; command-specific indexes and compat maps are built later.
   if (!ValidateGraphDb(graph)) return false;
-
   compat_db.db_dir = std::filesystem::path(db_path).parent_path().string();
   compat_db.format_version = header.version;
   compat_db.member_declared_axes_verified = header.version == 6 && (header.reserved & kDbMemberDeclaredAxes);
-  compat_db.signals.clear();
-  compat_db.hierarchy.clear();
-  compat_db.global_nets.clear();
-  compat_db.global_sink_to_source.clear();
+  return true;
+}
 
-  graph.load_ref_index.clear();
-  graph.driver_ref_index.clear();
-  graph.assignment_lhs_ref_index.clear();
-  for (size_t i = 0; i < graph.load_ref_ranges.size(); ++i)
-    graph.load_ref_index.emplace(graph.load_ref_ranges[i].path_str_id, i);
-  for (size_t i = 0; i < graph.driver_ref_ranges.size(); ++i)
-    graph.driver_ref_index.emplace(graph.driver_ref_ranges[i].path_str_id, i);
-  for (size_t i = 0; i < graph.assignment_lhs_ref_ranges.size(); ++i)
-    graph.assignment_lhs_ref_index.emplace(graph.assignment_lhs_ref_ranges[i].path_str_id, i);
-
+void MaterializeGraphHierarchy(TraceSession &session) {
+  const GraphDb &graph = *session.graph;
+  TraceDb &compat_db = session.db;
   slang::flat_hash_map<uint32_t, size_t> hierarchy_param_index;
-  hierarchy_param_index.reserve(graph.hierarchy_param_ranges.size());
-  for (size_t i = 0; i < graph.hierarchy_param_ranges.size(); ++i)
-    hierarchy_param_index.emplace(graph.hierarchy_param_ranges[i].path_str_id, i);
-
-  for (const GraphHierarchyRecord &gh : graph.hierarchy) {
-    const std::string &path = GraphString(graph, gh.path_str_id);
-    auto &node = compat_db.hierarchy[path];
+  hierarchy_param_index.reserve(graph.ReadHierarchyParamRanges().size());
+  for (size_t i = 0; i < graph.ReadHierarchyParamRanges().size(); ++i)
+    hierarchy_param_index.emplace(graph.ReadHierarchyParamRanges()[i].path_str_id, i);
+  for (const GraphHierarchyRecord gh : graph.ReadHierarchy()) {
+    auto &node = compat_db.hierarchy[std::string(GraphString(graph, gh.path_str_id))];
     node.module = GraphString(graph, gh.module_str_id);
-    if (header.version >= 3 && gh.file_str_id != std::numeric_limits<uint32_t>::max()) {
+    if (compat_db.format_version >= 3 && gh.file_str_id != std::numeric_limits<uint32_t>::max()) {
       node.source_file = GraphString(graph, gh.file_str_id);
       node.source_line = gh.line;
     }
     auto param_it = hierarchy_param_index.find(gh.path_str_id);
     if (param_it != hierarchy_param_index.end()) {
-      const GraphPathRefRange &range = graph.hierarchy_param_ranges[param_it->second];
+      const auto range = graph.ReadHierarchyParamRanges()[param_it->second];
       node.parameters.reserve(range.count);
       for (uint32_t i = 0; i < range.count; ++i) {
-        const GraphInstanceParamRecord &gp = graph.hierarchy_params[range.begin + i];
+        const auto gp = graph.ReadHierarchyParams()[range.begin + i];
         InstanceParameterRecord param;
         param.name = GraphString(graph, gp.name_str_id);
         param.value = GraphString(graph, gp.value_str_id);
@@ -3540,20 +3590,24 @@ bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db,
     }
     node.children.reserve(gh.child_count);
     for (uint32_t i = 0; i < gh.child_count; ++i)
-      node.children.push_back(GraphString(graph, graph.hierarchy_children[gh.child_begin + i]));
+      node.children.emplace_back(GraphString(graph, graph.ReadHierarchyChildren()[gh.child_begin + i]));
   }
-  for (const GraphGlobalNetRecord &gg : graph.global_nets) {
-    const std::string &source = GraphString(graph, gg.source_path_str_id);
+}
+
+void MaterializeGraphGlobalNets(TraceSession &session) {
+  const GraphDb &graph = *session.graph;
+  TraceDb &compat_db = session.db;
+  for (const GraphGlobalNetRecord gg : graph.ReadGlobalNets()) {
+    const std::string source(GraphString(graph, gg.source_path_str_id));
     auto &rec = compat_db.global_nets[source];
     rec.category = GraphString(graph, gg.category_str_id);
     rec.sinks.reserve(gg.sink_count);
     for (uint32_t i = 0; i < gg.sink_count; ++i) {
-      const std::string &sink = GraphString(graph, graph.global_sinks[gg.sink_begin + i]);
+      const std::string sink(GraphString(graph, graph.ReadGlobalSinks()[gg.sink_begin + i]));
       rec.sinks.push_back(sink);
       compat_db.global_sink_to_source[sink] = source;
     }
   }
-  return true;
 }
 
 std::string StatMtimeString(const std::string &path) {
@@ -3563,29 +3617,45 @@ std::string StatMtimeString(const std::string &path) {
   return std::to_string(ts.time_since_epoch().count());
 }
 
+void BuildSessionSignalNames(TraceSession &session) {
+  if (session.signal_names_ready) return;
+  const GraphDb &graph = *session.graph;
+  session.signal_names_by_id.reserve(graph.ReadSignals().size());
+  for (const auto signal : graph.ReadSignals())
+    session.signal_names_by_id.push_back(GraphString(graph, signal.name_str_id));
+  session.signal_names_ready = true;
+}
+
 void BuildSessionSignalIndex(TraceSession &session) {
   if (session.signal_index_ready) return;
-  session.signal_name_to_id.clear();
-  session.signal_names_by_id.clear();
-  GraphDb &graph = *session.graph;
-  session.signal_name_to_id.reserve(graph.signals.size());
-  session.signal_names_by_id.reserve(graph.signals.size());
-  for (uint32_t i = 0; i < graph.signals.size(); ++i) {
-    const std::string &name = GraphString(graph, graph.signals[i].name_str_id);
-    session.signal_name_to_id.emplace(std::string_view(name), i);
-    session.signal_names_by_id.push_back(&name);
-  }
+  BuildSessionSignalNames(session);
+  session.signal_name_to_id.reserve(session.signal_names_by_id.size());
+  for (uint32_t i = 0; i < session.signal_names_by_id.size(); ++i)
+    session.signal_name_to_id.emplace(session.signal_names_by_id[i], i);
   session.signal_index_ready = true;
 }
 
 void EnsureSessionHierarchy(TraceSession &session) {
   if (session.hierarchy_ready) return;
+  MaterializeGraphHierarchy(session);
   BuildHierarchyFromSignals(session.db);
   session.hierarchy_ready = true;
 }
 
 void BuildSessionReverseRefs(TraceSession &session) {
   if (session.reverse_refs_ready) return;
+  BuildSessionSignalIndex(session);
+  GraphDb &graph = *session.graph;
+  graph.load_ref_index.reserve(graph.ReadLoadRefRanges().size());
+  graph.driver_ref_index.reserve(graph.ReadDriverRefRanges().size());
+  graph.assignment_lhs_ref_index.reserve(graph.ReadAssignmentLhsRefRanges().size());
+  for (size_t i = 0; i < graph.ReadLoadRefRanges().size(); ++i)
+    graph.load_ref_index.emplace(graph.ReadLoadRefRanges()[i].path_str_id, i);
+  for (size_t i = 0; i < graph.ReadDriverRefRanges().size(); ++i)
+    graph.driver_ref_index.emplace(graph.ReadDriverRefRanges()[i].path_str_id, i);
+  for (size_t i = 0; i < graph.ReadAssignmentLhsRefRanges().size(); ++i)
+    graph.assignment_lhs_ref_index.emplace(graph.ReadAssignmentLhsRefRanges()[i].path_str_id, i);
+  MaterializeGraphGlobalNets(session);
   session.reverse_refs_ready = true;
 }
 
@@ -3597,10 +3667,10 @@ bool OpenTraceSession(const std::string &db_path, TraceSession &session, uint32_
   GraphDb graph;
   if (!LoadGraphDb(db_path, graph, fresh.db, error)) return false;
   fresh.graph = std::move(graph);
+  if (flags & kSessionSignals) BuildSessionSignalNames(fresh);
+  if (flags & kSessionHierarchy) EnsureSessionHierarchy(fresh);
+  if (flags & kSessionReverseRefs) BuildSessionReverseRefs(fresh);
   session = std::move(fresh);
-  BuildSessionSignalIndex(session);
-  if (flags & kSessionHierarchy) EnsureSessionHierarchy(session);
-  if (flags & kSessionReverseRefs) BuildSessionReverseRefs(session);
   return true;
 }
 
@@ -3610,9 +3680,9 @@ std::optional<uint32_t> LookupSignalId(const TraceSession &session, std::string_
   return it->second;
 }
 
-const std::string &SessionSignalName(const TraceSession &session, uint32_t id) {
+std::string_view SessionSignalName(const TraceSession &session, uint32_t id) {
   if (id >= session.signal_names_by_id.size()) throw std::out_of_range("invalid signal id");
-  return *session.signal_names_by_id[id];
+  return session.signal_names_by_id[id];
 }
 
 bool EndpointMatchesParentStructBits(const TraceSession &session, const EndpointRecord &e,
@@ -3642,11 +3712,11 @@ bool EndpointMatchesParentStructBits(const TraceSession &session, const Endpoint
 }
 
 const SignalRecord &SessionSignalRecord(TraceSession &session, uint32_t id) {
-  if (id >= session.graph->signals.size()) throw std::out_of_range("invalid signal id");
+  if (id >= session.graph->ReadSignals().size()) throw std::out_of_range("invalid signal id");
   auto cached = session.materialized_signal_records.find(id);
   if (cached != session.materialized_signal_records.end()) return cached->second;
   const GraphDb &graph = *session.graph;
-  const GraphSignalRecord &gs = graph.signals[id];
+  const GraphSignalRecord &gs = graph.ReadSignals()[id];
 
   // Level 2: struct member signals derive endpoints from parent by bit-range filtering
   if (gs.parent_signal_id != std::numeric_limits<uint32_t>::max()) {
@@ -3681,18 +3751,18 @@ const SignalRecord &SessionSignalRecord(TraceSession &session, uint32_t id) {
     e.assignment_end = ge.assignment_end;
     e.lhs_signals.reserve(ge.lhs_count);
     for (uint32_t i = 0; i < ge.lhs_count; ++i)
-      e.lhs_signals.push_back(GraphString(graph, graph.signal_refs[ge.lhs_begin + i]));
+      e.lhs_signals.emplace_back(GraphString(graph, graph.ReadSignalRefs()[ge.lhs_begin + i]));
     e.rhs_signals.reserve(ge.rhs_count);
     for (uint32_t i = 0; i < ge.rhs_count; ++i)
-      e.rhs_signals.push_back(GraphString(graph, graph.signal_refs[ge.rhs_begin + i]));
+      e.rhs_signals.emplace_back(GraphString(graph, graph.ReadSignalRefs()[ge.rhs_begin + i]));
     return e;
   };
   rec.drivers.reserve(gs.driver_count);
   for (uint32_t i = 0; i < gs.driver_count; ++i)
-    rec.drivers.push_back(materialize_endpoint(graph.endpoints[gs.driver_begin + i]));
+    rec.drivers.push_back(materialize_endpoint(graph.ReadEndpoints()[gs.driver_begin + i]));
   rec.loads.reserve(gs.load_count);
   for (uint32_t i = 0; i < gs.load_count; ++i)
-    rec.loads.push_back(materialize_endpoint(graph.endpoints[gs.load_begin + i]));
+    rec.loads.push_back(materialize_endpoint(graph.ReadEndpoints()[gs.load_begin + i]));
   return session.materialized_signal_records.emplace(id, std::move(rec)).first->second;
 }
 
@@ -3700,8 +3770,8 @@ std::vector<uint32_t> SessionBridgeRefs(const TraceSession &session, bool use_lo
                                         uint32_t path_id) {
   const GraphDb &graph = *session.graph;
   const auto &index = use_load_refs ? graph.load_ref_index : graph.driver_ref_index;
-  const auto &ranges = use_load_refs ? graph.load_ref_ranges : graph.driver_ref_ranges;
-  const auto &flat = use_load_refs ? graph.load_ref_signal_ids : graph.driver_ref_signal_ids;
+  const auto &ranges = use_load_refs ? graph.ReadLoadRefRanges() : graph.ReadDriverRefRanges();
+  const auto &flat = use_load_refs ? graph.ReadLoadRefSignalIds() : graph.ReadDriverRefSignalIds();
   auto it = index.find(path_id);
   if (it == index.end()) return {};
   const GraphPathRefRange &range = ranges[it->second];
@@ -3715,8 +3785,8 @@ std::vector<uint32_t> SessionAssignmentLhsRefs(const TraceSession &session, uint
   const GraphDb &graph = *session.graph;
   const auto it = graph.assignment_lhs_ref_index.find(path_id);
   if (it == graph.assignment_lhs_ref_index.end()) return {};
-  const GraphPathRefRange &range = graph.assignment_lhs_ref_ranges[it->second];
-  const auto &flat = graph.assignment_lhs_ref_signal_ids;
+  const GraphPathRefRange &range = graph.ReadAssignmentLhsRefRanges()[it->second];
+  const auto &flat = graph.ReadAssignmentLhsRefSignalIds();
   if (!ValidateGraphRange(range.begin, range.count, flat.size())) {
     throw std::out_of_range("invalid assignment-lhs range");
   }
@@ -4021,7 +4091,7 @@ size_t EditDistance(const std::string &a, const std::string &b) {
 
 // Levenshtein distance identical to EditDistance() whenever the result is <= bound; otherwise
 // returns some value > bound. `prev`/`cur` are caller-provided scratch rows (reused across calls).
-static size_t BoundedEditDistance(const std::string &a, const std::string &b, size_t bound,
+static size_t BoundedEditDistance(std::string_view a, std::string_view b, size_t bound,
                                   std::vector<size_t> &prev, std::vector<size_t> &cur) {
   const size_t diff = a.size() > b.size() ? a.size() - b.size() : b.size() - a.size();
   if (diff > bound) return diff;
@@ -4238,19 +4308,19 @@ std::vector<std::string> TopSuggestions(const TraceSession &session, const std::
   // were scored and fully sorted — computed with a parallel bounded top-k. Once a worker holds
   // `keep` candidates, names that cannot beat its current worst are rejected early via a
   // bounded edit distance (exact whenever the distance is <= the bound).
-  using Scored = std::pair<size_t, const std::string *>;
+  using Scored = std::pair<size_t, std::string_view>;
   auto scored_less = [](const Scored &a, const Scored &b) {
     if (a.first != b.first) return a.first < b.first;
-    return *a.second < *b.second;
+    return a.second < b.second;
   };
   using Collector = TopKCollector<Scored, decltype(scored_less)>;
   const size_t keep = std::max<size_t>(limit, 1);
-  const std::vector<const std::string *> &names = session.signal_names_by_id;
+  const std::vector<std::string_view> &names = session.signal_names_by_id;
   const std::vector<Scored> top = ParallelTopK<Scored>(
       names.size(), keep, scored_less, [&](size_t begin, size_t end, Collector &out) {
         std::vector<size_t> prev, cur;
         for (size_t i = begin; i < end; ++i) {
-          const std::string &name = *names[i];
+          const std::string_view name = names[i];
           const size_t bound = out.Full() ? out.Worst().first : std::numeric_limits<size_t>::max();
           const size_t d = BoundedEditDistance(name, needle, bound, prev, cur);
           if (d <= bound) out.Push({d, names[i]});
@@ -4258,7 +4328,7 @@ std::vector<std::string> TopSuggestions(const TraceSession &session, const std::
       });
   std::vector<std::string> out;
   out.reserve(top.size());
-  for (const Scored &p : top) out.push_back(*p.second);
+  for (const Scored &p : top) out.emplace_back(p.second);
   return out;
 }
 

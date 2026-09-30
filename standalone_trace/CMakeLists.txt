@@ -123,3 +123,14 @@ add_test(
           --source-dir ${CMAKE_CURRENT_SOURCE_DIR}
           ${RTL_TRACE_PARENT_ARGS}
 )
+add_test(
+  NAME graph_db_mapping_regression
+  COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/graph_db_mapping_regression.py
+          --rtl-trace $<TARGET_FILE:rtl_trace>
+)
+
+add_executable(graph_pod_view_test tests/graph_pod_view_test.cc)
+target_include_directories(graph_pod_view_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(graph_pod_view_test PRIVATE slang::slang)
+add_test(NAME graph_pod_view_test COMMAND graph_pod_view_test)
