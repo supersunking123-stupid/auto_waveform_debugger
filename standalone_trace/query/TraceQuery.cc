@@ -91,6 +91,9 @@ TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
   TraceRunResult result;
 
   const bool is_drivers_mode = (opts.mode == "drivers");
+  const auto root_id = LookupSignalId(session, opts.root_signal);
+  const bool root_is_member = root_id && session.graph->signals[*root_id].parent_signal_id !=
+                                             std::numeric_limits<uint32_t>::max();
   std::vector<EndpointRecord> logic_endpoints;
   std::vector<EndpointRecord> unresolved_ports;
   std::unordered_set<std::string> seen_logic;
@@ -166,7 +169,14 @@ TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
               continue;
             }
             const std::string key = EndpointKey(db, e);
-            if (seen_logic.insert(key).second) logic_endpoints.push_back(e);
+            // Dedup uses the original bitmap. Routing also keeps the original record;
+            // only the root's owning output copy may show a narrowed merged range.
+            // Port projections and fallback drivers can carry a different signal's
+            // coordinates even when stored or presented on the root record.
+            if (seen_logic.insert(key).second)
+              logic_endpoints.push_back(sig == opts.root_signal && e_path == sig && active_edges == &edges
+                                            ? ClipRootMergedEndpointCopy(e, opts, root_is_member)
+                                            : e);
             if (cone_depth + 1 < opts.cone_level) {
               const std::vector<std::string> &next_signals =
                   is_drivers_mode ? e.rhs_signals : e.lhs_signals;

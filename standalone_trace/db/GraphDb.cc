@@ -1383,6 +1383,7 @@ struct EndpointMergeKey {
            a.assignment_start == b.assignment_start && a.assignment_end == b.assignment_end &&
            a.path == b.path && a.file == b.file && a.direction == b.direction &&
            a.assignment_text == b.assignment_text && a.bit_map_logical_axes == b.bit_map_logical_axes &&
+           a.bit_map_merged == b.bit_map_merged &&
            a.lhs_signal_ids == b.lhs_signal_ids &&
            a.rhs_signal_ids == b.rhs_signal_ids && a.lhs_signals == b.lhs_signals &&
            a.rhs_signals == b.rhs_signals;
@@ -1475,6 +1476,8 @@ void MergeEndpointBitRangesInPlace(std::vector<EndpointRecord> &endpoints, Endpo
       if (items[k].index != first_index) dropped[items[k].index] = 1;
     }
     any_dropped = true;
+    // Grouping is complete: provenance can now change without invalidating key lookups.
+    endpoints[first_index].bit_map_merged = true;
     // Keep the source's range direction when every multi-bit member used [lo:hi].
     endpoints[first_index].bit_map = (any_ascending && !any_descending && cur_lo != cur_hi)
                                          ? "[" + std::to_string(cur_lo) + ":" + std::to_string(cur_hi) + "]"
@@ -2553,7 +2556,8 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
     append_signal_refs(e.rhs_signal_ids, e.rhs_signals, ge.rhs_begin, ge.rhs_count);
     ge.kind = (e.kind == EndpointKind::kPort) ? 1u : 0u;
     ge.bit_map_approximate = e.bit_map_approximate ? 1u : 0u;
-    ge.reserved = e.bit_map_logical_axes ? kEndpointLogicalAxes : 0u;
+    ge.reserved = (e.bit_map_logical_axes ? kEndpointLogicalAxes : 0u) |
+                  (e.bit_map_merged ? kEndpointMergedRange : 0u);
     ge.has_assignment_range = e.has_assignment_range ? 1u : 0u;
     graph.endpoints.push_back(ge);
   };
@@ -3488,6 +3492,7 @@ const SignalRecord &SessionSignalRecord(TraceSession &session, uint32_t id) {
     e.bit_map = GraphString(graph, ge.bit_map_str_id);
     e.bit_map_approximate = (ge.bit_map_approximate != 0);
     e.bit_map_logical_axes = (ge.reserved & kEndpointLogicalAxes) != 0;
+    e.bit_map_merged = (ge.reserved & kEndpointMergedRange) != 0;
     e.has_assignment_range = (ge.has_assignment_range != 0);
     e.assignment_start = ge.assignment_start;
     e.assignment_end = ge.assignment_end;
@@ -3789,6 +3794,25 @@ bool EndpointMatchesSignalAxes(const EndpointRecord &e,
   return true;
 }
 
+EndpointRecord ClipRootMergedEndpointCopy(const EndpointRecord &e, const TraceOptions &opts,
+                                         bool root_is_member) {
+  EndpointRecord copy = e;
+  // Tagged logical axes and member-local selectors use different coordinate spaces.
+  // Keep those displays conservative until a precise conversion is available.
+  if (!e.bit_map_merged || e.bit_map_approximate || e.bit_map_logical_axes || root_is_member ||
+      e.kind == EndpointKind::kPort || opts.signal_select_axes.size() != 1) return copy;
+  const auto endpoint = ParseExactBitMapText(e.bit_map);
+  if (!endpoint) return copy;
+  const auto &query = opts.signal_select_axes.front();
+  const int32_t lo = std::max(std::min(endpoint->first, endpoint->second),
+                              std::min(query.first, query.second));
+  const int32_t hi = std::min(std::max(endpoint->first, endpoint->second),
+                              std::max(query.first, query.second));
+  if (lo > hi) return copy;  // The walker normally filters a disjoint endpoint first.
+  copy.bit_map = endpoint->first < endpoint->second ? FormatBitRange(lo, hi) : FormatBitRange(hi, lo);
+  return copy;
+}
+
 std::string EndpointKey(const TraceDb &db, const EndpointRecord &e) {
   return std::to_string(static_cast<int>(e.kind)) + "\t" + EndpointPath(db, e) + "\t" +
          EndpointFile(db, e) + "\t" + std::to_string(e.line) + "\t" + e.direction + "\t" +
@@ -3911,7 +3935,8 @@ bool ParseDefinesPlus(std::string_view tok, std::vector<std::string> &out) {
 // never reuses a DB built with older semantics. .meta files without a SEMANTICS_EPOCH line are
 // epoch 1. Epoch 2: endpoint bit-range merge fix (66c78ff).
 // Epoch 3: logical declared-axis metadata for multidimensional selectors (E4b).
-constexpr int kCompileSemanticsEpoch = 3;
+// Epoch 4: persist merged-range provenance for root-only display narrowing (E4c).
+constexpr int kCompileSemanticsEpoch = 4;
 
 std::string ComputeCompileFingerprint(const std::vector<std::string> &passthrough_args) {
   std::vector<std::string> parts;

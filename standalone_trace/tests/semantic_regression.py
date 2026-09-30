@@ -1061,9 +1061,9 @@ def main():
                 f"endpoint merge must preserve logical multi-dimensional selects: expected {expected_m_loads}, "
                 f"got {m_loads}"
             )
-        # A bit query returns the merged endpoint (its range covers the selected bit).
+        # A root bit query narrows each merged output copy to the selected bit.
         a2_loads = merge_bit_maps("loads", "endpoint_merge.a[2]")
-        if a2_loads != [(16, "[3:0]"), (20, "[3:0]")]:
+        if a2_loads != [(16, "[2]"), (20, "[2]")]:
             raise AssertionError(f"endpoint merge (a[2] loads): got {a2_loads}")
         # ===== BEGIN find_fastpath tests (parallel top-k find / literal prefilter / suggestions) =====
         run_find_fastpath_tests(rtl_trace, db, tmpdir)
