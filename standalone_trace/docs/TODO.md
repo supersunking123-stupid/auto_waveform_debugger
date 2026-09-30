@@ -205,8 +205,6 @@ default against `=0`).
     investigated.
   - Multi-dimensional bit_maps are written inner-select-first (`m[1][0]` stored as `[0][7:4]`),
     and the query-side bit filter reads only the first bracket.
-  - `--incremental` does not fingerprint the binary, so a DB built before the merge fix is reused
-    until a source file or argument changes; rebuild existing DBs once.
 
 ## Done / dropped
 
@@ -255,3 +253,7 @@ default against `=0`).
   Python re-implementation on all 7.6M Lumion lists and tc01–tc15. Test 31 and
   `tests/fixtures/endpoint_merge.sv` updated. Agent-visible effect: per-bit assignments and
   generate loops show as one range (`bits [7:0]` instead of eight endpoints).
+- `--incremental` no longer reuses DBs built with older compile semantics: the compile fingerprint
+  carries a `SEMANTICS_EPOCH` line (now 2, bumped for the endpoint-merge fix), and a `.meta` without
+  it or with an older epoch triggers a full rebuild (f8cd024). Bump `kCompileSemanticsEpoch` in
+  `db/GraphDb.cc` whenever the same sources and arguments start producing a different DB.
