@@ -7,11 +7,18 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Source VCS environment (if available)
+# Source VCS environment only if the site setup script exists; otherwise rely
+# on vcs already being on PATH (VCS steps are skipped when it is not).
 if [ -f ~/my_env/vcs.bash ]; then
     source ~/my_env/vcs.bash
-    echo "[VCS] Running VCS compilation for syntax check..."
-    vcs -full64 -f files.f -top multi_level_generate_top -l vcs.log -sverilog && echo "VCS compilation passed!" || echo "VCS not available, skipping..."
+fi
+
+# VCS compilation for syntax check
+echo "[VCS] Running VCS compilation for syntax check..."
+if command -v vcs >/dev/null 2>&1; then
+    vcs -full64 -f files.f -top multi_level_generate_top -l vcs.log -sverilog && echo "VCS compilation passed!" || echo "VCS compilation FAILED!"
+else
+    echo "vcs not found on PATH, skipping VCS compilation step..."
 fi
 
 RTL_TRACE="${RTL_TRACE:-$(cd "$SCRIPT_DIR/../.." && pwd)/standalone_trace/build/rtl_trace}"

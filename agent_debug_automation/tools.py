@@ -259,7 +259,7 @@ def list_signals(
     If vcd_path is omitted, the active Session selects the waveform file.
     Default behavior lists only signals declared in the waveform's top module.
     Pass `pattern="*"` to enumerate the full namespace, or a narrower
-    wildcard such as `top.nvdla_top.nvdla_core2cvsram_ar_*`.
+    wildcard such as `top.u_core.axi_ar_*`.
     `types` may include any combination of `input`, `output`, `inout`,
     `net`, and `register`.
     """

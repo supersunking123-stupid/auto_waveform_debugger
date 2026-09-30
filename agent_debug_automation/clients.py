@@ -4,6 +4,7 @@ import atexit
 import json
 import os
 import queue
+import select
 import shlex
 import subprocess
 import threading
@@ -149,7 +150,35 @@ class RtlTraceServeSession:
             if s.strip() == "<<END>>":
                 break
             out_lines.append(s)
-        return {"status": "success", "stdout": "".join(out_lines)}
+        result: Dict[str, Any] = {"status": "success", "stdout": "".join(out_lines)}
+        # serve reports per-query errors (bad regex, unknown signal, ...) on stderr and still
+        # terminates the response with <<END>>; surface them instead of returning empty stdout.
+        err = self._drain_stderr()
+        if err:
+            result["stderr"] = err
+        return result
+
+    def _drain_stderr(self) -> str:
+        """Non-blocking read of whatever serve has already written to stderr.
+
+        serve writes a query's diagnostics to stderr before it flushes <<END>> to stdout, so
+        once <<END>> has been read they are already in the pipe. Reads the raw fd (the text
+        wrapper is only used after the process exits) so the pipe cannot fill up and block serve.
+        """
+        stream = self.process.stderr
+        if stream is None:
+            return ""
+        chunks: List[bytes] = []
+        try:
+            fd = stream.fileno()
+            while select.select([fd], [], [], 0)[0]:
+                data = os.read(fd, 65536)
+                if not data:
+                    break
+                chunks.append(data)
+        except (OSError, ValueError):
+            pass
+        return b"".join(chunks).decode("utf-8", errors="replace")
 
     def query(self, line: str) -> Dict[str, Any]:
         with self._query_lock:
@@ -255,7 +284,9 @@ def _rtl_trace_json(
 
     stdout = result.get("stdout", "").strip()
     if not stdout:
-        return {"status": "error", "message": "rtl_trace returned empty output"}
+        detail = str(result.get("stderr", "")).strip()
+        message = f"rtl_trace error: {detail}" if detail else "rtl_trace returned empty output"
+        return {"status": "error", "message": message}
     try:
         payload = json.loads(stdout)
     except json.JSONDecodeError as e:

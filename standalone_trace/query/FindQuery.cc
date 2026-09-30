@@ -1,5 +1,6 @@
 // FindQuery.cc — Find query subcommand implementation.
 #include "query/FindQuery.h"
+#include "query/TraceQuery.h"
 #include "db/EntryPoints.h"
 #include "db/GraphDbTypes.h"
 #include "db/GraphDbInternals.h"
@@ -57,6 +58,11 @@ ParseStatus ParseFindArgs(const std::vector<std::string> &args, std::optional<st
   if ((require_db && (db_path == nullptr || !db_path->has_value())) || opts.query.empty()) {
     return std::cerr << "Missing required args: " << (require_db ? "--db " : "") << "--query\n",
            ParseStatus::kError;
+  }
+  // Validate at parse time so a malformed pattern is a reported error, not a std::regex_error
+  // abort (also keeps `serve` alive). RunFindWithSession recompiles the already-valid pattern.
+  if (opts.regex_mode && !CompileUserRegex("--query (--regex)", opts.query, nullptr)) {
+    return ParseStatus::kError;
   }
   return ParseStatus::kOk;
 }

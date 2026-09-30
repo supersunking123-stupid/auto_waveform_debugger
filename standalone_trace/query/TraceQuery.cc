@@ -12,6 +12,17 @@
 
 namespace rtl_trace {
 
+bool CompileUserRegex(const char *option, const std::string &pattern, std::regex *out) {
+  try {
+    std::regex compiled(pattern);
+    if (out != nullptr) *out = std::move(compiled);
+    return true;
+  } catch (const std::regex_error &e) {
+    std::cerr << "Invalid regex for " << option << ": '" << pattern << "' (" << e.what() << ")\n";
+    return false;
+  }
+}
+
 std::vector<EndpointRecord> FindFallbackDriverEndpoints(TraceSession &session, uint32_t target_sig_id) {
   std::vector<EndpointRecord> out;
   if (!session.graph.has_value()) return out;
@@ -338,7 +349,9 @@ ParseStatus ParseTraceArgs(const std::vector<std::string> &args, std::optional<s
         std::cerr << "Missing value for --include\n";
         return ParseStatus::kError;
       }
-      opts.include_re = std::regex(args[++i]);
+      std::regex re;
+      if (!CompileUserRegex("--include", args[++i], &re)) return ParseStatus::kError;
+      opts.include_re = std::move(re);
       continue;
     }
     if (arg == "--exclude") {
@@ -346,7 +359,9 @@ ParseStatus ParseTraceArgs(const std::vector<std::string> &args, std::optional<s
         std::cerr << "Missing value for --exclude\n";
         return ParseStatus::kError;
       }
-      opts.exclude_re = std::regex(args[++i]);
+      std::regex re;
+      if (!CompileUserRegex("--exclude", args[++i], &re)) return ParseStatus::kError;
+      opts.exclude_re = std::move(re);
       continue;
     }
     if (arg == "--stop-at") {
@@ -354,7 +369,9 @@ ParseStatus ParseTraceArgs(const std::vector<std::string> &args, std::optional<s
         std::cerr << "Missing value for --stop-at\n";
         return ParseStatus::kError;
       }
-      opts.stop_at_re = std::regex(args[++i]);
+      std::regex re;
+      if (!CompileUserRegex("--stop-at", args[++i], &re)) return ParseStatus::kError;
+      opts.stop_at_re = std::move(re);
       continue;
     }
     if (arg == "--format") {

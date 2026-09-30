@@ -1027,17 +1027,137 @@ def main():
         # ===== BEGIN find_fastpath tests (parallel top-k find / literal prefilter / suggestions) =====
         run_find_fastpath_tests(rtl_trace, db, tmpdir)
         # ===== END find_fastpath tests =====
+        # ===== BEGIN invalid_regex tests =====
+        run_invalid_regex_tests(rtl_trace, db)
+        # ===== END invalid_regex tests =====
 
         print("semantic_regression: PASS")
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+# ===== BEGIN invalid_regex tests =====
+# A malformed user regex (find --regex, trace --include/--exclude/--stop-at) must be reported as
+# an argument error: non-zero exit without a crash (no abort/core dump), a clear message naming
+# the option and pattern, and nothing on stdout. `serve` must survive it and keep answering.
+
+def _assert_regex_rejected(proc, option, pattern, label):
+    if proc.returncode == 0:
+        raise AssertionError(f"[{label}] invalid regex must fail, got rc=0\n{proc.stdout}")
+    if proc.returncode < 0 or proc.returncode == 134 or proc.returncode > 128:
+        raise AssertionError(f"[{label}] invalid regex crashed the process: rc={proc.returncode}\n{proc.stderr}")
+    want = f"Invalid regex for {option}: '{pattern}'"
+    if want not in proc.stderr or "regex_error" in proc.stderr or "terminate" in proc.stderr:
+        raise AssertionError(f"[{label}] expected {want!r} in stderr, got:\n{proc.stderr}")
+    if proc.stdout != "":
+        raise AssertionError(f"[{label}] invalid regex must not print to stdout:\n{proc.stdout}")
+
+
+class _ServeClient:
+    """Minimal `rtl_trace serve` driver: one command line in, stdout up to <<END>> out."""
+
+    def __init__(self, rtl_trace, db):
+        self.proc = subprocess.Popen(
+            [str(rtl_trace), "serve", "--db", str(db)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.read_response()  # startup banner
+
+    def read_response(self):
+        lines = []
+        while True:
+            line = self.proc.stdout.readline()
+            if line == "":
+                raise AssertionError(f"serve exited (rc={self.proc.poll()}) before <<END>>; got: {lines}")
+            if line.rstrip("\n") == "<<END>>":
+                return "".join(lines)
+            lines.append(line)
+
+    def query(self, cmd):
+        self.proc.stdin.write(cmd + "\n")
+        self.proc.stdin.flush()
+        return self.read_response()
+
+    def close(self):
+        try:
+            self.query("quit")
+        except Exception:
+            pass
+        self.proc.stdin.close()
+        try:
+            self.proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait()
+        err = self.proc.stderr.read()
+        self.proc.stdout.close()
+        self.proc.stderr.close()
+        return err
+
+
+def run_invalid_regex_tests(rtl_trace, db):
+    sig = "semantic_top.hit"
+    base = [str(rtl_trace), "trace", "--db", str(db), "--mode", "drivers", "--signal", sig, "--format", "json"]
+    good = subprocess.run(base, text=True, capture_output=True)
+    if good.returncode != 0:
+        raise AssertionError(f"invalid_regex: baseline trace failed:\n{good.stdout}{good.stderr}")
+
+    # one-shot trace: every regex option is validated at argument-parse time
+    for opt in ("--include", "--exclude", "--stop-at"):
+        proc = subprocess.run(base + [opt, "zz("], text=True, capture_output=True)
+        _assert_regex_rejected(proc, opt, "zz(", f"trace {opt}")
+    # a valid pattern is still accepted for each option
+    for opt in ("--include", "--exclude", "--stop-at"):
+        proc = subprocess.run(base + [opt, "^zz_no_such$"], text=True, capture_output=True)
+        if proc.returncode != 0:
+            raise AssertionError(f"trace {opt} with a valid regex failed: rc={proc.returncode}\n{proc.stderr}")
+
+    # serve: bad regex -> error on stderr, response still terminated, next queries answered
+    client = _ServeClient(rtl_trace, db)
+    try:
+        trace_cmd = f"trace --mode drivers --signal {sig} --format json"
+        want_trace = client.query(trace_cmd)
+        if want_trace != good.stdout:
+            raise AssertionError(f"serve trace differs from one-shot trace:\n{want_trace}\nvs\n{good.stdout}")
+        want_find = client.query("find --query semantic_top.u_ --limit 3")
+        if "signal semantic_top.u_cons.hi_nibble" not in want_find:
+            raise AssertionError(f"serve baseline find unexpected:\n{want_find}")
+        for bad_cmd in (
+            "find --query zz( --regex",
+            "find --query 'a[' --regex --format json",
+            f"{trace_cmd} --include 'zz('",
+            f"{trace_cmd} --exclude 'zz('",
+            f"{trace_cmd} --stop-at 'zz('",
+        ):
+            out = client.query(bad_cmd)
+            if out != "":
+                raise AssertionError(f"serve: bad regex query {bad_cmd!r} produced stdout:\n{out}")
+            if client.proc.poll() is not None:
+                raise AssertionError(f"serve died on {bad_cmd!r}: rc={client.proc.returncode}")
+            # session is still loaded and answers valid queries identically
+            if client.query(trace_cmd) != want_trace:
+                raise AssertionError(f"serve: trace answer changed after {bad_cmd!r}")
+            if client.query("find --query semantic_top.u_ --limit 3") != want_find:
+                raise AssertionError(f"serve: find answer changed after {bad_cmd!r}")
+        if client.query("find --query 'semantic_top.u_.*\\.in_bus$' --regex --format json") == "":
+            raise AssertionError("serve: valid regex find returned nothing after bad regex queries")
+    finally:
+        err = client.close()
+    for want in ("Invalid regex for --query (--regex): 'zz('", "Invalid regex for --query (--regex): 'a['",
+                 "Invalid regex for --include: 'zz('", "Invalid regex for --exclude: 'zz('",
+                 "Invalid regex for --stop-at: 'zz('"):
+        if want not in err:
+            raise AssertionError(f"serve stderr missing {want!r}:\n{err}")
+    if client.proc.returncode != 0:
+        raise AssertionError(f"serve exit code after bad regexes: {client.proc.returncode}\n{err}")
+# ===== END invalid_regex tests =====
+
+
 # ===== BEGIN find_fastpath tests =====
 # `rtl_trace find` scans names in parallel (bounded top-k) and prefilters regexes with a required
 # literal. These tests pin the observable behaviour: lexicographically sorted first --limit
 # matches, count == min(matches, limit), exit code 2 on no match, suggestions ordered by
-# (edit distance, name), and unchanged invalid-regex handling.
+# (edit distance, name), and rejection of invalid regexes.
 
 FIND_FASTPATH_BIG_SV = """
 module ff_leaf(input logic clk, input logic [7:0] i_paddr, output logic [7:0] o_data);
@@ -1137,14 +1257,10 @@ def run_find_fastpath_tests(rtl_trace, small_db, tmpdir):
     if obj["count"] != 0 or obj["matches"] != [] or len(obj["suggestions"]) != 2:
         raise AssertionError(f"find_fastpath regex no-match json unexpected: {proc.stdout}")
 
-    # invalid regex: unchanged behaviour (uncaught std::regex_error -> abnormal termination,
-    # nothing on stdout)
-    proc = _find_raw(rtl_trace, small_db, "(", regex=True)
-    if proc.returncode == 0 or "regex_error" not in proc.stderr or proc.stdout != "":
-        raise AssertionError(f"find_fastpath invalid regex behaviour changed: rc={proc.returncode} {proc.stderr}")
-    proc = _find_raw(rtl_trace, small_db, "zz(", regex=True)  # literal prefix must not mask the error
-    if proc.returncode == 0 or "regex_error" not in proc.stderr:
-        raise AssertionError("find_fastpath invalid regex with literal prefix must still fail")
+    # invalid regex: reported as an argument error (rc != 0, no abort/signal, nothing on stdout)
+    for bad in ("(", "zz("):  # the second has a literal prefix that must not mask the error
+        proc = _find_raw(rtl_trace, small_db, bad, regex=True)
+        _assert_regex_rejected(proc, "--query (--regex)", bad, f"find --regex {bad!r}")
     # substring mode treats regex metacharacters literally
     _find_raw(rtl_trace, small_db, "(", regex=False, expect=2)
 
