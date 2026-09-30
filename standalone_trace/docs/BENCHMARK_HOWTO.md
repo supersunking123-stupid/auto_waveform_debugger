@@ -1,6 +1,34 @@
 # Compile Benchmark Commands
 
-All benchmarks were run from `/home/qsun/DVT/nvdla/hw/verif/sim_vip`.
+## Current reference design: Lumion vb2b_dbPCIe__ips
+
+The Lumion repo has `make rtl_trace_db` in
+`func_ver/sanity/vb2b/vb2b_dbPCIe__ips/Makefile` (copies sources to `rtl_trace_work/src`, applies
+`rtl_trace/patch_sources.sh` for slang compatibility, runs `rtl_trace compile` with the VCS
+defines/filelists). A ready worktree is at `local_test_design/lumion` (gitignored, branch
+`rtl-trace-bench`, created with `git worktree add -b rtl-trace-bench <dir>` from the Lumion repo
+`/home/qsun/Lumion_proj/lumionchip_shanghai_n1_PCIE_HPA_EVAL_batch_quick_20260929_120154`).
+
+```bash
+cd local_test_design/lumion/func_ver/sanity/vb2b/vb2b_dbPCIe__ips
+free -g    # need >= 34 GB MemAvailable: the compile peaks at ~28 GB RSS
+make rtl_trace_clean
+systemd-run --user --scope -p MemoryMax=40G -p MemorySwapMax=0 \
+  /usr/bin/time -v make rtl_trace_db RTL_TRACE=<repo root>/standalone_trace/build/rtl_trace \
+  TRACE_ARGS="--low-mem"      # optional extra rtl_trace compile args
+```
+
+- Do not cap below ~30 GB: a 10 GB cap kills the compile during hierarchy collection.
+- Results: `Elapsed (wall clock)` and `Maximum resident set size` in the `/usr/bin/time -v` output;
+  `rtl_trace_work/rtl_trace_compile.log` has the `[Memory]` lines and `save_graph_db: ...` timing.
+- Reference numbers: `COMPILE_BENCHMARK.md` ("Lumion vb2b_dbPCIe__ips" section).
+- Offline builds of `rtl_trace` itself: slang's CMake fetches mimalloc from GitHub at configure
+  time; pass `-DFETCHCONTENT_SOURCE_DIR_MIMALLOC=<path to an existing mimalloc source tree>` (e.g.
+  `standalone_trace/build/_deps/mimalloc-src`) to avoid the download.
+
+## Historical: NVDLA (design no longer available)
+
+All NVDLA benchmarks were run from `/home/qsun/DVT/nvdla/hw/verif/sim_vip`.
 
 ## Prerequisites
 
@@ -14,7 +42,7 @@ free -h   # confirm swap is 0, sufficient free RAM
 ## Binary path
 
 ```bash
-RTL_TRACE=/home/qsun/AI_PROJ/auto_waveform_debugger/standalone_trace/build/rtl_trace
+RTL_TRACE=<repo root>/standalone_trace/build/rtl_trace
 ```
 
 ## Without --low-mem
