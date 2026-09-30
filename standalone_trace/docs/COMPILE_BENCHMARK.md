@@ -255,6 +255,31 @@ In the instrumented runs the loop RSS was 0.3-0.8 GB lower through the first 3.2
 moved from a transient at ~3.2M signals (26,887 MB) to the end of the loop (26,377 MB). Finalize
 got faster (`refs_s` 1.9 s -> 0.5 s, `global_nets_s` 0.27 s -> 0.02 s).
 
+### Endpoint merge fix (TODO item 2, option A, 2026-09-30)
+
+Measured on top of `490e5ec` (option B was an experiment only and is not in the tree).
+One run each, all with `RTL_TRACE_SAVE_GRAPH_PROFILE=1`; see `TODO.md` item 2 for details.
+
+| Build | Wall | Peak RSS | Endpoints | DB size | merge_s |
+| --- | --- | --- | --- | --- | --- |
+| HEAD `490e5ec` (current pass) | 1:41.9 | 26.43 GiB | 21,610,369 | 2.74 GB | 6.50 s |
+| option B: pass removed (experiment) | 1:39.3 | 26.46 GiB | 21,631,237 | 2.74 GB | ~0.2 s |
+| option A: candidate merge | 1:38.4 | 26.58 GiB | 19,659,527 | 2.63 GB | 0.30 s |
+
+### Canonical-body tracer as default (TODO item 4, 2026-09-30) — current numbers
+
+Signals of instance bodies that slang skipped are traced on their canonical body (no per-instance
+body binding). Same session, `main` with TODO items 2, 3 and 4; both DBs `cmp`-identical to each
+other and to the item-2 reference DB (19,659,527 endpoints, 2,625,464,530 bytes):
+
+| Build | Wall | Max RSS | `build_graph` |
+| --- | --- | --- | --- |
+| default (canonical bodies) | 0:48.73 | 14,820,324 kB (14.13 GiB) | 29.3 s |
+| `RTL_TRACE_CANONICAL_BODIES=0` (per-body binding) | 1:34.73 | 26,949,052 kB (25.70 GiB) | 75.0 s |
+
+Index builds drop from 1.94M (707k distinct bodies) to 2,227; RSS growth in the build loop from
+~15 GB to ~2.6 GB.
+
 ### Query behaviour on the Lumion DB (baseline DB)
 
 | Operation | Cost |
@@ -281,4 +306,6 @@ All are off by default and do not change the DB unless noted.
 | `RTL_TRACE_ENDPOINTS_PER_SIGNAL=<n>` | Untouched-virtual reservation of `graph.endpoints` / `signal_refs` / ref-pair vectors as a multiple of the signal count (default 8) so they do not double-and-copy. Never changes the DB. |
 | `RTL_TRACE_KEEP_SIGNAL_PATHS=1` | Keep the compile-side signal path vector (parallel to `SignalCompileItem`, which has no path field) during the build loop (default: freed after the bucket sort; the loop reads paths from `graph.strings`). A/B measurement only. |
 | `RTL_TRACE_SIGNALS_RESERVE=<n>` | Initial capacity of the compile-time signal vector (default 2000000). A tiny value forces reallocation, for sanitizer runs. |
-| `RTL_TRACE_FIX_ENDPOINT_MERGE=1` | Uses `MergeEndpointBitRangesInPlaceStable`. **Changes DB output**: endpoints that share path/file/line/text/lhs/rhs and have adjacent or overlapping bit ranges now merge (default merging is defeated by a moved-from grouping key). |
+| `RTL_TRACE_CANONICAL_BODIES=0` | Disables the default canonical-body tracer: every instance body that slang skipped (instance caching) is bound lazily and indexed, as before 2026-09-30. Same DB; much slower and larger on designs with many identical instances (Lumion 0:48.7 / 14.13 GiB default vs 1:34.7 / 25.70 GiB). Fallback and A/B checks. |
+| `RTL_TRACE_CANONICAL_VERIFY=1` | With the canonical tracer: also builds the baseline record for every signal (binding every body, like `=0`) and reports mismatches. The DB is still written from the canonical record. Diagnostic only. |
+| `RTL_TRACE_CANONICAL_STATS=1` | Prints `[Canon]` statistics: skipped/elaborated instance bodies, which call paths bind them, per-body index builds and redirected signals. |

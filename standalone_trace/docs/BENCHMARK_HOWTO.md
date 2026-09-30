@@ -11,14 +11,15 @@ defines/filelists). A ready worktree is at `local_test_design/lumion` (gitignore
 
 ```bash
 cd local_test_design/lumion/func_ver/sanity/vb2b/vb2b_dbPCIe__ips
-free -g    # need >= 34 GB MemAvailable: the compile peaks at ~28 GB RSS
+free -g    # need >= 20 GB MemAvailable: the compile peaks at ~15 GB RSS (~27 GB with RTL_TRACE_CANONICAL_BODIES=0)
 make rtl_trace_clean
 systemd-run --user --scope -p MemoryMax=40G -p MemorySwapMax=0 \
   /usr/bin/time -v make rtl_trace_db RTL_TRACE=<repo root>/standalone_trace/build/rtl_trace \
   TRACE_ARGS="--low-mem"      # optional extra rtl_trace compile args
 ```
 
-- Do not cap below ~30 GB: a 10 GB cap kills the compile during hierarchy collection.
+- Do not cap below ~20 GB (~30 GB with `RTL_TRACE_CANONICAL_BODIES=0`): RSS is already ~12.6 GB
+  before the build loop, and a 10 GB cap kills the compile during hierarchy collection.
 - Results: `Elapsed (wall clock)` and `Maximum resident set size` in the `/usr/bin/time -v` output;
   `rtl_trace_work/rtl_trace_compile.log` has the `[Memory]` lines and `save_graph_db: ...` timing.
 - Reference numbers: `COMPILE_BENCHMARK.md` ("Lumion vb2b_dbPCIe__ips" section).

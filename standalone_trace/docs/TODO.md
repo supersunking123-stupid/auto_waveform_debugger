@@ -1,56 +1,20 @@
 # TODO
 
-Reference design for all measurements: Lumion `vb2b_dbPCIe__ips` (3.8M signals, 21.6M endpoints).
+Reference design for all measurements: Lumion `vb2b_dbPCIe__ips` (3.8M signals, 19.7M endpoints).
 Current numbers and how to reproduce them: `COMPILE_BENCHMARK.md` and `BENCHMARK_HOWTO.md`.
 Any change to the compile path must produce a DB that is `cmp`-identical to the previous one
 (or come with an explicit, documented DB change).
 
-Suggested order: 2 (mostly a decision plus one Lumion run) → 3 → 4 (largest payoff, start with a
-measured spike) → 5.
+Suggested order: 4 (remaining hardening) → 5.
 
-## 2. Endpoint merge: fix it or remove it (changes DB output)
-
-`MergeEndpointBitRangesInPlace` (`db/GraphDb.cc`) builds its grouping key from views into an
-endpoint that is then moved from, so endpoints never actually merge. The corrected version,
-`MergeEndpointBitRangesInPlaceStable`, exists and is enabled by `RTL_TRACE_FIX_ENDPOINT_MERGE=1`.
-It is off by default because it changes the DB: endpoints with the same
-path/file/line/text/lhs/rhs and adjacent or overlapping bit ranges collapse into one
-(per-bit assignments, generate loops). Endpoint counts on small designs, default vs fixed:
-
-| Design | Default | Fixed |
-| --- | --- | --- |
-| tc07_mux_tree | 65 | 17 |
-| tc05_multi_dim_arrays | 171 | 66 |
-| tc12_multi_cone | 260 | 140 |
-| tc01_generate_loop | 170 | 110 |
-| tc11_deep_soc | 6201 | 6036 |
-
-Today the default pass costs about 7 s on Lumion and merges almost nothing, so the real choice
-is between two options:
-- **A. Merge properly**: make the stable version the default.
-- **B. Do not merge**: remove the pass. This is not automatically `cmp`-identical, because the
-  current pass still reorders endpoints and reformats `bit_map`; decide whether to keep an
-  equivalent no-merge ordering or accept a one-time DB change.
-
-To do:
-- Run Lumion with the fix on: endpoint count, DB size, wall time, peak RSS.
-- Check that `trace` output is still correct and no less useful for agents (merged bit ranges
-  such as `[3:0]` instead of four single-bit endpoints); review query code that assumes
-  one endpoint per assignment. This decides A vs B.
-- Output order: both versions emit merged groups in hash-map iteration order (deterministic,
-  but not source order, and it changes if the hash or map type changes). If A is chosen, sort
-  the output (for example by each group's first original index) so the DB is stable.
-- Then: make the chosen behaviour the default, remove the env switch, bump the DB format version
-  if readers need to tell the difference, update test 31 in `tests/semantic_regression.py`
-  (it currently asserts both the unmerged default and the merged fixed output), and refresh
-  the benchmark docs.
+## 2. Endpoint merge — done, option A (see "Done / dropped")
 
 ## 3. Smaller compile-memory items — done (see "Done / dropped")
 
 Three of the four sub-items are in; the per-endpoint `file` interning was dropped. Lumion peak RSS
 27,729,112 kB -> 27,062,888 kB (-0.64 GiB), wall 1:36.9 -> 1:34.7, DB and `.meta` `cmp`-identical.
 
-## 4. Index only canonical instance bodies (large redesign)
+## 4. Index only canonical instance bodies — default since 2026-09-30; hardening left
 
 Measured on Lumion: about 19 of the ~28 GB peak RSS is slang's AST, and about 12 GB of that
 is added during the `SaveGraphDb` build loop. slang elaborates one canonical body per
@@ -81,7 +45,9 @@ Risks and checks:
   DB `cmp` sweep, and the Lumion DB `cmp`.
 Expected: much lower peak RSS and further wall time reduction (currently 1:36 wall, 26.4 GiB).
 
-**Status (2026-09-30): spike done, prototype works, not yet the default.**
+**Status (2026-09-30): the canonical tracer is the default; `RTL_TRACE_CANONICAL_BODIES=0` selects the
+old per-body binding as a fallback (same DB).** Final Lumion numbers are at the end of this item.
+The original plan and spike notes follow.
 `RTL_TRACE_CANONICAL_BODIES=1` (`db/CanonicalBodies.inc`, a narrow hook in `SaveGraphDb`) produces
 a Lumion DB that is `cmp`-identical to the default. Lumion, same binary, back to back:
 
@@ -149,18 +115,25 @@ Verified:
   `semantic_regression.py`.
 - Lumion: the flag-off and flag-on DBs are both `cmp`-identical to the reference DB.
 
-To productionize (about 3–5 days):
-- Make the canonical tracer the default and keep the baseline only as a fallback.
-- Drop or fold in the stats instrumentation.
+Remaining hardening (about 2–4 days):
 - Handle shared bodies with interface ports (translate through the actual interface connection)
-  or keep the fallback. This needs a design with many such instances to measure.
+  instead of falling back to binding them. Needs a design with many such instances to measure.
 - Replace the string-level path translation with symbol-level translation where it is cheap.
-- Refresh `COMPILE_BENCHMARK.md` once it is the default. (`test_cases/run_all_tests.sh` with the flag on:
-  27/27 pass, checked after integration.)
+- Decide whether to keep `RTL_TRACE_CANONICAL_STATS` / `RTL_TRACE_CANONICAL_VERIFY` long term
+  (diagnostics only), and remove the `=0` fallback once the tracer has seen more designs.
 
-After integration into main together with item 3 (same session, `cmp`-identical to the reference
-DB both ways): flag off 1:38.8 / 27,063,192 kB max RSS; flag on 0:50.4 / 14,942,764 kB,
-`build_graph` 79.0 s → 31.9 s.
+Final Lumion numbers (main with items 2, 3 and 4, same session; both DBs `cmp`-identical to the
+item-2 reference DB, 19,659,527 endpoints):
+
+| | default (canonical) | `RTL_TRACE_CANONICAL_BODIES=0` |
+| --- | --- | --- |
+| wall | 0:48.7 | 1:34.7 |
+| max RSS | 14,820,324 kB (14.13 GiB) | 26,949,052 kB (25.70 GiB) |
+| `build_graph` | 29.3 s | 75.0 s |
+
+Verified: small-design sweep (33 designs × 6 variants) default vs `=0` 198/198 identical;
+`test_cases/run_all_tests.sh` 27/27; `semantic_regression.py` (canonical block now compares the
+default against `=0`).
 
 ## 5. Later / ideas
 
@@ -173,6 +146,17 @@ DB both ways): flag off 1:38.8 / 27,063,192 kB max RSS; flag on 0:50.4 / 14,942,
 - Small leftover: 15 `test_cases/*` scripts call bare `python3`; the system Python fails on
   `str | List[str]` in `models.py`, so `run_all_tests.sh` only passes with `.venv/bin` first on
   `PATH`. Use the repo `.venv` interpreter explicitly (or a `PYTHON` variable defaulting to it).
+- Endpoint-merge follow-ups (item 2):
+  - A bit query on a merged range returns the whole range (`trace --signal x[5]` gives
+    `bits [15:0]`, same file:line). Narrowing it back needs per-member info in the DB.
+  - 1.03M exact-duplicate endpoints with empty or non-mergeable bit_maps remain in the DB (trace
+    hides them); dropping them would shrink the DB further.
+  - Merged builds peaked ~0.12 GiB above unmerged ones in single runs (spread ~0.14 GiB); not
+    investigated.
+  - Multi-dimensional bit_maps are written inner-select-first (`m[1][0]` stored as `[0][7:4]`),
+    and the query-side bit filter reads only the first bracket.
+  - `--incremental` does not fingerprint the binary, so a DB built before the merge fix is reused
+    until a source file or argument changes; rebuild existing DBs once.
 
 ## Done / dropped
 
@@ -210,3 +194,14 @@ DB both ways): flag off 1:38.8 / 27,063,192 kB max RSS; flag on 0:50.4 / 14,942,
     only live for one signal (nothing caches them), so the saving is bounded by the largest single
     record (44,800 loads x ~100 B, about 5 MB), far under the 50 MB bar; it would also change the
     `file` field used by the endpoint-merge grouping key (item 2).
+- ~~Item 2, endpoint merge~~ — option A (2026-09-30). The old pass was not a no-op: its key
+  pointed into moved-from endpoints and had no `path_id`, so the same source line in different
+  instances collapsed into one endpoint (3,951 Lumion lists lost real endpoints), and a prefix
+  parse corrupted multi-dimensional bit_maps (`[3][3]` → `[3]`, 5,136 lists); the
+  `RTL_TRACE_FIX_ENDPOINT_MERGE` variant shared both bugs. Now one in-place
+  `MergeEndpointBitRangesInPlace`: key includes `path_id`/`file_id`, strict `[N]`/`[L:R]` parser,
+  source order kept, env switch and Stable variant removed, no DB format bump. Lumion: endpoints
+  21.61M → 19.66M, DB 2.74 → 2.63 GB, merge pass 6.5 s → 0.3 s. Verified against an independent
+  Python re-implementation on all 7.6M Lumion lists and tc01–tc15. Test 31 and
+  `tests/fixtures/endpoint_merge.sv` updated. Agent-visible effect: per-bit assignments and
+  generate loops show as one range (`bits [7:0]` instead of eight endpoints).
