@@ -23,7 +23,9 @@
 #include "slang/ast/expressions/SelectExpressions.h"
 #include "slang/ast/statements/MiscStatements.h"
 #include "slang/ast/symbols/BlockSymbols.h"
+#include "slang/ast/symbols/CompilationUnitSymbols.h"
 #include "slang/ast/symbols/InstanceSymbols.h"
+#include "slang/util/FlatMap.h"
 #include "slang/ast/symbols/ParameterSymbols.h"
 #include "slang/ast/symbols/PortSymbols.h"
 #include "slang/driver/Driver.h"
@@ -35,6 +37,7 @@
 #include <chrono>
 #include <cctype>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -388,6 +391,8 @@ struct TraceCompileCache {
   std::list<const slang::ast::InstanceBodySymbol *> lru_order;
   size_t body_cache_limit = 16;
 };
+
+#include "db/CanonicalBodiesStats.inc"  // TODO item 4 spike instrumentation (RTL_TRACE_CANONICAL_STATS=1)
 
 // ScopedFileLock — local utility for SaveGraphDb file locking
 class ScopedFileLock {
@@ -905,6 +910,7 @@ const BodyTraceIndex &GetOrBuildBodyTraceIndex(const slang::ast::InstanceBodySym
     ++g_build_prof.bodies_built;
     if (!g_build_prof.bodies_seen.insert(&body).second) ++g_build_prof.bodies_rebuilt;
   }
+  const long canon_rss0 = g_canon_stats.on ? CanonStatsRssKB() : 0;
   BodyTraceIndexBuilder</*DRIVERS*/ true> driver_builder(body_cache.body_trace_index, body_cache,
                                                          body);
   body.visit(driver_builder);
@@ -912,6 +918,7 @@ const BodyTraceIndex &GetOrBuildBodyTraceIndex(const slang::ast::InstanceBodySym
                                                         body);
   body.visit(load_builder);
   body_cache.body_trace_index_ready = true;
+  if (g_canon_stats.on) CanonStatsOnBuild(body, CanonStatsRssKB() - canon_rss0);
   return body_cache.body_trace_index;
 }
 
@@ -994,6 +1001,7 @@ std::vector<TraceResult> CollectPortConnectionResults(
   if (inst == nullptr) return {};
 
   BuildProfTimer timer(&BuildLoopProfile::port_follow_s);
+  const long canon_rss0 = g_canon_stats.on ? CanonStatsRssKB() : 0;
   std::vector<TraceResult> out;
   for (const slang::ast::PortConnection *conn : inst->getPortConnections()) {
     const auto *conn_port = conn->port.template as_if<slang::ast::PortSymbol>();
@@ -1005,6 +1013,7 @@ std::vector<TraceResult> CollectPortConnectionResults(
     expr->visit(collector);
     break;
   }
+  if (g_canon_stats.on) CanonStatsOnEscape(*inst, CanonStatsRssKB() - canon_rss0);
   return out;
 }
 
@@ -1067,6 +1076,7 @@ std::vector<TraceResult> ComputeIndexedTraceResults(
       } else {
         const slang::ast::Symbol *internal = expr->context_port->internalSymbol;
         if (visited.insert(internal).second) {
+          CanonStatsReasonScope canon_reason(CanonicalStats::kDownward);
           std::vector<TraceResult> nested = ComputeIndexedTraceResults<DRIVERS>(internal, cache, visited);
           if (!nested.empty()) {
             out.insert(out.end(), std::make_move_iterator(nested.begin()), std::make_move_iterator(nested.end()));
@@ -1084,6 +1094,7 @@ SignalRecord BuildSignalRecord(const slang::ast::Symbol *sym, const slang::Sourc
                                TraceCompileCache &cache,
                                CompileContext &compile_ctx,
                                const slang::flat_hash_map<const slang::ast::Symbol *, uint32_t> *symbol_path_ids = nullptr) {
+  CanonStatsSignalScope canon_stats_scope(sym);
   SignalRecord rec;
   std::unordered_set<const slang::ast::Symbol *> visited_drivers;
   visited_drivers.insert(sym);
@@ -1103,6 +1114,8 @@ SignalRecord BuildSignalRecord(const slang::ast::Symbol *sym, const slang::Sourc
 
   return rec;
 }
+
+#include "db/CanonicalBodies.inc"  // TODO item 4 spike (RTL_TRACE_CANONICAL_BODIES=1)
 
 std::string DirectionToString(slang::ast::ArgumentDirection dir) {
   switch (dir) {
@@ -2478,7 +2491,15 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
   LogMemPhase("SaveGraphDb:AfterPreIntern strings=" + std::to_string(graph.strings.size()) +
               " signals=" + std::to_string(graph.signals.size()));
 
+  // TODO item 4 spike: RTL_TRACE_CANONICAL_BODIES=1 traces signals of slang-skipped instance bodies on their
+  // canonical body and translates the paths back (db/CanonicalBodies.inc). Off by default.
+  std::unique_ptr<CanonicalTracer> canonical_tracer;
+  if (EnvFlagEnabled("RTL_TRACE_CANONICAL_BODIES")) {
+    canonical_tracer = std::make_unique<CanonicalTracer>(sm, trace_cache, compile_ctx, symbol_path_ids,
+                                                         graph.strings, string_index);
+  }
   auto build_signal_record = [&](const slang::ast::Symbol *sym) -> SignalRecord {
+    if (canonical_tracer) return canonical_tracer->Build(sym);
     return BuildSignalRecord(sym, sm, trace_cache, compile_ctx, &symbol_path_ids);
   };
 
@@ -2766,6 +2787,8 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
   const auto t_build_end = Clock::now();
   LogMemPhase("SaveGraphDb:AfterBuildLoop endpoints=" + std::to_string(graph.endpoints.size()) +
               " signal_refs=" + std::to_string(graph.signal_refs.size()));
+  if (canonical_tracer) canonical_tracer->Report();
+  CanonStatsReport();
   if (mem_progress) {
     mem_progress_line("build_done", "");
     mem_accounting_line("build_done");
