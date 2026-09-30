@@ -309,3 +309,106 @@ All are off by default and do not change the DB unless noted.
 | `RTL_TRACE_CANONICAL_BODIES=0` | Disables the default canonical-body tracer: every instance body that slang skipped (instance caching) is bound lazily and indexed, as before 2026-09-30. Same DB; much slower and larger on designs with many identical instances (Lumion 0:48.7 / 14.13 GiB default vs 1:34.7 / 25.70 GiB). Fallback and A/B checks. |
 | `RTL_TRACE_CANONICAL_VERIFY=1` | With the canonical tracer: also builds the baseline record for every signal (binding every body, like `=0`) and reports mismatches. The DB is still written from the canonical record. Diagnostic only. |
 | `RTL_TRACE_CANONICAL_STATS=1` | Prints `[Canon]` statistics: skipped/elaborated instance bodies, which call paths bind them, per-body index builds and redirected signals. |
+
+### Canonical diagnostic switch recommendations (item 4 hardening)
+
+Keep `RTL_TRACE_CANONICAL_VERIFY` and `RTL_TRACE_CANONICAL_STATS` opt-in and disabled by
+default. VERIFY builds actual-body records as an independent comparison and remains the
+strongest full-design oracle. It reports mismatches but still writes the canonical DB;
+validation must require a positive verified-signal count and zero mismatched lists, as well
+as successful process status. STATS helps diagnose skipped-body binding, but adds whole-design
+classification, bookkeeping, RSS reads and timing. Neither belongs in default-path timing samples.
+
+Keep `RTL_TRACE_CANONICAL_ALLOW_IFACE` only as an unsafe diagnostic while interface exclusions
+remain. It bypasses unresolved, shape, conflict, alias split/merge and forwarding-interface
+protection. Supported maps still apply; invalid partial maps are discarded. A successful compile
+with this switch does not establish correctness. Do not enable it in production or acceptance
+runs. The frozen pre-hardening fixtures did not produce DB differences with this switch: existing
+collectors omit direct hierarchical interface references. That limitation is not proof that bypass
+is safe for other constructs.
+
+A future cleanup could move instrumentation out of the compile implementation. This task makes
+no such move and removes no switches. Preserve `CanonBodyHasIfacePort`, a production helper
+currently housed in `CanonicalBodiesStats.inc`, and the instance classification logic. Keep
+`RTL_TRACE_CANONICAL_BODIES=0` as the independent baseline until broader design coverage exists.
+
+
+### Item 4 interface hardening measurements (2026-09-30)
+
+Release builds use GCC 11.5 (C++20), pinned slang/fmt, the existing mimalloc source and project
+Python. Samples use normal OS caching with no cache flush. No other task-owned heavy jobs
+run during timing. All DBs are byte-identical; newly generated metadata matches exactly.
+Saved legacy Lumion metadata differs only by the required single `SEMANTICS_EPOCH:2` line.
+
+Task A compares frozen `26d84df` with the corrected interface-mapping implementation:
+
+| Pair | Baseline wall s | Candidate wall s | Baseline build_graph s | Candidate build_graph s | Baseline RSS KiB | Candidate RSS KiB |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 45.17 | 45.17 | 26.664 | 26.646 | 14824972 | 14833844 |
+| 2 | 45.49 | 45.76 | 26.725 | 27.235 | 14824368 | 14843560 |
+| 3 | 44.78 | 45.72 | 26.204 | 27.027 | 14842100 | 14837060 |
+| Median | 45.17 | 45.72 | 26.664 | 27.027 | 14824972 | 14837060 |
+| Range | 44.78–45.49 | 45.17–45.76 | 26.204–26.725 | 26.646–27.235 | 14824368–14842100 | 14833844–14843560 |
+
+The median regressions, +0.55 s wall and +0.0115 GiB RSS, pass the 1 s/0.15 GiB limits.
+No Lumion gain is expected because it has no interface crossings. VERIFY checks 3,798,275
+signals with zero mismatched lists; the DB has 19,659,527 endpoints.
+
+The initial extracted helper copied a destination string on each module rewrite. Two
+exploratory pairs showed wall 44.91/45.18 s baseline versus 48.40/48.11 s candidate. That
+implementation was discarded. The final helper uses a const string reference.
+The original third A2 pair overlapped an unrelated eight-worker CPU job and was replaced;
+its wall samples 52.50/49.56 s are excluded. Accepted labels are h4A2_*_1, *_2 and *_3q.
+A separate single VCS/simulation job and desktop activity remained visible in host samples.
+These are shared-host measurements; no task-owned builds/tests overlapped them.
+
+The deterministic generator defaults to 4096 repeated modules, each with a scalar modport
+and whole interface-array port. Three alternating baseline/A pairs gave:
+
+| Metric | Baseline samples | A samples | Baseline median (range) | A median (range) |
+|---|---|---|---|---|
+| Wall s | 0.16,0.16,0.16 | 0.13,0.14,0.14 | 0.16 (0.16–0.16) | 0.14 (0.13–0.14) |
+| build_graph s | 0.079,0.078,0.079 | 0.055,0.055,0.055 | 0.079 (0.078–0.079) | 0.055 (0.055–0.055) |
+| RSS KiB | 172452,172264,172456 | 142608,142604,142600 | 172452 (172264–172456) | 142604 (142600–142608) |
+
+Separate STATS runs show skipped-body index builds 7898→0 (4095 distinct first builds),
+interface exclusion attempts 12285→0 and redirected signals 0→8190. All mapping anomalies
+are zero. Every generated DB and metadata file matches exactly. Absolute timing differences
+are small; elimination of binding is the main result.
+
+Verification: CTest 4/4, test-case suite 27/27, canonical-vs-disabled and reference-vs-candidate
+sweeps 246/246 each across six variants. All 48 new interface fixture/variant combinations
+pass their diagnostic requirements. The frozen ALLOW_IFACE negative-control mismatch was
+not reproduced because existing collectors omit direct hierarchical interface references.
+The pure path test covers substitutions; end-to-end interface-reference coverage remains open.
+
+Full evidence/report: `/tmp/auto_waveform_item4_codex_report_2026-09-30.md`.
+
+
+### Task B symbol-ID hint experiment — discarded
+
+The experiment passed a stack-local frame/representative-ID/actual-ID hint through endpoint
+and reference translation. Only an exact frame and ID match used the direct ID. All other
+paths used Task A translation. It added no persistent cache and preserved sorting/duplicates.
+
+Three alternating pairs compare frozen Task A2 with the hint experiment:
+
+| Pair | Baseline wall s | Candidate wall s | Baseline build_graph s | Candidate build_graph s | Baseline RSS KiB | Candidate RSS KiB |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 45.43 | 42.55 | 26.923 | 23.99 | 14852848 | 14834312 |
+| 2 | 45.21 | 43.03 | 26.716 | 24.367 | 14831980 | 14822916 |
+| 3 | 48.72 | 43.5 | 29.713 | 24.437 | 14840664 | 14835608 |
+| Median | 45.43 | 43.03 | 26.923 | 24.367 | 14840664 | 14834312 |
+| Range | 45.21–48.72 | 42.55–43.5 | 26.716–29.713 | 23.99–24.437 | 14831980–14852848 | 14822916–14835608 |
+
+The median build_graph reduction is 2.556 s (9.5%). It exceeds 2% (0.53846 s), but does not
+exceed the baseline range (2.997 s). RSS falls by only 6352 KiB, far below 2%. The required
+retention rule therefore fails, and the hint code was discarded. Single CPU-bound jobs
+from other projects were visible during this shared-host series, including the slower
+third baseline. All three pairs are included in this decision.
+
+The experiment passed CTest 4/4, test-case suite 27/27 and both six-variant sweeps 246/246.
+All Lumion timing DBs and metadata pass exact comparisons. B VERIFY also checks 3,798,275
+signals with zero mismatched lists. Restoring Task A leaves its
+validated implementation intact. The experiment patch and measurements are retained in
+`/tmp/item4_taskB_hint.patch` and `/tmp/item4_taskB_metrics.json`.

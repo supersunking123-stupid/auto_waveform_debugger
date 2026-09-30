@@ -103,9 +103,10 @@ The prototype works as follows:
   frames (crossing instance, canonical body).
 - Descending into a skipped child through a port enters a new frame.
 - The endpoint paths and lhs/rhs refs are translated prefix by prefix and then re-sorted.
-- Crossings into non-module definitions, or into bodies that have interface ports, fall back to
-  binding the actual body. Such a body can be shared although it is connected to different
-  interface instances. Lumion has none.
+- Crossings into non-module definitions still bind the actual body. Interface connections now
+  use cached per-instance root maps. Unresolved connections, incompatible shapes, conflicting
+  roots, changed alias relationships, and connected interfaces that forward interface ports
+  retain narrow fallbacks. Lumion has no interface crossings.
 
 Verified:
 - The small-design sweep (33 designs × default/`--low-mem`/`--partition-budget 2`/
@@ -115,12 +116,26 @@ Verified:
   `semantic_regression.py`.
 - Lumion: the flag-off and flag-on DBs are both `cmp`-identical to the reference DB.
 
-Remaining hardening (about 2–4 days):
-- Handle shared bodies with interface ports (translate through the actual interface connection)
-  instead of falling back to binding them. Needs a design with many such instances to measure.
-- Replace the string-level path translation with symbol-level translation where it is cheap.
-- Decide whether to keep `RTL_TRACE_CANONICAL_STATS` / `RTL_TRACE_CANONICAL_VERIFY` long term
-  (diagnostics only), and remove the `=0` fallback once the tracer has seen more designs.
+Hardening on `item4-hardening` (2026-09-30):
+- Cached interface-root translation supports scalar/modports, reversed whole arrays, generic
+  ports, nested module forwarding, virtual-interface assignment and repeated local wrappers.
+  Six positive fixtures require redirection with no interface exclusions, skipped-body index
+  builds or mapping anomalies. Two alias fixtures require their specific fallback reason.
+- The planned frozen `ALLOW_IFACE=1` DB-mismatch oracle was not reproduced. Existing collectors
+  omit direct hierarchical interface references. The fixtures prove binding elimination and
+  current DB equality; a pure C++ test covers path substitutions. End-to-end interface-reference
+  coverage remains open. Do not change collectors or DB semantics to force this oracle.
+- Keep VERIFY/STATS opt-in and off by default. Keep ALLOW_IFACE as an unsafe diagnostic while
+  exclusions remain; it bypasses correctness protection. Any relocation is separate work and
+  must preserve production helpers in the statistics include. No switches removed or moved.
+- Keep the `=0` fallback until broader design coverage exists.
+- The stack-local symbol-ID hint experiment was discarded: median build_graph improved
+  9.5%, but its 2.556 s gain did not exceed the 2.997 s baseline range. No persistent cache
+  or hint code remains. Full samples and limits are in `COMPILE_BENCHMARK.md`.
+- Task A passes measured Lumion regression limits (+0.55 s wall, +0.0115 GiB RSS median).
+  The generated 4096-module interface design eliminates all 7898 skipped-body index builds.
+  Correctness checks: CTest 4/4, suite 27/27, both six-variant sweeps 246/246, Lumion VERIFY
+  3,798,275 signals with zero mismatched lists. DB and metadata comparisons pass.
 
 Final Lumion numbers (main with items 2, 3 and 4, same session; both DBs `cmp`-identical to the
 item-2 reference DB, 19,659,527 endpoints):
