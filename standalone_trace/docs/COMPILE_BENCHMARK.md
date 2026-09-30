@@ -441,3 +441,36 @@ three quiet-host alternating pairs after this fix. No hint was reapplied or reru
 Follow-up evidence: `/tmp/item4_fix_ctest.log`, `/tmp/item4_fix_testcases.log`,
 `/tmp/item4_fix_canon/summary.txt`, `/tmp/item4_fix_ab/summary.txt`,
 `/tmp/item4_fix_diagnostics.log`, and `/tmp/codex_item4_oracle_rerun/validation_summary.txt`.
+
+### Item-5 experimental measurements (2026-10-01)
+
+These are isolated prototypes, not the current implementation on `item5`.
+The full report and raw medians/min-max are in
+`/tmp/auto_waveform_item5_codex_report_20260930.md` and `/tmp/item5_logs/`.
+
+E2's default1thread and8thread compile comparisons each obtained0quiet pairs in
+6attempts. E3a's default compile comparison did likewise. All runs are preserved;
+no compile gain or regression decision follows from their diagnostic numbers.
+Default thread count remains1.
+
+E3a paired warm query measurements,3alternating repetitions perquery:
+
+| Operation | Reference median (range) | E3a median (range) |
+|---|---|---|
+| trace drivers wall |1.7963s (1.7962–1.8468)|0.8239s (0.8108–0.8269)|
+| trace max RSS |5,523,320kB|3,405,920kB|
+| literal find wall |1.8421s (1.8419–1.8539)|0.2283s (0.2283–0.2294)|
+| literal find max RSS |5,522,936kB|2,230,832kB|
+| serve startup |1.7046s (1.6936–1.7372)|1.0168s (1.0157–1.0450)|
+| serve regex |0.7304s (0.7114–0.7340)|0.6786s (0.6761–0.6787)|
+
+A clean warm confirmation measured trace1.786s (1.771–1.817) ->0.803s
+(0.799–0.831), RSS5,523,320 ->3,406,104kB. Serve startup1.696 ->1.015s.
+All48saved artifacts match, including every serve repetition/exchange.
+The confirmation monitor saw only the persistent desktop renderer; no external
+batch job. Query measurements were serialized with worker builds/tests held.
+
+Full49query T0 baseline runs are diagnostic only because external waveform-decoder
+activity was found in their host record. E3a's independent paired-query gain exceeds
+30% for both trace and literal find. Its compile regression gate is inconclusive,
+so the prototype is not retained. Warm trace<1.0s closes the E3b v6 gate.

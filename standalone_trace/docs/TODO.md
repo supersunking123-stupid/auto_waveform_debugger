@@ -185,27 +185,34 @@ Verified: small-design sweep (33 designs × 6 variants) default vs `=0` 198/198 
 `test_cases/run_all_tests.sh` 27/27; `semantic_regression.py` (canonical block now compares the
 default against `=0`).
 
-## 5. Later / ideas
+## 5. Item-5 experiments (2026-10-01)
 
-- Parallelise the build loop (slang `freeze()`, per-thread caches, ordered commit of string ids
-  to keep the DB byte-identical). Only worthwhile after items 2 and 4, since memory rises with
-  thread count.
-- Faster one-shot queries: each CLI query reloads the whole DB (3.3 s warm, 15 s cold cache,
-  5.6 GB RSS). Options: an mmap-able DB layout or lazy loading of DB sections. Until then,
-  agents should use `serve`.
-- Test-script Python cleanup (E1): the reference suite passed 27/27 with a clean
-  `/usr/bin:/bin` PATH, so the earlier system-Python failure claim was stale. All 27 scripts
-  now use `PYTHON`, defaulting to the repo `.venv/bin/python3`, and fail clearly if that
-  interpreter is missing. An executable interpreter path can override `PYTHON`.
-- Endpoint-merge follow-ups (item 2):
-  - A bit query on a merged range returns the whole range (`trace --signal x[5]` gives
-    `bits [15:0]`, same file:line). Narrowing it back needs per-member info in the DB.
-  - 1.03M exact-duplicate endpoints with empty or non-mergeable bit_maps remain in the DB (trace
-    hides them); dropping them would shrink the DB further.
-  - Merged builds peaked ~0.12 GiB above unmerged ones in single runs (spread ~0.14 GiB); not
-    investigated.
-  - Multi-dimensional bit_maps are written inner-select-first (`m[1][0]` stored as `[0][7:4]`),
-    and the query-side bit filter reads only the first bracket.
+- **E1 retained:** all27 test scripts use `PYTHON`, defaulting to the repository
+  `.venv/bin/python3`. Normal and clean `/usr/bin:/bin` PATH suites pass27/27.
+  The old system-Python failure claim was not reproduced. Missing interpreters fail
+  clearly; an executable interpreter path can override `PYTHON`.
+- **E2 inconclusive:** ordered serial commit and parallel tracing preserve DB/meta
+  bytes on300-design/variant sweeps and Lumion. Full-slang TSan and debug freeze
+  checks pass. Both default1thread and8thread timing comparisons exhausted6attempts
+  without3quiet pairs. The prototype is on `item5-e2`, not retained here.
+  Default remains1; no new default is recommended from invalid timing data.
+- **E3a inconclusive compile gate:** mmap v5 and command-specific indexes preserve
+  output. Warm Lumion trace median1.786s ->0.803s; RSS5,523,320 ->3,406,104kB.
+  Literal find also exceeds the30% gain threshold; serve metrics do not regress.
+  Compile timings exhausted6attempts without3quiet pairs. The prototype remains
+  on `item5-e3a`; this branch keeps the existing loader/writer.
+- **E3b gate closed:** warm trace after E3a is below1.0s. No v6 indexed format.
+- **E4a inconclusive:** merged/unmerged RSS trials exhausted6attempts with
+  no valid quiet pairs. The fix gate did not open; no merge code change retained.
+- **E4b/E4c/E4d pending user decision:** logical multidimensional coordinates,
+  merged root-range display intersection, and full-field stable dedup are separate
+  experiments. They change DB bytes or query output and belong on `item5-visible`.
+  They are not accepted by this branch.
+
+All Lumion comparisons use the same predeclared quiet-host rule. Invalid runs are
+preserved and do not decide retention. Report and complete raw evidence:
+`/tmp/auto_waveform_item5_codex_report_20260930.md`, `/tmp/item5_logs/`.
+No silent background-serve substitution or MCP interface change was attempted.
 
 ## Done / dropped
 
