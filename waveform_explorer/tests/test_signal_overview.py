@@ -297,6 +297,30 @@ $enddefinitions $end
             self.assertEqual(result["status"], "error")
             self.assertIn("Failed to load waveform file", result["message"])
 
+    def test_multiline_timescale_is_reported(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            multiline_vcd = Path(temp_dir) / "multiline_timescale.vcd"
+            multiline_vcd.write_text(
+                """$timescale
+  1ps
+$end
+$scope module top $end
+$var wire 1 ! sig $end
+$upscope $end
+$enddefinitions $end
+#0
+0!
+""",
+                encoding="ascii",
+            )
+
+            completed = self._run(multiline_vcd, "get_signal_info", {"path": "top.sig"})
+
+            self.assertEqual(completed.returncode, 0)
+            result = json.loads(completed.stdout)
+            self.assertEqual(result["status"], "success")
+            self.assertEqual(result["data"]["timescale"], "1ps")
+
 
 @unittest.skipUnless(CLI.exists(), "wave_agent_cli not built")
 class SignalListingCliTests(unittest.TestCase):

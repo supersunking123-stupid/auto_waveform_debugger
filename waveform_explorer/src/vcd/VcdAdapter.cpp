@@ -47,11 +47,24 @@ bool VcdAdapter::Load(const std::string& filepath) {
             iss >> token;
 
             if (token == "$timescale") {
-                iss >> timescale_;
-                if (timescale_ == "1") {
-                    std::string unit;
-                    iss >> unit;
-                    timescale_ += unit;
+                timescale_.clear();
+                bool reached_end = false;
+                std::string part;
+
+                auto collect_timescale = [&](std::istringstream& stream) {
+                    while (stream >> part) {
+                        if (part == "$end") {
+                            reached_end = true;
+                            break;
+                        }
+                        timescale_ += part;
+                    }
+                };
+
+                collect_timescale(iss);
+                while (!reached_end && std::getline(file, line)) {
+                    std::istringstream continuation(line);
+                    collect_timescale(continuation);
                 }
             } else if (token == "$scope") {
                 std::string type, name;
