@@ -412,3 +412,32 @@ All Lumion timing DBs and metadata pass exact comparisons. B VERIFY also checks 
 signals with zero mismatched lists. Restoring Task A leaves its
 validated implementation intact. The experiment patch and measurements are retained in
 `/tmp/item4_taskB_hint.patch` and `/tmp/item4_taskB_metrics.json`.
+
+
+### Review fixes after Task A measurements
+
+Claude's review found a self-reference regression not covered by the original fixtures:
+interface-root substitution could rewrite a module-local interface onto an unrelated
+external interface. The follow-up rejects that crossing unless its root substitution agrees
+with module translation. Consistent self-references and external-to-local connections stay
+supported. The branch now reports `iface_selfref` for the excluded case.
+
+Nine new fixtures raise each six-variant sweep from 246 to 300 cases. All 300 canonical-vs-off
+and 300 reference-vs-candidate comparisons pass exact DB and metadata checks. CTest passes
+4/4, the project suite passes 27/27, and all 27 canonical fixtures have a separate default
+VERIFY compile with positive signal counts and zero mismatched lists. The 30-case adversarial
+set also passes exact DB/meta comparisons and VERIFY; all five formerly failing cases fall
+back, while s1/s5 still redirect without interface exclusions. The diagnostic checker passes
+108 interface fixture/variant combinations. See TODO for fallback reachability and source
+citations. External interface references omitted by the collectors remain an oracle limit.
+
+No new performance samples were taken. The agreed fix scope requires no Lumion timing rerun;
+Lumion has no interface crossings. Historical measurements above describe the earlier binary.
+Task B remains discarded. Its third baseline was contaminated, and sample exclusion was not
+uniform between A and B. Thus the retention-rule result does not establish that the hint is
+ineffective. A user-approved rerun would need a uniform predeclared contamination policy and
+three quiet-host alternating pairs after this fix. No hint was reapplied or rerun.
+
+Follow-up evidence: `/tmp/item4_fix_ctest.log`, `/tmp/item4_fix_testcases.log`,
+`/tmp/item4_fix_canon/summary.txt`, `/tmp/item4_fix_ab/summary.txt`,
+`/tmp/item4_fix_diagnostics.log`, and `/tmp/codex_item4_oracle_rerun/validation_summary.txt`.

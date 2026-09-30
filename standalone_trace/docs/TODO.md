@@ -116,26 +116,61 @@ Verified:
   `semantic_regression.py`.
 - Lumion: the flag-off and flag-on DBs are both `cmp`-identical to the reference DB.
 
-Hardening on `item4-hardening` (2026-09-30):
+Hardening on `item4-hardening` (2026-09-30), including Claude review fixes:
 - Cached interface-root translation supports scalar/modports, reversed whole arrays, generic
   ports, nested module forwarding, virtual-interface assignment and repeated local wrappers.
-  Six positive fixtures require redirection with no interface exclusions, skipped-body index
-  builds or mapping anomalies. Two alias fixtures require their specific fallback reason.
+  Supported fixtures require redirection with no interface exclusions, skipped-body index
+  builds or mapping anomalies. Alias split/merge, conflicting nested roots and interfaces
+  that forward interface ports have fixtures requiring their specific fallback reasons.
+- Self-referencing ports can shadow the module rewrite for locally traced signals. If a
+  source root lies under the representative module, its destination must equal the module
+  rewrite; otherwise use the actual body and report `iface_selfref`. Keep consistent roots
+  for alias checks. External sources targeting image-local interfaces remain supported.
+  Five fallback fixtures and two supported fixtures cover these cases.
+- Each of the 27 canonical fixtures now has a separate default VERIFY compile requiring
+  positive verified-signal count and zero mismatched lists. Its actual-body work is excluded
+  from normal skipped-build checks. The helper regression preserves valid external roots
+  across unrelated outer frames and retains enclosing-module rewriting of local interfaces.
+  A stricter provenance-aware anomaly diagnostic is optional future work.
 - The planned frozen `ALLOW_IFACE=1` DB-mismatch oracle was not reproduced. Existing collectors
-  omit direct hierarchical interface references. The fixtures prove binding elimination and
-  current DB equality; a pure C++ test covers path substitutions. End-to-end interface-reference
-  coverage remains open. Do not change collectors or DB semantics to force this oracle.
+  omit direct `HierarchicalValueExpression` interface references. VERIFY catches the local-body
+  self-reference corruption but does not validate omitted external references end to end.
+  Do not change collectors or DB semantics to force this oracle.
 - Keep VERIFY/STATS opt-in and off by default. Keep ALLOW_IFACE as an unsafe diagnostic while
   exclusions remain; it bypasses correctness protection. Any relocation is separate work and
   must preserve production helpers in the statistics include. No switches removed or moved.
 - Keep the `=0` fallback until broader design coverage exists.
 - The stack-local symbol-ID hint experiment was discarded: median build_graph improved
   9.5%, but its 2.556 s gain did not exceed the 2.997 s baseline range. No persistent cache
-  or hint code remains. Full samples and limits are in `COMPILE_BENCHMARK.md`.
-- Task A passes measured Lumion regression limits (+0.55 s wall, +0.0115 GiB RSS median).
-  The generated 4096-module interface design eliminates all 7898 skipped-body index builds.
-  Correctness checks: CTest 4/4, suite 27/27, both six-variant sweeps 246/246, Lumion VERIFY
-  3,798,275 signals with zero mismatched lists. DB and metadata comparisons pass.
+  or hint code remains. The contaminated third baseline and uneven sample exclusion policy
+  limit this conclusion. A rerun needs user approval, a uniform predeclared contamination
+  policy, and three quiet-host alternating pairs after the self-reference fix.
+- Historical Task A measurements pass Lumion regression limits (+0.55 s wall, +0.0115 GiB RSS
+  median). The generated 4096-module design eliminates all 7898 skipped-body index builds.
+  Full samples are in `COMPILE_BENCHMARK.md`; no new timing is claimed for this follow-up.
+
+Fallback coverage and defensive guards (pinned slang `50ce32a`; paths below are relative to
+`standalone_trace/third_party/slang/`):
+- `iface_conflict`: `iface_conflict.sv` maps a parent interface and its nested leaf to
+  destinations that do not preserve their containment relationship.
+- `iface_forwarding`: `iface_forwarding.sv` connects a module to an interface that itself has
+  an interface port. Root substitution does not model that forwarded connection graph.
+- `iface_unresolved`: no valid default-policy crossing fixture was found. Invalid/unconnected
+  ports yield empty connections (`source/ast/symbols/PortSymbols.cpp:917–939,1223–1235`);
+  forwarding resolution and empty-array/non-interface rejection occur in
+  `source/ast/Expression.cpp:1373–1415`. Empty instance arrays arise from dimension errors or
+  limits (`source/ast/symbols/InstanceSymbols.cpp:140–158`). These errors block graph building
+  in `standalone_trace/compile/Compiler.cc:411–415`. The unconnected-port probe fails before
+  producing a DB. Retain the guard for invalid or changed upstream states.
+- `iface_shape`: no valid default-policy crossing fixture was found. The cache key requires
+  matching definitions, parameters, recursive interface definitions and modports
+  (`source/ast/InstanceCacheKey.cpp:71–108`). Interface names, not heterogeneous concatenations,
+  are accepted (`source/ast/Expression.cpp:1321–1325`). Array connections are rewired to formal
+  ranges and must have compatible dimensions (`source/ast/symbols/PortSymbols.cpp:1193–1216,
+  1283–1321`). A dimension-mismatch probe fails before DB generation; differing generic
+  interface definitions compile but use separate cache keys. Keep the defensive guard.
+These statements are scoped to successful elaboration under the pinned default diagnostic
+policy; they do not assert unreachability under suppressed errors or future slang changes.
 
 Final Lumion numbers (main with items 2, 3 and 4, same session; both DBs `cmp`-identical to the
 item-2 reference DB, 19,659,527 endpoints):
