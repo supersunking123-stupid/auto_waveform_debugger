@@ -1478,7 +1478,7 @@ void MergeEndpointBitRangesInPlace(std::vector<EndpointRecord> &endpoints, Endpo
     }
     any_dropped = true;
     // Grouping is complete: provenance can now change without invalidating key lookups.
-    endpoints[first_index].bit_map_merged = true;
+    endpoints[first_index].bit_map_merged = kTrackMergedRangeProvenance;
     // Keep the source's range direction when every multi-bit member used [lo:hi].
     endpoints[first_index].bit_map = (any_ascending && !any_descending && cur_lo != cur_hi)
                                          ? "[" + std::to_string(cur_lo) + ":" + std::to_string(cur_hi) + "]"
@@ -1595,8 +1595,44 @@ size_t NumericArrayAxisCount(const slang::ast::Type &root_type) {
     type = type->getArrayElementType();
     if (type == nullptr) return count;
   }
-  if (type->isPredefinedInteger() && type->getBitWidth() > 1) ++count;
+  if (type->isIntegral() && type->getBitWidth() > 1) ++count;
   return count;
+}
+
+// Declaration metadata is independent of observed accesses and global compaction.
+void AppendDeclaredCoordinates(GraphDb &graph, uint32_t id, const slang::ast::Type &root) {
+  std::vector<GraphDeclaredAxis> axes;
+  const auto *type = &root;
+  uint32_t flags = root.isPackedArray() ? kCoordinatePackedOuter : 0u;
+  while (type->isArray()) {
+    GraphDeclaredAxis axis;
+    if (type->hasFixedRange()) {
+      const auto range = type->getFixedRange();
+      axis = {range.left, range.right, kAxisFixed};
+    }
+    if (type->isPackedArray()) axis.flags |= kAxisPacked;
+    if (type->isAssociativeArray()) flags |= kCoordinateUnsupported;
+    axes.push_back(axis);
+    type = type->getArrayElementType();
+    if (type == nullptr) { flags |= kCoordinateUnsupported; break; }
+  }
+  if (type != nullptr) {
+    const auto kind = type->getCanonicalType().kind;
+    if (kind == slang::ast::SymbolKind::EnumType) flags |= kCoordinateTerminalEnum;
+    if (kind == slang::ast::SymbolKind::PackedStructType ||
+        kind == slang::ast::SymbolKind::PackedUnionType)
+      flags |= kCoordinateTerminalAggregate | kCoordinateUnsupported;
+    if (type->isIntegral()) {
+      if (type->getBitWidth() > 1) {
+        const auto range = type->getFixedRange();
+        axes.push_back({range.left, range.right, kAxisFixed | kAxisPacked});
+      }
+    } else flags |= kCoordinateUnsupported;
+  }
+  if (axes.size() < 2) return;
+  graph.coordinates.push_back({id, static_cast<uint32_t>(graph.declared_axes.size()),
+                               static_cast<uint32_t>(axes.size()), flags});
+  graph.declared_axes.insert(graph.declared_axes.end(), axes.begin(), axes.end());
 }
 
 std::optional<int32_t> EvalLogicalIndex(const slang::ast::Expression &expression,
@@ -1609,6 +1645,18 @@ std::optional<int32_t> EvalLogicalIndex(const slang::ast::Expression &expression
   // positive overflow explicitly, instead of interpreting e.g. 32'hffffffff as -1.
   if (!integer.isSigned() && integer.getActiveBits() > 31) return std::nullopt;
   return integer.as<int32_t>();
+}
+
+std::string UnknownIndexMarker(const slang::ast::Expression &expression,
+                               const slang::ast::Symbol &symbol) {
+  slang::ast::EvalContext context(symbol);
+  const auto value = expression.eval(context);
+  if (!value || !value.isInteger()) return "?";
+  const auto &integer = value.integer();
+  if (integer.hasUnknown()) return "!constant-xz:";
+  if ((!integer.isSigned() && integer.getActiveBits() > 31) || !integer.as<int32_t>())
+    return "!constant-overflow:";
+  return "!oob:";
 }
 
 const slang::ast::Type *SelectorValueType(const slang::ast::Expression &expression) {
@@ -1629,6 +1677,7 @@ std::pair<std::string, bool> DescribeLogicalAxisSelectors(
     std::optional<std::pair<int32_t, int32_t>> range;
     std::string symbolic;
     bool unknown = false;
+    std::string marker = "?";
   };
   std::vector<Axis> axes;
   size_t axis_index = 0;
@@ -1640,9 +1689,11 @@ std::pair<std::string, bool> DescribeLogicalAxisSelectors(
     std::optional<std::pair<int32_t, int32_t>> selected;
     std::string text;
     bool consumes_axis = false;
+    std::string marker = "?";
     if (const auto *element = expression.as_if<slang::ast::ElementSelectExpression>()) {
       consumes_axis = true;
       text = GetSourceText(element->selector().sourceRange, sm);
+      marker = UnknownIndexMarker(element->selector(), symbol);
       if (const auto index = EvalLogicalIndex(element->selector(), symbol)) {
         if (type != nullptr &&
             (type->hasFixedRange() ? type->getFixedRange().containsPoint(*index) : *index >= 0))
@@ -1652,6 +1703,8 @@ std::pair<std::string, bool> DescribeLogicalAxisSelectors(
       const auto left = EvalLogicalIndex(range->left(), symbol);
       const auto right = EvalLogicalIndex(range->right(), symbol);
       const auto kind = range->getSelectionKind();
+      marker = !left ? UnknownIndexMarker(range->left(), symbol) :
+               !right ? UnknownIndexMarker(range->right(), symbol) : "!invalid-range:";
       const std::string separator = kind == slang::ast::RangeSelectionKind::IndexedUp ? "+:" :
                                     kind == slang::ast::RangeSelectionKind::IndexedDown ? "-:" : ":";
       text = GetSourceText(range->left().sourceRange, sm) + separator +
@@ -1667,11 +1720,13 @@ std::pair<std::string, bool> DescribeLogicalAxisSelectors(
         if (result && result->fullWidth() <= std::numeric_limits<int32_t>::max() &&
             (!type->hasFixedRange() || type->getFixedRange().contains(*result)))
           selected = std::make_pair(result->left, result->right);
+        else if (result) marker = "!oob:";
       }
     } else {
       text = GetSourceText(expression.sourceRange, sm);
     }
     if (!selected || axis.unknown) {
+      if (!axis.unknown) axis.marker = marker;
       axis.unknown = true;
       if (!axis.symbolic.empty()) axis.symbolic += " -> ";
       axis.symbolic += text;
@@ -1685,6 +1740,7 @@ std::pair<std::string, bool> DescribeLogicalAxisSelectors(
         if (low > high) {
           axis.unknown = true;
           axis.symbolic = text;
+          axis.marker = "!invalid-range:";
           axis.range.reset();
         } else {
           axis.range = selected->first < selected->second ? std::make_pair(low, high) :
@@ -1698,8 +1754,7 @@ std::pair<std::string, bool> DescribeLogicalAxisSelectors(
   bool approximate = false;
   for (const Axis &axis : axes) {
     if (axis.unknown || !axis.range) {
-      // The '?' distinguishes an out-of-bounds constant from an exact coordinate.
-      bit_map += "[?" + axis.symbolic + "]";
+      bit_map += "[" + axis.marker + axis.symbolic + "]";
       approximate = true;
     } else bit_map += FormatBitRange(axis.range->first, axis.range->second);
   }
@@ -2581,6 +2636,10 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
     graph.signals[i].parent_signal_id = signals[i].parent_signal_idx;
     graph.signals[i].member_bit_offset = static_cast<uint32_t>(signals[i].member_bit_offset);
     graph.signals[i].member_bit_width = static_cast<uint32_t>(signals[i].member_bit_width);
+    if (signals[i].parent_signal_idx == std::numeric_limits<uint32_t>::max() && signals[i].sym) {
+      if (const auto *value = signals[i].sym->as_if<slang::ast::ValueSymbol>())
+        AppendDeclaredCoordinates(graph, static_cast<uint32_t>(i), value->getType());
+    }
   }
 
   LogMemPhase("SaveGraphDb:AfterPreIntern strings=" + std::to_string(graph.strings.size()) +
@@ -2839,8 +2898,10 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
       // post-merge records within each list; never normalize refs or encodings.
       const auto t_dedup_start = profile_save_graph ? Clock::now() : Clock::time_point{};
       dedup_peak_list_size = std::max({dedup_peak_list_size, rec.drivers.size(), rec.loads.size()});
-      dedup_driver_count += DeduplicateEndpointsInPlace(rec.drivers, dedup_scratch);
-      dedup_load_count += DeduplicateEndpointsInPlace(rec.loads, dedup_scratch);
+      if (kEnableEndpointDedup) {
+        dedup_driver_count += DeduplicateEndpointsInPlace(rec.drivers, dedup_scratch);
+        dedup_load_count += DeduplicateEndpointsInPlace(rec.loads, dedup_scratch);
+      }
       if (profile_save_graph) t_dedup_s += elapsed_seconds(t_dedup_start, Clock::now());
 
       GraphSignalRecord &gs = graph.signals[sig_id];
@@ -3150,6 +3211,7 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
   }
 
   GraphDbFileHeader header;
+  header.reserved = 1;  // Version6 declared-coordinate footer is mandatory.
   std::memcpy(header.magic, kGraphDbMagic, sizeof(header.magic));
   header.string_count = graph.strings.size();
   header.string_blob_size = total_str_bytes;
@@ -3196,6 +3258,10 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
       !WriteBinaryVector(out, graph.hierarchy_params)) {
     return false;
   }
+  const uint64_t coordinate_count = graph.coordinates.size();
+  const uint64_t axis_count = graph.declared_axes.size();
+  if (!WriteBinaryValue(out, coordinate_count) || !WriteBinaryVector(out, graph.coordinates) ||
+      !WriteBinaryValue(out, axis_count) || !WriteBinaryVector(out, graph.declared_axes)) return false;
   const auto t_write_end = Clock::now();
   LogMemPhase("SaveGraphDb:AfterWrite");
   if (logger != nullptr) {
@@ -3213,6 +3279,26 @@ bool ValidateGraphRange(uint32_t begin, uint32_t count, size_t size) {
 }
 
 bool ValidateGraphDb(const GraphDb &graph) {
+  uint64_t next_axis = 0;
+  uint32_t previous_signal = 0;
+  bool first_coordinate = true;
+  for (const auto &row : graph.coordinates) {
+    if (row.signal_id >= graph.signals.size() || (!first_coordinate && row.signal_id <= previous_signal) ||
+        row.axis_count < 2 || row.axis_begin != next_axis || (row.flags & ~0x0fu) ||
+        ((row.flags & kCoordinateTerminalEnum) && (row.flags & kCoordinateTerminalAggregate)) ||
+        ((row.flags & kCoordinateTerminalAggregate) && !(row.flags & kCoordinateUnsupported)) ||
+        !ValidateGraphRange(row.axis_begin, row.axis_count, graph.declared_axes.size())) return false;
+    first_coordinate = false;
+    previous_signal = row.signal_id;
+    const auto &outer = graph.declared_axes[row.axis_begin];
+    if (bool(row.flags & kCoordinatePackedOuter) != bool(outer.flags & kAxisPacked)) return false;
+    next_axis += row.axis_count;
+  }
+  if (next_axis != graph.declared_axes.size()) return false;
+  for (const auto &axis : graph.declared_axes) {
+    if ((axis.flags & ~0x03u) || ((axis.flags & kAxisPacked) && !(axis.flags & kAxisFixed)) ||
+        (!(axis.flags & kAxisFixed) && (axis.left != 0 || axis.right != 0))) return false;
+  }
   for (const GraphSignalRecord &gs : graph.signals) {
     if (!ValidateGraphRange(gs.driver_begin, gs.driver_count, graph.endpoints.size())) return false;
     if (!ValidateGraphRange(gs.load_begin, gs.load_count, graph.endpoints.size())) return false;
@@ -3254,6 +3340,9 @@ bool ValidateGraphDb(const GraphDb &graph) {
 }
 
 bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db) {
+  // A reused graph must not carry v6 declarations into a legacy load.
+  graph.coordinates.clear();
+  graph.declared_axes.clear();
   ScopedFileLock db_lock;
   if (!db_lock.AcquireShared(db_path)) return false;
 
@@ -3264,8 +3353,9 @@ bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db)
   if (!ReadBinaryValue(in, header)) return false;
   if (std::memcmp(header.magic, kGraphDbMagic, sizeof(header.magic)) != 0) return false;
   if (header.version != 1 && header.version != 2 && header.version != 3 && header.version != 4 &&
-      header.version != 5)
+      header.version != 5 && header.version != 6)
     return false;
+  if (header.version == 6 && header.reserved != 1) return false;
 
   std::vector<uint32_t> string_offsets;
   if (!ReadBinaryVector(in, string_offsets, static_cast<size_t>(header.string_count + 1))) return false;
@@ -3352,6 +3442,23 @@ bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db)
                           static_cast<size_t>(hierarchy_param_count))) {
       return false;
     }
+  }
+  if (header.version == 6) {
+    // Bound footer allocations by the actual remaining bytes before resizing.
+    auto read_footer_vector = [&]<typename T>(std::vector<T> &items, uint64_t maximum) {
+      uint64_t count = 0;
+      if (!ReadBinaryValue(in, count) || count > maximum) return false;
+      const auto cursor = in.tellg();
+      in.seekg(0, std::ios::end);
+      const auto end = in.tellg();
+      in.seekg(cursor);
+      if (cursor < 0 || end < cursor || count > static_cast<uint64_t>(end - cursor) / sizeof(T))
+        return false;
+      return ReadBinaryVector(in, items, static_cast<size_t>(count));
+    };
+    if (!read_footer_vector(graph.coordinates, header.signal_count) ||
+        !read_footer_vector(graph.declared_axes, std::numeric_limits<uint32_t>::max()) ||
+        in.peek() != std::char_traits<char>::eof() || in.bad()) return false;
   }
   if (!ValidateGraphDb(graph)) return false;
 
@@ -3956,7 +4063,8 @@ bool ParseDefinesPlus(std::string_view tok, std::vector<std::string> &out) {
 // Epoch 3: logical declared-axis metadata for multidimensional selectors (E4b).
 // Epoch 4: persist merged-range provenance for root-only display narrowing (E4c).
 // Epoch 5: stable full-field endpoint duplicate removal after compaction/merge (E4d).
-constexpr int kCompileSemanticsEpoch = 5;
+// Epoch6: version6 declared-coordinate metadata and safe selector diagnostics (B fix).
+constexpr int kCompileSemanticsEpoch = 6;
 
 std::string ComputeCompileFingerprint(const std::vector<std::string> &passthrough_args) {
   std::vector<std::string> parts;
@@ -4192,6 +4300,22 @@ void PrintTraceJson(const TraceDb &db, const TraceOptions &opts, const TraceRunR
   std::cout << "{";
   std::cout << "\"target\":\"" << JsonEscape(opts.signal) << "\",";
   std::cout << "\"mode\":\"" << JsonEscape(opts.mode) << "\",";
+  std::cout << "\"coordinate_encoding\":\"" << opts.coordinate_encoding << "\",\"declared_axes\":[";
+  for (size_t i = 0; i < opts.declared_axes.size(); ++i) {
+    if (i) std::cout << ",";
+    const auto &axis = opts.declared_axes[i];
+    std::cout << "{\"left\":" << axis.left << ",\"right\":" << axis.right
+              << ",\"fixed\":" << ((axis.flags & kAxisFixed) ? "true" : "false")
+              << ",\"packed\":" << ((axis.flags & kAxisPacked) ? "true" : "false") << "}";
+  }
+  std::cout << "],\"diagnostics\":[";
+  for (size_t i = 0; i < opts.diagnostics.size(); ++i) {
+    if (i) std::cout << ",";
+    const auto &d = opts.diagnostics[i];
+    std::cout << "{\"code\":\"" << JsonEscape(d.code) << "\",\"message\":\"" << JsonEscape(d.message)
+              << "\",\"severity\":\"" << d.severity << "\"}";
+  }
+  std::cout << "],";
   std::cout << "\"summary\":{\"cone_level\":" << opts.cone_level << ",\"count\":"
             << result.endpoints.size() << ",\"visited\":"
             << result.visited_count << ",\"stops\":" << result.stops.size() << "},";
@@ -4208,6 +4332,11 @@ void PrintTraceJson(const TraceDb &db, const TraceOptions &opts, const TraceRunR
               << "\"line\":" << e.line << ","
               << "\"direction\":\"" << JsonEscape(e.direction) << "\","
               << "\"bit_map\":\"" << JsonEscape(e.bit_map) << "\","
+              << "\"bit_map_encoding\":\""
+              << (e.bit_map.empty() || e.kind == EndpointKind::kPort ? "unrestricted" :
+                  e.bit_map_logical_axes ? "declared_axes" :
+                  opts.coordinate_encoding == "parent_struct_bits" && path == opts.root_signal ? "parent_struct_bits" :
+                  db.format_version < 6 ? "legacy_flattened" : "flat_bits") << "\","
               << "\"bit_map_approximate\":" << (e.bit_map_approximate ? "true" : "false") << ","
               << "\"assignment\":\"" << JsonEscape(e.assignment_text) << "\","
               << "\"lhs\":[";

@@ -57,7 +57,7 @@ Notes:
 - `compile --compile-log <file>` writes key compile-stage steps and partition information into a log file while still printing to the console. During DB generation it also records `save_graph_db` sub-step timings such as `build_graph` and `write_file`.
 - The `trace` phase only queries the DB and does not parse RTL again.
 - The current DB format is a binary graph DB.
-- The current graph DB file version is `v4`.
+- The current graph DB file version is `v6`. It stores declared axes for multidimensional signals. See [coordinate format and diagnostics](./docs/COORDINATES_V6.md). Older readers reject `v6`; the current reader accepts graph versions `v1`–`v6`.
 - The old V7 / V8 text DB format is no longer supported. Re-run `compile` to generate the current graph DB.
 - If you previously generated an old graph DB (`v1`), you also need to re-run `compile`, because the new version persists assignment-LHS reverse references to accelerate `drivers` queries on interface members.
 - If you previously generated a `v2` or `v3` graph DB, re-run `compile` if you want `whereis-instance --show-params`; instance parameter metadata is persisted starting in `v4`.
@@ -76,7 +76,7 @@ Additional `trace` output details:
   - `rhs <hierarchical_path>` (RHS signal list)
 - `mode=loads`: if an expression can be associated with an assignment, the tool prints:
   - `lhs <hierarchical_path>` (LHS signal list)
-- `--format json`: output includes `summary`, `endpoints`, and `stops`, which is convenient for agents / scripts.
+- `--format json`: output includes `summary`, `endpoints`, and `stops`, plus coordinate encodings, declared axes and diagnostics. Ambiguous packed single-axis and out-of-bounds multidimensional queries return a clear error in JSON and text.
 - Source file locations in query results use the source-path style chosen at `compile` time. Without extra flags they keep the legacy logical/display form; with `compile --physical-source-paths` they are emitted as physical absolute paths when available.
 - Bit-select queries are supported: `--signal top.sig[3]`, `--signal top.sig[7:4]`.
 - `hier`: prints the instance hierarchy tree (supports `--root`, `--depth`, `--max-nodes`, `--format json`, `--show-source`).

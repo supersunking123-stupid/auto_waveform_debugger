@@ -459,7 +459,7 @@ int RunTraceWithSession(TraceSession &session, const TraceOptions &parsed_opts) 
               << " (expected hier.path followed by signed [index] or [left:right] selects)\n";
     return 1;
   }
-  const TraceOptions &opts = *resolved;
+  TraceOptions opts = *resolved;
   if (!LookupSignalId(session, opts.root_signal).has_value()) {
     std::cerr << "Signal not found: " << opts.root_signal << "\n";
     for (const std::string &s : TopSuggestions(session, opts.root_signal, 5)) {
@@ -467,32 +467,77 @@ int RunTraceWithSession(TraceSession &session, const TraceOptions &parsed_opts) 
     }
     return 2;
   }
+  const uint32_t id = *LookupSignalId(session, opts.root_signal);
+  opts.coordinate_encoding = session.db.format_version < 6 ? "legacy_unverified" : "flat_bits";
+  auto diagnostic = [&](std::string code, std::string message, bool error) {
+    opts.diagnostics.push_back({std::move(code), std::move(message), error ? "error" : "warning"});
+    const auto &d = opts.diagnostics.back();
+    std::cerr << d.severity << ": " << d.code << ": " << d.message << "\n";
+    if (error) {
+      if (opts.format == OutputFormat::kJson) PrintTraceJson(session.db, opts, TraceRunResult{});
+      else std::cout << d.severity << ": " << d.code << ": " << d.message << "\n";
+    }
+    return 1;
+  };
+  const auto &coordinate_rows = session.graph->coordinates;
+  const auto coordinate = std::lower_bound(coordinate_rows.begin(), coordinate_rows.end(), id,
+      [](const GraphSignalCoordinates &row, uint32_t value) { return row.signal_id < value; });
+  const bool has_coordinates = coordinate != coordinate_rows.end() && coordinate->signal_id == id;
+  if (has_coordinates) {
+    opts.coordinate_encoding = "declared_axes";
+    opts.declared_axes.assign(session.graph->declared_axes.begin() + coordinate->axis_begin,
+                             session.graph->declared_axes.begin() + coordinate->axis_begin + coordinate->axis_count);
+  }
+  if (session.graph->signals[id].parent_signal_id != std::numeric_limits<uint32_t>::max())
+    opts.coordinate_encoding = "parent_struct_bits";
+  if (!opts.signal_select_axes.empty()) {
+    if (session.db.format_version < 6) {
+      // An old DB does not retain declarations. Even an endpoint-free packed
+      // array must not silently be presented as a proven scalar vector.
+      diagnostic("legacy_dimensions_unverified",
+                 "Legacy DB lacks declared dimensions. Selected coordinates may be flattened bits or array axes; rebuild with the current compiler to disambiguate.", false);
+      const SignalRecord &record = SessionSignalRecord(session, id);
+      auto multi_axis_evidence = [](const std::vector<EndpointRecord> &edges) {
+        return std::any_of(edges.begin(), edges.end(), [](const EndpointRecord &endpoint) {
+          const auto axes = ParseEndpointAxes(endpoint.bit_map);
+          return axes && axes->size() > 1;
+        });
+      };
+      if (opts.signal_select_axes.size() > 1 || multi_axis_evidence(record.drivers) ||
+          multi_axis_evidence(record.loads))
+        return diagnostic("legacy_multidimensional_select",
+                          "Selected signal has multidimensional access evidence but the legacy DB lacks declared-axis metadata. Rebuild the DB with the current compiler.", true);
+    } else if (has_coordinates) {
+      if (coordinate->flags & kCoordinateUnsupported)
+        return diagnostic("unsupported_coordinate_type",
+                          "Selected packed aggregate or nonnumeric associative array coordinates remain unsupported in the current DB format.", true);
+      if (opts.signal_select_axes.size() > opts.declared_axes.size())
+        return diagnostic("too_many_axes", "Query supplies more axes than the signal declares.", true);
+      for (size_t axis = 0; axis < opts.signal_select_axes.size(); ++axis) {
+        const auto &declared = opts.declared_axes[axis];
+        const auto &selected = opts.signal_select_axes[axis];
+        if ((declared.flags & kAxisFixed) &&
+            (std::min(selected.first, selected.second) < std::min(declared.left, declared.right) ||
+             std::max(selected.first, selected.second) > std::max(declared.left, declared.right)))
+          return diagnostic("axis_out_of_bounds", "Axis " + std::to_string(axis) + " selection is outside declared [" +
+                            std::to_string(declared.left) + ":" + std::to_string(declared.right) +
+                            "]. Flattened waveform bit indices are not declared array coordinates.", true);
+      }
+      if (opts.signal_select_axes.size() == 1 && (coordinate->flags & kCoordinatePackedOuter))
+        return diagnostic("ambiguous_single_axis",
+                          "A single-axis query on a packed multidimensional signal can mean a flattened waveform bit or a declared outer axis. Supply multiple declared axes or query the whole signal; implicit flattened-bit interpretation is unsupported.", true);
+    } else if (opts.signal_select_axes.size() > 1 &&
+               session.graph->signals[id].parent_signal_id == std::numeric_limits<uint32_t>::max()) {
+      return diagnostic("unsupported_coordinate_type", "Signal has no supported multidimensional declaration; multidimensional selects remain unsupported.", true);
+    }
+  }
   if (opts.signal_select_axes.size() > 1) {
-    const uint32_t id = *LookupSignalId(session, opts.root_signal);
     if (session.graph->signals[id].parent_signal_id != std::numeric_limits<uint32_t>::max()) {
-      std::cerr << "Multi-dimensional selects of struct members remain unsupported: "
-                << opts.root_signal << "\n";
-      return 1;
+      return diagnostic("unsupported_struct_member_axes", "Multi-dimensional selects of struct members remain unsupported: " + opts.root_signal, true);
     }
     if (session.db.global_nets.contains(opts.root_signal) ||
         session.db.global_sink_to_source.contains(opts.root_signal)) {
-      std::cerr << "Multi-dimensional selects of compact global nets remain unsupported: "
-                << opts.root_signal << "\n";
-      return 1;
-    }
-    const SignalRecord &record = SessionSignalRecord(session, id);
-    const auto has_legacy_coordinates = [](const std::vector<EndpointRecord> &edges) {
-      return std::any_of(edges.begin(), edges.end(), [](const EndpointRecord &endpoint) {
-        return endpoint.kind == EndpointKind::kExpr && !endpoint.bit_map.empty() &&
-               !endpoint.bit_map_logical_axes;
-      });
-    };
-    if (has_legacy_coordinates(record.drivers) || has_legacy_coordinates(record.loads)) {
-      std::cerr << "Multi-dimensional select requires logical-axis DB metadata: "
-                << opts.root_signal << "\n"
-                << "Rebuild the DB with the current compiler. Multidimensional struct members "
-                   "and nonnumeric associative arrays remain unsupported.\n";
-      return 1;
+      return diagnostic("unsupported_compact_global_axes", "Multi-dimensional selects of compact global nets remain unsupported: " + opts.root_signal, true);
     }
   }
   TraceRunResult result = RunTraceQuery(session, opts);
@@ -501,6 +546,8 @@ int RunTraceWithSession(TraceSession &session, const TraceOptions &parsed_opts) 
     PrintTraceJson(session.db, opts, result);
   } else {
     PrintTraceText(session.db, opts, result);
+    for (const auto &d : opts.diagnostics)
+      std::cout << d.severity << ": " << d.code << ": " << d.message << "\n";
   }
   return 0;
 }

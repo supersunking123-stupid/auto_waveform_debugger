@@ -105,6 +105,29 @@ struct GraphSignalRecord {
 
 constexpr uint8_t kEndpointMergedRange = 0x01;
 constexpr uint8_t kEndpointLogicalAxes = 0x02;
+// Feature stages are enabled by the following independent fix commits.
+constexpr bool kTrackMergedRangeProvenance = false;
+constexpr bool kEnableEndpointDedup = false;
+
+constexpr uint32_t kCoordinatePackedOuter = 0x01;
+constexpr uint32_t kCoordinateUnsupported = 0x02;
+constexpr uint32_t kCoordinateTerminalEnum = 0x04;
+constexpr uint32_t kCoordinateTerminalAggregate = 0x08;
+constexpr uint32_t kAxisFixed = 0x01;
+constexpr uint32_t kAxisPacked = 0x02;
+struct GraphSignalCoordinates {
+  uint32_t signal_id = 0;
+  uint32_t axis_begin = 0;
+  uint32_t axis_count = 0;
+  uint32_t flags = 0;
+};
+struct GraphDeclaredAxis {
+  int32_t left = 0;
+  int32_t right = 0;
+  uint32_t flags = 0;
+};
+static_assert(sizeof(GraphSignalCoordinates) == 16);
+static_assert(sizeof(GraphDeclaredAxis) == 12);
 
 struct GraphEndpointRecord {
   uint32_t path_str_id = std::numeric_limits<uint32_t>::max();
@@ -179,6 +202,8 @@ struct GraphDb {
   std::vector<GraphInstanceParamRecord> hierarchy_params;
   std::vector<GraphGlobalNetRecord> global_nets;
   std::vector<uint32_t> global_sinks;
+  std::vector<GraphSignalCoordinates> coordinates;
+  std::vector<GraphDeclaredAxis> declared_axes;
   slang::flat_hash_map<uint32_t, size_t> load_ref_index;
   slang::flat_hash_map<uint32_t, size_t> driver_ref_index;
   slang::flat_hash_map<uint32_t, size_t> assignment_lhs_ref_index;
@@ -230,6 +255,10 @@ struct TraceOptions {
   std::optional<std::regex> exclude_re;
   std::optional<std::regex> stop_at_re;
   OutputFormat format = OutputFormat::kText;
+  std::string coordinate_encoding = "flat_bits";
+  std::vector<GraphDeclaredAxis> declared_axes;
+  struct Diagnostic { std::string code, message, severity; };
+  std::vector<Diagnostic> diagnostics;
 };
 
 struct TraceStop {
@@ -301,7 +330,7 @@ constexpr char kGraphDbMagic[kGraphDbMagicSize] = {
 
 struct GraphDbFileHeader {
   char magic[kGraphDbMagicSize];
-  uint32_t version = 5;
+  uint32_t version = 6;
   uint32_t reserved = 0;
   uint64_t string_count = 0;
   uint64_t string_blob_size = 0;

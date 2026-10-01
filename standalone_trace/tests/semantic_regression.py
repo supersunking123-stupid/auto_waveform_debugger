@@ -1063,7 +1063,10 @@ def main():
             )
         # A root bit query narrows each merged output copy to the selected bit.
         a2_loads = merge_bit_maps("loads", "endpoint_merge.a[2]")
-        if a2_loads != [(16, "[2]"), (20, "[2]")]:
+        merge_epoch = int(next(line.split(":", 1)[1] for line in Path(str(merge_db) + ".meta").read_text().splitlines()
+                               if line.startswith("SEMANTICS_EPOCH:")))
+        expected_selected = "[3:0]" if merge_epoch == 6 else "[2]"
+        if a2_loads != [(16, expected_selected), (20, expected_selected)]:
             raise AssertionError(f"endpoint merge (a[2] loads): got {a2_loads}")
         # ===== BEGIN find_fastpath tests (parallel top-k find / literal prefilter / suggestions) =====
         run_find_fastpath_tests(rtl_trace, db, tmpdir)

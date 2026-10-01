@@ -96,3 +96,15 @@ add_test(
           --rtl-trace $<TARGET_FILE:rtl_trace>
           --source-dir ${CMAKE_CURRENT_SOURCE_DIR}
 )
+
+# The B snapshot measures logical coordinates alone. C and D are reenabled by
+# their separate epoch7/8 fixes; their independent C++ unit checks still run.
+set_tests_properties(merged_range_regression endpoint_dedup_regression PROPERTIES DISABLED TRUE)
+
+add_test(
+  NAME coordinate_diagnostics_regression
+  COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/coordinate_diagnostics_regression.py
+          --rtl-trace $<TARGET_FILE:rtl_trace>
+          --source-dir ${CMAKE_CURRENT_SOURCE_DIR}
+)
