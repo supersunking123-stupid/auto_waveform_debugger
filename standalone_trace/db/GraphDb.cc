@@ -1482,7 +1482,7 @@ void MergeEndpointBitRangesInPlace(std::vector<EndpointRecord> &endpoints, Endpo
         [&](const auto &member) {
           return member.lo != items[run_begin].lo || member.hi != items[run_begin].hi;
         });
-    endpoints[first_index].bit_map_merged |= kTrackMergedRangeProvenance && different_coordinates;
+    endpoints[first_index].bit_map_merged |= different_coordinates;
     // Keep the source's range direction when every multi-bit member used [lo:hi].
     endpoints[first_index].bit_map = (any_ascending && !any_descending && cur_lo != cur_hi)
                                          ? "[" + std::to_string(cur_lo) + ":" + std::to_string(cur_hi) + "]"
@@ -2628,6 +2628,7 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
   graph.signals.resize(signals.size());
   slang::flat_hash_map<const slang::ast::Symbol *, uint32_t> symbol_path_ids;
   symbol_path_ids.reserve(signals.size());
+  slang::flat_hash_map<uint32_t, const slang::ast::Type *> member_types;
   for (size_t i = 0; i < signals.size(); ++i) {
     graph.signals[i].name_str_id = intern(signal_paths[i]);
     // Member signals reuse the parent's Symbol*, so they must NOT be inserted
@@ -2643,6 +2644,26 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
     if (signals[i].parent_signal_idx == std::numeric_limits<uint32_t>::max() && signals[i].sym) {
       if (const auto *value = signals[i].sym->as_if<slang::ast::ValueSymbol>())
         AppendDeclaredCoordinates(graph, static_cast<uint32_t>(i), value->getType());
+    } else if (signals[i].sym) {
+      // Retain declarations for multidimensional members without changing their
+      // existing absolute parent-bit endpoints. The sparse compile-only map
+      // avoids adding a type pointer to every signal in the design.
+      const uint32_t parent = signals[i].parent_signal_idx;
+      const auto *value = signals[parent].sym->as_if<slang::ast::ValueSymbol>();
+      const auto parent_type = member_types.find(parent);
+      const auto *type = parent_type != member_types.end() ? parent_type->second :
+                         value ? &value->getType() : nullptr;
+      const auto *packed = type ? type->getCanonicalType().as_if<slang::ast::PackedStructType>() : nullptr;
+      if (packed) {
+        const std::string_view field_name = std::string_view(signal_paths[i]).substr(signal_paths[parent].size() + 1);
+        const auto *field = packed->find(field_name);
+        const auto *field_value = field ? field->as_if<slang::ast::ValueSymbol>() : nullptr;
+        if (field_value) {
+          const auto &field_type = field_value->getType();
+          member_types.emplace(static_cast<uint32_t>(i), &field_type);
+          AppendDeclaredCoordinates(graph, static_cast<uint32_t>(i), field_type);
+        }
+      }
     }
   }
 
@@ -2902,10 +2923,8 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
       // post-merge records within each list; never normalize refs or encodings.
       const auto t_dedup_start = profile_save_graph ? Clock::now() : Clock::time_point{};
       dedup_peak_list_size = std::max({dedup_peak_list_size, rec.drivers.size(), rec.loads.size()});
-      if (kEnableEndpointDedup) {
-        dedup_driver_count += DeduplicateEndpointsInPlace(rec.drivers, dedup_scratch);
-        dedup_load_count += DeduplicateEndpointsInPlace(rec.loads, dedup_scratch);
-      }
+      dedup_driver_count += DeduplicateEndpointsInPlace(rec.drivers, dedup_scratch);
+      dedup_load_count += DeduplicateEndpointsInPlace(rec.loads, dedup_scratch);
       if (profile_save_graph) t_dedup_s += elapsed_seconds(t_dedup_start, Clock::now());
 
       GraphSignalRecord &gs = graph.signals[sig_id];
@@ -3215,7 +3234,7 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
   }
 
   GraphDbFileHeader header;
-  header.reserved = 1;  // Version6 declared-coordinate footer is mandatory.
+  header.reserved = kDbDeclaredAxes | kDbMemberDeclaredAxes;
   std::memcpy(header.magic, kGraphDbMagic, sizeof(header.magic));
   header.string_count = graph.strings.size();
   header.string_blob_size = total_str_bytes;
@@ -3343,7 +3362,9 @@ bool ValidateGraphDb(const GraphDb &graph) {
   return true;
 }
 
-bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db) {
+bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db,
+                 std::string *error) {
+  if (error) *error = "Failed to read DB: " + db_path;
   // A reused graph must not carry v6 declarations into a legacy load.
   graph.coordinates.clear();
   graph.declared_axes.clear();
@@ -3357,9 +3378,13 @@ bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db)
   if (!ReadBinaryValue(in, header)) return false;
   if (std::memcmp(header.magic, kGraphDbMagic, sizeof(header.magic)) != 0) return false;
   if (header.version != 1 && header.version != 2 && header.version != 3 && header.version != 4 &&
-      header.version != 5 && header.version != 6)
+      header.version != 5 && header.version != 6) {
+    if (error) *error = "unsupported DB version " + std::to_string(header.version) +
+                        " (this binary reads 1–6); recompile: " + db_path;
     return false;
-  if (header.version == 6 && header.reserved != 1) return false;
+  }
+  if (header.version == 6 && (!(header.reserved & kDbDeclaredAxes) ||
+                            (header.reserved & ~(kDbDeclaredAxes | kDbMemberDeclaredAxes)))) return false;
 
   std::vector<uint32_t> string_offsets;
   if (!ReadBinaryVector(in, string_offsets, static_cast<size_t>(header.string_count + 1))) return false;
@@ -3468,6 +3493,7 @@ bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db)
 
   compat_db.db_dir = std::filesystem::path(db_path).parent_path().string();
   compat_db.format_version = header.version;
+  compat_db.member_declared_axes_verified = header.version == 6 && (header.reserved & kDbMemberDeclaredAxes);
   compat_db.signals.clear();
   compat_db.hierarchy.clear();
   compat_db.global_nets.clear();
@@ -3563,12 +3589,13 @@ void BuildSessionReverseRefs(TraceSession &session) {
   session.reverse_refs_ready = true;
 }
 
-bool OpenTraceSession(const std::string &db_path, TraceSession &session, uint32_t flags) {
+bool OpenTraceSession(const std::string &db_path, TraceSession &session, uint32_t flags,
+                      std::string *error) {
   TraceSession fresh;
   fresh.db_path = db_path;
   fresh.db_mtime = StatMtimeString(db_path);
   GraphDb graph;
-  if (!LoadGraphDb(db_path, graph, fresh.db)) return false;
+  if (!LoadGraphDb(db_path, graph, fresh.db, error)) return false;
   fresh.graph = std::move(graph);
   session = std::move(fresh);
   BuildSessionSignalIndex(session);
@@ -4076,6 +4103,7 @@ std::string ComputeCompileFingerprint(const std::vector<std::string> &passthroug
   std::vector<std::string> parts;
   parts.push_back("rtl_trace_compile_fingerprint_v1");
   parts.push_back("SEMANTICS_EPOCH:" + std::to_string(kCompileSemanticsEpoch));
+  parts.push_back("MEMBER_DECLARED_AXES:1");
   for (const std::string &arg : passthrough_args)
     parts.push_back("ARG:" + arg);
 

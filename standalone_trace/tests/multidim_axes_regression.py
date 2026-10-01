@@ -202,20 +202,31 @@ endmodule
                 vector_db = root / (label + '_vector.db')
                 run(compiler, ['compile', '--db', vector_db, '--single-unit', scalar_source, '--top', 'vector_only'])
                 vector_dbs.append(vector_db)
-            # Version6 is an intentional format change, even for vectors. The
-            # prior body is identical in the epoch6 B-only feature snapshot.
-            current_meta=Path(str(vector_dbs[1])+'.meta').read_text()
-            if 'SEMANTICS_EPOCH:6\n' in current_meta:
-                prefix=footer(vector_dbs[1].read_bytes())[0]
-                old_layout=bytearray(vector_dbs[1].read_bytes()[:prefix])
-                struct.pack_into('<II',old_layout,16,5,0)
-                assert bytes(old_layout)==vector_dbs[0].read_bytes()
+            # C adds provenance on this fixture's adjacent distinct bit selects.
+            # Account only those exact flag bits; all other legacy bytes match.
+            prefix = footer(vector_dbs[1].read_bytes())[0]
+            old_layout = bytearray(vector_dbs[1].read_bytes()[:prefix])
+            struct.pack_into('<II', old_layout, 16, 5, 0)
+            header = struct.unpack_from('<16sII15Q', old_layout)
+            endpoint_start = 144 + 4 * (header[3] + 1) + header[4] + 32 * header[5]
+            provenance_count = 0
+            for index in range(header[6]):
+                flag_offset = endpoint_start + 48 * index + 47
+                if old_layout[flag_offset] & 1:
+                    assert old_layout[flag_offset] == 1
+                    old_layout[flag_offset] = 0
+                    provenance_count += 1
+            assert provenance_count > 0
+            assert bytes(old_layout) == vector_dbs[0].read_bytes()
+            print(f'PASS: active legacy vector byte comparison; {provenance_count} explicit merged-provenance flag deltas only')
             for query in ('vector_only.a', 'vector_only.a[2]'):
                 old=run(parent,['trace','--db',vector_dbs[0],'--mode','loads','--signal',query,'--format','json'])
                 compatible=run(binary,['trace','--db',vector_dbs[0],'--mode','loads','--signal',query,'--format','json'])
                 assert json.loads(old.stdout)==original_fields(json.loads(compatible.stdout))
                 if '[' in query: assert 'legacy_dimensions_unverified' in compatible.stderr
             print('PASS: one-dimensional legacy query fields unchanged; coordinate metadata and warning explicitly checked')
+        else:
+            print('SKIP: actual-parent legacy compatibility (--parent-bin not supplied)')
 
 
 if __name__ == '__main__':

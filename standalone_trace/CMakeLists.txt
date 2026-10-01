@@ -48,6 +48,14 @@ target_link_libraries(parallel_topk_test PRIVATE Threads::Threads ${CMAKE_DL_LIB
 
 enable_testing()
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
+set(RTL_TRACE_PARENT_BIN "/tmp/rtl_trace_item5_round3_main" CACHE FILEPATH
+    "Frozen main binary for legacy reader and incremental-cache regression tests")
+set(RTL_TRACE_PARENT_ARGS)
+if(EXISTS "${RTL_TRACE_PARENT_BIN}")
+  list(APPEND RTL_TRACE_PARENT_ARGS --parent-bin "${RTL_TRACE_PARENT_BIN}")
+else()
+  message(STATUS "SKIP: frozen main binary unavailable: ${RTL_TRACE_PARENT_BIN}")
+endif()
 
 add_test(
   NAME rtl_trace_semantic_regression
@@ -87,6 +95,7 @@ add_test(
           ${CMAKE_CURRENT_SOURCE_DIR}/tests/multidim_axes_regression.py
           --rtl-trace $<TARGET_FILE:rtl_trace>
           --source-dir ${CMAKE_CURRENT_SOURCE_DIR}
+          ${RTL_TRACE_PARENT_ARGS}
 )
 
 add_test(
@@ -103,4 +112,5 @@ add_test(
           ${CMAKE_CURRENT_SOURCE_DIR}/tests/coordinate_diagnostics_regression.py
           --rtl-trace $<TARGET_FILE:rtl_trace>
           --source-dir ${CMAKE_CURRENT_SOURCE_DIR}
+          ${RTL_TRACE_PARENT_ARGS}
 )

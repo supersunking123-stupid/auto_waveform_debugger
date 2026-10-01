@@ -87,6 +87,7 @@ struct TraceDb {
   std::vector<std::string> file_pool;
   std::string db_dir;
   uint32_t format_version = 0;
+  bool member_declared_axes_verified = false;
 };
 
 // --- Graph DB binary format types ---
@@ -105,11 +106,9 @@ struct GraphSignalRecord {
 
 constexpr uint8_t kEndpointMergedRange = 0x01;
 constexpr uint8_t kEndpointLogicalAxes = 0x02;
-// Feature stages are enabled by the following independent fix commits.
-constexpr bool kTrackMergedRangeProvenance = true;
-constexpr bool kEnableEndpointDedup = true;
-
 constexpr uint32_t kCoordinatePackedOuter = 0x01;
+constexpr uint32_t kDbDeclaredAxes = 0x01;
+constexpr uint32_t kDbMemberDeclaredAxes = 0x02;
 constexpr uint32_t kCoordinateUnsupported = 0x02;
 constexpr uint32_t kCoordinateTerminalEnum = 0x04;
 constexpr uint32_t kCoordinateTerminalAggregate = 0x08;

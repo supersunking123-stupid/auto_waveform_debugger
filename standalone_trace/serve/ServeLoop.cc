@@ -101,8 +101,9 @@ int RunServe(int argc, char *argv[]) {
   };
   auto open_db = [&](const std::string &path) -> int {
     TraceSession loaded;
-    if (!OpenTraceSession(path, loaded, kSessionHierarchy | kSessionReverseRefs)) {
-      std::cerr << "Failed to read DB: " << path << "\n";
+    std::string error;
+    if (!OpenTraceSession(path, loaded, kSessionHierarchy | kSessionReverseRefs, &error)) {
+      std::cerr << error << "\n";
       return 1;
     }
     session = std::move(loaded);

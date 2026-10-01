@@ -472,7 +472,9 @@ int RunTraceWithSession(TraceSession &session, const TraceOptions &parsed_opts) 
   auto diagnostic = [&](std::string code, std::string message, bool error) {
     opts.diagnostics.push_back({std::move(code), std::move(message), error ? "error" : "warning"});
     const auto &d = opts.diagnostics.back();
-    std::cerr << d.severity << ": " << d.code << ": " << d.message << "\n";
+    // JSON goes to stdout and diagnostics to stderr. Text errors have one copy.
+    if (!error || opts.format == OutputFormat::kJson)
+      std::cerr << d.severity << ": " << d.code << ": " << d.message << "\n";
     if (error) {
       if (opts.format == OutputFormat::kJson) PrintTraceJson(session.db, opts, TraceRunResult{});
       else std::cout << d.severity << ": " << d.code << ": " << d.message << "\n";
@@ -491,6 +493,10 @@ int RunTraceWithSession(TraceSession &session, const TraceOptions &parsed_opts) 
   if (session.graph->signals[id].parent_signal_id != std::numeric_limits<uint32_t>::max())
     opts.coordinate_encoding = "parent_struct_bits";
   if (!opts.signal_select_axes.empty()) {
+    const bool member = session.graph->signals[id].parent_signal_id != std::numeric_limits<uint32_t>::max();
+    if (member && !session.db.member_declared_axes_verified)
+      return diagnostic("unverified_struct_member_axes",
+                        "This DB lacks verified struct-member declaration axes. Selected member coordinates may be flattened bits or packed array axes; recompile the DB or query the whole member signal: " + opts.root_signal, true);
     if (session.db.format_version < 6) {
       // An old DB does not retain declarations. Even an endpoint-free packed
       // array must not silently be presented as a proven scalar vector.
@@ -510,7 +516,9 @@ int RunTraceWithSession(TraceSession &session, const TraceOptions &parsed_opts) 
     } else if (has_coordinates) {
       if (coordinate->flags & kCoordinateUnsupported)
         return diagnostic("unsupported_coordinate_type",
-                          "Selected packed aggregate or nonnumeric associative array coordinates remain unsupported in the current DB format.", true);
+                          "Selected coordinates of " + std::string((coordinate->flags & kCoordinateTerminalAggregate) ?
+                          "a packed struct or packed union array" : "a nonnumeric associative array or nonintegral element type") +
+                          " remain unsupported in the current DB format. Querying the whole signal still works: " + opts.root_signal, true);
       if (opts.signal_select_axes.size() > opts.declared_axes.size())
         return diagnostic("too_many_axes", "Query supplies more axes than the signal declares.", true);
       for (size_t axis = 0; axis < opts.signal_select_axes.size(); ++axis) {
@@ -523,9 +531,38 @@ int RunTraceWithSession(TraceSession &session, const TraceOptions &parsed_opts) 
                             std::to_string(declared.left) + ":" + std::to_string(declared.right) +
                             "]. Flattened waveform bit indices are not declared array coordinates.", true);
       }
-      if (opts.signal_select_axes.size() == 1 && (coordinate->flags & kCoordinatePackedOuter))
+      if (opts.signal_select_axes.size() == 1 && (coordinate->flags & kCoordinatePackedOuter)) {
+        const auto selected = opts.signal_select_axes.front();
+        const auto selector = [](int32_t left, int32_t right) {
+          return "[" + std::to_string(left) + (left == right ? "" : ":" + std::to_string(right)) + "]";
+        };
+        std::string row_query = opts.root_signal + selector(selected.first, selected.second);
+        for (size_t axis = 1; axis < opts.declared_axes.size(); ++axis)
+          row_query += selector(opts.declared_axes[axis].left, opts.declared_axes[axis].right);
+        std::string examples = " Declared row " + std::to_string(selected.first) + " → " + row_query + ".";
+        // A waveform's flattened bit zero is the rightmost element of every
+        // packed axis. Decode a mixed-radix offset without assuming [N:0].
+        int64_t bit = selected.first;
+        std::vector<int32_t> indexes(opts.declared_axes.size());
+        bool fixed = bit >= 0;
+        for (size_t axis = opts.declared_axes.size(); axis-- > 0;) {
+          const auto &declared = opts.declared_axes[axis];
+          if (!(declared.flags & kAxisFixed) || !(declared.flags & kAxisPacked)) { fixed = false; break; }
+          const int64_t width = std::abs(int64_t(declared.left) - declared.right) + 1;
+          const int64_t offset = bit % width;
+          indexes[axis] = static_cast<int32_t>(int64_t(declared.right) +
+              (declared.left >= declared.right ? offset : -offset));
+          bit /= width;
+        }
+        if (fixed && bit == 0 && selected.first == selected.second) {
+          std::string flat_query = opts.root_signal;
+          for (int32_t index : indexes) flat_query += selector(index, index);
+          examples += " Flattened bit " + std::to_string(selected.first) + " → " + flat_query + ".";
+        }
         return diagnostic("ambiguous_single_axis",
-                          "A single-axis query on a packed multidimensional signal can mean a flattened waveform bit or a declared outer axis. Supply multiple declared axes or query the whole signal; implicit flattened-bit interpretation is unsupported.", true);
+                          "A single-axis query on a packed multidimensional signal can mean a flattened waveform bit or a declared outer axis. Supply multiple declared axes or query the whole signal; implicit flattened-bit interpretation is unsupported." + examples +
+                          (member ? " Struct-member multi-axis selects remain unsupported; query the whole member signal." : ""), true);
+      }
     } else if (opts.signal_select_axes.size() > 1 &&
                session.graph->signals[id].parent_signal_id == std::numeric_limits<uint32_t>::max()) {
       return diagnostic("unsupported_coordinate_type", "Signal has no supported multidimensional declaration; multidimensional selects remain unsupported.", true);
@@ -559,8 +596,9 @@ int RunTrace(int argc, char *argv[]) {
   if (status == ParseStatus::kExitSuccess) return 0;
   if (status == ParseStatus::kError) return 1;
   TraceSession session;
-  if (!OpenTraceSession(*db_path, session, kSessionReverseRefs)) {
-    std::cerr << "Failed to read DB: " << *db_path << "\n";
+  std::string error;
+  if (!OpenTraceSession(*db_path, session, kSessionReverseRefs, &error)) {
+    std::cerr << error << "\n";
     return 1;
   }
   return RunTraceWithSession(session, opts);

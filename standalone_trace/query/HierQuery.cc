@@ -253,8 +253,9 @@ int RunHier(int argc, char *argv[]) {
   if (status == ParseStatus::kExitSuccess) return 0;
   if (status == ParseStatus::kError) return 1;
   TraceSession session;
-  if (!OpenTraceSession(*db_path, session, kSessionHierarchy)) {
-    std::cerr << "Failed to read DB: " << *db_path << "\n";
+  std::string error;
+  if (!OpenTraceSession(*db_path, session, kSessionHierarchy, &error)) {
+    std::cerr << error << "\n";
     return 1;
   }
   return RunHierWithSession(session, opts);

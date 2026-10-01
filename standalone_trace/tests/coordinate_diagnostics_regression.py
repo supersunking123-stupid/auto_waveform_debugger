@@ -29,7 +29,7 @@ def trace(binary, db, signal, mode='loads', expected=0, text=False):
 
 def footer(data):
     h = struct.unpack_from('<16sII15Q', data)
-    assert h[1:3] == (6, 1), h[:3]
+    assert h[1] == 6 and h[2] in (1, 3), h[:3]
     pos = 144 + 4 * (h[3] + 1) + h[4]
     pos += sum(n * size for n, size in zip(h[5:], (32, 48, 4, 12, 4, 12, 4, 12, 4, 24, 4, 16, 4)))
     count = struct.unpack_from('<Q', data, pos)[0]
@@ -80,7 +80,7 @@ def main():
                 assert not body['endpoints'] and body['coordinate_encoding'] == 'declared_axes'
                 assert 'rebuild' not in p.stderr.lower(), p.stderr
                 text = trace(binary, db, name, mode, expected=1, text=True)
-                assert text.stdout == text.stderr and code in text.stdout, text.stdout
+                assert not text.stderr and code in text.stdout, text.stdout
                 records.append({'signal': name, 'mode': mode, 'code': code, 'json': body})
         p_whole = json.loads(trace(binary, db, 'coordinate_diagnostics.p').stdout)
         maps = {e['bit_map'] for e in p_whole['endpoints']}
@@ -97,6 +97,29 @@ def main():
         assert unused['declared_axes'] == [{'left': 3, 'right': 0, 'fixed': True, 'packed': True},
                                           {'left': 1, 'right': 0, 'fixed': True, 'packed': True}], unused
         print('PASS: declaration bounds/packed ambiguity in both modes, enum axes, aggregate unsupported, exact OOB vs dynamic markers')
+        for mode in ('drivers', 'loads'):
+            ambiguous = json.loads(trace(binary, db, 'coordinate_diagnostics.p[2]', mode, expected=1).stdout)
+            message = ambiguous['diagnostics'][-1]['message']
+            assert 'Declared row 2 → coordinate_diagnostics.p[2][1:0]' in message, message
+            assert 'Flattened bit 2 → coordinate_diagnostics.p[1][0]' in message, message
+            aggregate = json.loads(trace(binary, db, 'coordinate_diagnostics.aggregates[1]', mode, expected=1).stdout)
+            assert 'packed struct or packed union array' in aggregate['diagnostics'][-1]['message']
+            assert 'whole signal still works' in aggregate['diagnostics'][-1]['message']
+            trace(binary, db, 'coordinate_diagnostics.aggregates', mode)
+            member = json.loads(trace(binary, db, 'coordinate_diagnostics.member_packet.matrix[2]', mode, expected=1).stdout)
+            assert member['diagnostics'][-1]['code'] == 'ambiguous_single_axis'
+            multi = json.loads(trace(binary, db, 'coordinate_diagnostics.member_packet.matrix[2][1]', mode, expected=1).stdout)
+            assert multi['diagnostics'][-1]['code'] == 'unsupported_struct_member_axes'
+            trace(binary, db, 'coordinate_diagnostics.member_packet.matrix', mode)
+            trace(binary, db, 'coordinate_diagnostics.member_packet.vector[2]', mode)
+        assert struct.unpack_from('<I', data, 20)[0] == 3
+        round2 = root / 'round2_features.db'
+        round2_data = bytearray(data); struct.pack_into('<I', round2_data, 20, 1)
+        round2.write_bytes(round2_data)
+        selected_member = json.loads(trace(binary, round2, 'coordinate_diagnostics.member_packet.matrix[2]', expected=1).stdout)
+        assert selected_member['diagnostics'][-1]['code'] == 'unverified_struct_member_axes'
+        trace(binary, round2, 'coordinate_diagnostics.member_packet.matrix')
+        print('PASS: rewritten declared/flat queries, specific aggregate type, member ambiguity and fresh scalar-member selection')
 
         # Remove the footer and feature fields to create a declaration-free v5
         # reader fixture. New coordinate records must not be inferred as declarations.
@@ -130,6 +153,18 @@ def main():
             failed = run(binary, ['find', '--db', bad, '--query', 'p'], expected=1)
             assert 'Failed to read DB' in failed.stderr, failed.stderr
         print('PASS: sparse row IDs/flags/coverage, bounded allocations, truncation and trailing bytes reject')
+        for version in (0, 7, 999):
+            bad = root / ('version_'+str(version)+'.db')
+            changed = bytearray(data); struct.pack_into('<I', changed, 16, version); bad.write_bytes(changed)
+            commands = [['trace', '--mode', 'loads', '--signal', 'coordinate_diagnostics.p'],
+                        ['find', '--query', 'p'], ['hier'],
+                        ['whereis-instance', '--instance', 'coordinate_diagnostics'], ['serve']]
+            for command in commands:
+                # Serve reports startup errors within its response loop and exits normally.
+                failed = run(binary, [command[0], '--db', bad, *command[1:]], expected=0 if command[0] == 'serve' else 1)
+                assert f'unsupported DB version {version} (this binary reads 1–6); recompile' in failed.stderr, failed.stderr
+                assert 'Failed to read DB' not in failed.stderr
+        print('PASS: trace/find/hier/whereis/serve report specific unsupported DB versions')
 
         # Serve errors retain the response boundary and the next query succeeds.
         serve = subprocess.run(
@@ -151,6 +186,12 @@ def main():
             assert db.read_bytes() == data and meta_path.read_text() == current_meta
         hit = compile_db(binary, source, db, incremental=True)
         assert 'cache hit' in (hit.stdout+hit.stderr).lower()
+        # A round-2 DB has epoch 8 too, but lacks member declaration coverage.
+        assert 'MEMBER_DECLARED_AXES:1\n' in current_meta
+        meta_path.write_text(current_meta.replace('MEMBER_DECLARED_AXES:1\n', ''))
+        rebuilt = compile_db(binary, source, db, incremental=True)
+        assert 'cache hit' not in (rebuilt.stdout+rebuilt.stderr).lower()
+        assert db.read_bytes() == data and meta_path.read_text() == current_meta
         if args.parent_bin:
             parent = args.parent_bin.resolve()
             old = root / 'actual_parent.db'
@@ -163,7 +204,10 @@ def main():
             rebuilt = compile_db(binary, source, old, incremental=True)
             assert 'cache hit' not in (rebuilt.stdout+rebuilt.stderr).lower() and old.read_bytes() == data
             records.append({'old_reader_rejects_v6': True, 'actual_parent_incremental_rebuild': True})
-        print('PASS: epochs3/4/5 incremental refusal, fresh hit and optional actual-parent/old-reader compatibility')
+            print('PASS: actual-parent/old-reader compatibility')
+        else:
+            print('SKIP: actual-parent/old-reader compatibility (--parent-bin not supplied)')
+        print('PASS: epochs 3/4/5 and missing member-coverage feature force rebuild; fresh hit')
         off = root / 'canonical_off.db'
         compile_db(binary, source, off, env={'RTL_TRACE_CANONICAL_BODIES': '0'})
         assert off.read_bytes() == data

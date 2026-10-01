@@ -77,7 +77,8 @@ std::string StatMtimeString(const std::string &path);
 void BuildSessionSignalIndex(TraceSession &session);
 void EnsureSessionHierarchy(TraceSession &session);
 void BuildSessionReverseRefs(TraceSession &session);
-bool OpenTraceSession(const std::string &db_path, TraceSession &session, uint32_t flags);
+bool OpenTraceSession(const std::string &db_path, TraceSession &session, uint32_t flags,
+                      std::string *error = nullptr);
 std::optional<uint32_t> LookupSignalId(const TraceSession &session, std::string_view name);
 const std::string &SessionSignalName(const TraceSession &session, uint32_t id);
 const SignalRecord &SessionSignalRecord(TraceSession &session, uint32_t id);
@@ -89,7 +90,8 @@ std::vector<uint32_t> SessionAssignmentLhsRefs(const TraceSession &session, uint
 
 bool ValidateGraphRange(uint32_t begin, uint32_t count, size_t size);
 bool ValidateGraphDb(const GraphDb &graph);
-bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db);
+bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db,
+                 std::string *error = nullptr);
 
 // --- CLI utilities ---
 

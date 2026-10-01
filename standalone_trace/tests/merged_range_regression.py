@@ -38,7 +38,7 @@ def trace(binary, db, signal, extra=(), mode='drivers'):
 
 def layout(data):
     header = list(HEADER.unpack_from(data))
-    assert header[1] == 6 and header[2] == 1
+    assert header[1] == 6 and header[2] in (1, 3)
     strings_count, blob_size, signals_count, endpoints_count = header[3:7]
     blob_start = HEADER.size + 4 * (strings_count + 1)
     offsets = struct.unpack_from('<' + 'I' * (strings_count + 1), data, HEADER.size)
@@ -334,6 +334,8 @@ def main():
             hit = compile_db(binary, fixture, parent_db, incremental=True)
             assert 'cache hit' in (hit.stdout + hit.stderr).lower()
             print(f'PASS: {merged_count} merged flags are the only DB-byte deltas; old DB outputs exact; traversal unchanged; epoch 6 -> 7 rebuild then hit')
+        else:
+            print('SKIP: epoch 6 parent comparison (compatible B-only snapshot not supplied)')
 
 
 if __name__ == '__main__':

@@ -482,6 +482,8 @@ def main():
         print('PASS positive RTL dedup, canonical on/off, VERIFY, raw global threshold, cycle/node/depth/filter tests')
         if args.parent_bin:
             parent_checks(binary, args.parent_bin.resolve(), source, root, root, db)
+        else:
+            print('SKIP: epoch 7 parent comparison (compatible C-only snapshot not supplied)')
 
 
 if __name__ == '__main__':
