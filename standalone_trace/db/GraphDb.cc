@@ -3364,10 +3364,16 @@ bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db,
   // safe: legacy code can lock an old inode then reopen the newly renamed path.
   std::filesystem::path target;
   if (!ResolveGraphDestination(db_path, target)) return false;
-  const int fd = ::open(target.c_str(), O_RDONLY | O_CLOEXEC);
+  const int fd = ::open(target.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
   if (fd < 0) return false;
   struct stat st;
+  // Reject FIFOs/devices before flock; retain a fresh size check after taking
+  // the inode lease because a cooperating writer can finish while we wait.
+  if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+    ::close(fd); return false;
+  }
   if (::flock(fd, LOCK_SH) != 0 || ::fstat(fd, &st) != 0 ||
+      !S_ISREG(st.st_mode) ||
       st.st_size < static_cast<off_t>(sizeof(GraphDbFileHeader)) ||
       static_cast<uint64_t>(st.st_size) > std::numeric_limits<size_t>::max()) {
     ::close(fd);

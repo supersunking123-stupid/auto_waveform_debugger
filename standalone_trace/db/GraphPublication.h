@@ -33,12 +33,12 @@ class ScopedFileLock {
   ScopedFileLock &operator=(const ScopedFileLock &) = delete;
   ~ScopedFileLock() { if (fd_ >= 0) ::close(fd_); }
   bool Acquire(const std::string &path) {
-    fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0666);
-    if (fd_ < 0) fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_NONBLOCK, 0666);
+    if (fd_ < 0) fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
     return Lock(LOCK_EX);
   }
   bool AcquireShared(const std::string &path, bool optional = false) {
-    fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
     if (fd_ < 0 && optional && errno == ENOENT) return true;
     return Lock(LOCK_SH);
   }
@@ -46,6 +46,10 @@ class ScopedFileLock {
  private:
   bool Lock(int operation) {
     if (fd_ < 0) return false;
+    struct stat st;
+    if (::fstat(fd_, &st) != 0 || !S_ISREG(st.st_mode)) {
+      ::close(fd_); fd_ = -1; errno = EINVAL; return false;
+    }
     while (::flock(fd_, operation) != 0) {
       if (errno == EINTR) continue;
       ::close(fd_); fd_ = -1; return false;
@@ -277,13 +281,13 @@ inline bool GraphCompileCacheHit(const std::string &requested, const std::string
   // A legacy DB can lack a sidecar. Do not make an unlocked cache decision
   // while the first atomic writer creates that mutex; rebuild under EX instead.
   if (!lock.AcquireShared(target.string() + ".lock")) return false;
-  int fd = ::open(target.c_str(), O_RDONLY | O_CLOEXEC);
+  int fd = ::open(target.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
   GraphDbFileHeader header; uint64_t size = 0;
   const bool valid = fd >= 0 && ReadCacheHeader(fd, header, size);
   if (fd >= 0) ::close(fd);
   if (!valid) return false;
   const std::string expected = fingerprint + CacheEnvelope(header, size);
-  fd = ::open((target.string() + ".meta").c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  fd = ::open((target.string() + ".meta").c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
   if (fd < 0) return false;
   struct stat st;
   bool okay = ::fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0 &&

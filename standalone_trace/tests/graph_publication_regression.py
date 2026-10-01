@@ -66,6 +66,35 @@ def main():
             out, err = process.communicate(timeout=20)
             assert process.returncode == expected, (process.returncode, out, err)
 
+        # Opening a malformed cache node must not wait for a FIFO peer before
+        # its regular-file check. Refuse nonregular publication targets too.
+        for node in (metadata, destination, Path(str(destination)+'.lock')):
+            compile_db(binary, destination, a)
+            node.unlink()
+            os.mkfifo(node)
+            try:
+                attempt = subprocess.run(
+                    [str(binary), 'compile', '--db', str(destination),
+                     '--single-unit', str(a), '--top', 'mapped_top', '--incremental'],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+                assert attempt.returncode != 0, (node, attempt.stdout, attempt.stderr)
+                assert b'incremental-cache-hit' not in attempt.stdout
+                assert not list(root.glob('.rtl_trace_stage_*')), node
+                if node == destination:
+                    fifo_fd = os.open(node, os.O_RDWR | os.O_NONBLOCK)
+                    try:
+                        fcntl.flock(fifo_fd, fcntl.LOCK_EX)
+                        result = subprocess.run(
+                            [str(binary), 'find', '--db', str(destination), '--query', 'mapped_top'],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+                        assert result.returncode != 0, result
+                    finally:
+                        os.close(fifo_fd)
+            finally:
+                node.unlink()
+            compile_db(binary, destination, a)
+        print('PASS: FIFO DB, metadata and sidecar fail promptly without a cache hit or staging leak')
+
         for stage in ('prepared', 'db_closed', 'meta_closed', 'meta_invalidated', 'db_published', 'meta_published'):
             compile_db(binary, destination, a)
             process = publish(b, stage)
