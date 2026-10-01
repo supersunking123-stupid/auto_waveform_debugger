@@ -157,3 +157,18 @@ add_test(
           --rtl-trace $<TARGET_FILE:rtl_trace>
           ${RTL_TRACE_REFERENCE_ARGS}
 )
+
+set(RTL_TRACE_GENERATE_PARENT_BIN "/tmp/rtl_trace_item5_round3_phase2_v2" CACHE FILEPATH
+    "Frozen epoch 8 binary for inactive-generate incremental rebuild regression")
+set(RTL_TRACE_GENERATE_PARENT_ARGS)
+if(EXISTS "${RTL_TRACE_GENERATE_PARENT_BIN}")
+  list(APPEND RTL_TRACE_GENERATE_PARENT_ARGS --parent-bin "${RTL_TRACE_GENERATE_PARENT_BIN}")
+endif()
+add_test(
+  NAME uninstantiated_generate_regression
+  COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/uninstantiated_generate_regression.py
+          --rtl-trace $<TARGET_FILE:rtl_trace>
+          --source-dir ${CMAKE_CURRENT_SOURCE_DIR}
+          ${RTL_TRACE_GENERATE_PARENT_ARGS}
+)

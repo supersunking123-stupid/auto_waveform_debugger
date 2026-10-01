@@ -15,6 +15,7 @@
 
 // Slang AST headers needed for compile-time trace building
 #include "slang/ast/ASTVisitor.h"
+#include "slang/syntax/SyntaxNode.h"
 #include "slang/ast/Compilation.h"
 #include "slang/ast/EvalContext.h"
 #include "slang/ast/Expression.h"
@@ -539,6 +540,16 @@ class BodyTraceIndexBuilder : public slang::ast::ASTVisitor<BodyTraceIndexBuilde
   BodyTraceIndexBuilder(BodyTraceIndex &index, PerBodyTraceCache &body_cache,
                         const slang::ast::InstanceBodySymbol &body)
       : index_(index), body_cache_(body_cache), body_(body) {}
+
+  void handle(const slang::ast::GenerateBlockSymbol &block) {
+    if (!block.isUninstantiated) this->visitDefault(block);
+  }
+
+  void handle(const slang::ast::GenerateBlockArraySymbol &array) {
+    // Explicit entries traversal also keeps a zero-trip array empty.
+    for (const auto *block : array.entries)
+      if (block != nullptr) block->visit(*this);
+  }
 
   void handle(const slang::ast::InstanceSymbol &inst) {
     for (const slang::ast::PortConnection *conn : inst.getPortConnections()) {
@@ -2220,6 +2231,8 @@ void DecomposeStructMembers(std::vector<SignalCompileItem> &signals, std::vector
     DecomposePackedStructFields(signals, paths, static_cast<uint32_t>(i), max_depth, 1, 0);
   }
 }
+
+#include "db/InactiveScopes.inc"
 
 void CollectInstanceHierarchy(const slang::ast::RootSymbol &root, const slang::SourceManager &sm,
                               TraceDb &db, CompileContext &compile_ctx) {
@@ -4111,7 +4124,8 @@ bool ParseDefinesPlus(std::string_view tok, std::vector<std::string> &out) {
 // Epoch6: version6 declared-coordinate metadata and safe selector diagnostics (B fix).
 // Epoch7: narrowing provenance requires different merged coordinates (C fix).
 // Epoch8: stable full-field dedup with cheap singleton and touched-slot reuse (D fix).
-constexpr int kCompileSemanticsEpoch = 8;
+// Epoch9: omit endpoints/references in uninstantiated generate branches.
+constexpr int kCompileSemanticsEpoch = 9;
 
 std::string ComputeCompileFingerprint(const std::vector<std::string> &passthrough_args) {
   std::vector<std::string> parts;
