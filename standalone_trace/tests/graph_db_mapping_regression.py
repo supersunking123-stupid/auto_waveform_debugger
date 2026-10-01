@@ -162,15 +162,24 @@ def main():
                 elif command[0] in ('find', 'trace', 'hier'):
                     assert got.stdout == query(binary, db, command).stdout, (version, command)
         print('PASS: v1-v5 queries and unaligned mapped sections')
+        other_source = root / 'other.sv'
+        other_source.write_text(SOURCE.replace('logic [7:0] mid;', 'logic [7:0] mid; logic other_marker;'))
+        other_db = root / 'other.db'
+        compile_db(binary, other_db, other_source)
+        variants = {original: Path(str(db) + '.meta').read_bytes(),
+                    other_db.read_bytes(): Path(str(other_db) + '.meta').read_bytes()}
         writers = [subprocess.Popen([str(binary), 'compile', '--db', str(db), '--single-unit',
-                                     str(source), '--top', 'mapped_top'],
+                                     str(src), '--top', 'mapped_top'],
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                   for _ in range(2)]
+                   for src in (source, other_source)]
         for writer in writers:
             stdout, stderr = writer.communicate(timeout=20)
             assert writer.returncode == 0, (writer.returncode, stdout, stderr)
-        assert db.read_bytes() == original and not list(root.glob('*.tmp.*'))
-        print('PASS: concurrent same-source writers publish complete identical snapshots')
+        assert db.read_bytes() in variants
+        assert Path(str(db) + '.meta').read_bytes() == variants[db.read_bytes()]
+        assert not list(root.glob('.rtl_trace_stage_*'))
+        compile_db(binary, db, source)
+        print('PASS: concurrent different-source writers publish matching DB/fingerprint pairs')
 
         # Readers do not create sidecars, including when the DB directory is read-only.
         readonly = root / 'readonly'
@@ -249,7 +258,7 @@ def main():
                 assert b'new_marker' in client.query(command)
         finally:
             client.close()
-        assert not list(root.glob('*.tmp.*'))
+        assert not list(root.glob('.rtl_trace_stage_*'))
         print('PASS: compile while serve is mapped, mode preservation, reload lifetimes')
 
         # Atomic output follows the symlink target, matching the preceding writer.
@@ -270,7 +279,7 @@ def main():
         result = subprocess.run([str(binary), 'compile', '--db', str(destination), '--single-unit',
                                  str(source), '--top', 'mapped_top'], capture_output=True, timeout=20)
         assert result.returncode != 0 and (destination / 'keep').read_text() == 'preserved'
-        assert not list(root.glob('*.tmp.*'))
+        assert not list(root.glob('.rtl_trace_stage_*'))
         print('PASS: failed publication cleans its temporary file')
 
 

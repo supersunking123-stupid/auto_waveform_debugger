@@ -1,4 +1,5 @@
 #include "db/GraphDbTypes.h"
+#include "db/GraphStringView.h"
 
 #include <array>
 #include <cstdlib>
@@ -44,6 +45,31 @@ static void CheckUnalignedRecords() {
 }
 
 int main() {
+  std::array<char, 20> storage{};
+  uint32_t offsets[] = {0, 3, 5};
+  std::memcpy(storage.data(), offsets, sizeof(offsets));
+  std::memcpy(storage.data() + sizeof(offsets), "abcde", 5);
+  GraphDb db;
+  db.mapping = std::shared_ptr<void>(storage.data(), [](void *) {});
+  db.mapping_bytes = storage.size();
+  db.mapped_string_offsets = GraphPodView<uint32_t>(storage.data(), 3);
+  db.mapped_string_blob = storage.data() + sizeof(offsets);
+  db.mapped_string_blob_bytes = 5;
+  Require(ReadMappedGraphString(db, 0) == "abc");
+  Require(ReadMappedGraphString(db, 1) == "de");
+  // Mutate the already-loaded offset table, as an in-place writer can do.
+  uint32_t bad = 0xffffffff;
+  std::memcpy(storage.data() + 4, &bad, 4);
+  Require(ReadMappedGraphString(db, 0).empty());
+  Require(ReadMappedGraphString(db, 1).empty());
+  std::memcpy(storage.data(), offsets, sizeof(offsets));
+  Require(ReadMappedGraphString(db, 0) == "abc");
+  db.mapping_bytes = 14;
+  Require(ReadMappedGraphString(db, 0).empty());
+  db.mapping_bytes = storage.size();
+  db.mapped_string_offsets = GraphPodView<uint32_t>(storage.data() + 19, 3);
+  Require(ReadMappedGraphString(db, 0).empty());
+  Require(ReadMappedGraphString(db, 0xffffffff).empty());
   CheckUnalignedRecords<uint32_t>();
   CheckUnalignedRecords<GraphSignalRecord>();
   CheckUnalignedRecords<GraphEndpointRecord>();

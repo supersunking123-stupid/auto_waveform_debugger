@@ -199,6 +199,7 @@ class GraphPodView {
   explicit GraphPodView(const std::vector<T> &items)
       : data_(reinterpret_cast<const char *>(items.data())), size_(items.size()) {}
   size_t size() const { return size_; }
+  const char *data() const { return data_; }
   bool empty() const { return size_ == 0; }
   T operator[](size_t i) const {
     T value;
@@ -254,8 +255,11 @@ struct GraphDb {
   std::vector<GraphDeclaredAxis> declared_axes;
   // Compiler writes use the owned vectors above. Runtime reads use immutable mappings.
   std::shared_ptr<void> mapping;
+  size_t mapping_bytes = 0;
+  int mapping_fd = -1;  // owned by mapping's deleter, never closed separately
   GraphPodView<uint32_t> mapped_string_offsets;
   const char *mapped_string_blob = nullptr;
+  size_t mapped_string_blob_bytes = 0;
   GraphPodView<GraphSignalRecord> mapped_signals;
   GraphPodView<GraphSignalRecord> ReadSignals() const {
     return mapped_signals.empty() ? GraphPodView<GraphSignalRecord>(signals) : mapped_signals;

@@ -3,6 +3,7 @@
 #include "db/EntryPoints.h"
 #include "db/GraphDbTypes.h"
 #include "db/GraphDbInternals.h"
+#include <sys/stat.h>
 #include "query/TraceQuery.h"
 #include "query/HierQuery.h"
 #include "query/FindQuery.h"
@@ -148,6 +149,18 @@ int RunServe(int argc, char *argv[]) {
         std::cout << "bye\n";
         finish_response();
         break;
+      }
+      if (session && session->graph && cmd != "reload" && cmd != "open") {
+        const auto &graph = *session->graph;
+        struct stat mapped;
+        if (graph.mapping_fd >= 0 && (::fstat(graph.mapping_fd, &mapped) != 0 ||
+            mapped.st_size < 0 || static_cast<uint64_t>(mapped.st_size) != graph.mapping_bytes)) {
+          const auto path = session->db_path;
+          session.reset();
+          std::cerr << "Failed to read DB: " << path << " (mapped file size changed)\n";
+          finish_response();
+          continue;
+        }
       }
       if (cmd == "help") {
         if (args.empty()) {

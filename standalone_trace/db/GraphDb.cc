@@ -8,6 +8,8 @@
 #include "db/ParallelTopK.h"
 #include "db/CanonicalPath.h"
 #include "db/EndpointDedup.h"
+#include "db/GraphPublication.h"
+#include "db/GraphStringView.h"
 #include "compile/CompileData.h"
 #include "AssignmentUtils.h"
 
@@ -397,110 +399,6 @@ struct TraceCompileCache {
 };
 
 #include "db/CanonicalBodiesStats.inc"  // instance-body binding statistics (RTL_TRACE_CANONICAL_STATS=1)
-
-// ScopedFileLock — local utility for SaveGraphDb file locking
-class ScopedFileLock {
- public:
-  ScopedFileLock() = default;
-  ScopedFileLock(const ScopedFileLock &) = delete;
-  ScopedFileLock &operator=(const ScopedFileLock &) = delete;
-
-  ~ScopedFileLock() { Release(); }
-
-  bool Acquire(const std::string &path) {
-    return AcquireImpl(path, O_RDWR | O_CREAT, LOCK_EX);
-  }
-
-  bool AcquireShared(const std::string &path) {
-    return AcquireImpl(path, O_RDONLY, LOCK_SH);
-  }
-
- private:
-  bool AcquireImpl(const std::string &path, int open_flags, int lock_operation) {
-    Release();
-    fd_ = ::open(path.c_str(), open_flags, 0666);
-    if (fd_ < 0) return false;
-    if (::flock(fd_, lock_operation) != 0) {
-      Release();
-      return false;
-    }
-    return true;
-  }
-
-  void Release() {
-    if (fd_ >= 0) {
-      ::flock(fd_, LOCK_UN);
-      ::close(fd_);
-      fd_ = -1;
-    }
-  }
-
-  int fd_ = -1;
-};
-
-// weakly_canonical does not resolve a final symlink whose target is missing.
-// Follow final symlinks first, then resolve the existing parent components.
-bool ResolveGraphDestination(const std::string &requested_path, std::filesystem::path &out) {
-  std::error_code ec;
-  auto path = std::filesystem::absolute(requested_path, ec);
-  if (ec) return false;
-  for (size_t links = 0; links < 40; ++links) {
-    const auto status = std::filesystem::symlink_status(path, ec);
-    if (ec && ec != std::errc::no_such_file_or_directory) return false;
-    if (!std::filesystem::is_symlink(status)) {
-      ec.clear();
-      out = std::filesystem::weakly_canonical(path, ec);
-      return !ec;
-    }
-    const auto target = std::filesystem::read_symlink(path, ec);
-    if (ec) return false;
-    path = target.is_absolute() ? target : path.parent_path() / target;
-  }
-  return false;
-}
-
-// Publication has a stable writer mutex, independent of the inode readers map.
-// Readers require no sidecar or directory write permission. The old inode remains
-// immutable for candidate writers. Concurrent legacy compile writers are unsupported.
-class AtomicGraphOutput {
- public:
-  ~AtomicGraphOutput() { if (!temporary_.empty()) ::unlink(temporary_.c_str()); }
-  bool Prepare(const std::string &requested_path) {
-    std::filesystem::path destination;
-    if (!ResolveGraphDestination(requested_path, destination)) return false;
-    destination_ = destination.string();
-    if (!writer_lock_.Acquire(destination_ + ".lock")) return false;
-    struct stat old_stat;
-    const bool exists = ::stat(destination_.c_str(), &old_stat) == 0;
-    std::string pattern = destination_ + ".tmp.XXXXXX";
-    std::vector<char> name(pattern.begin(), pattern.end());
-    name.push_back('\0');
-    const int fd = ::mkstemp(name.data());
-    if (fd < 0) return false;
-    temporary_ = name.data();
-    // Preserve the destination mode. For a new DB, match ofstream's 0666/umask mode.
-    mode_t mode;
-    if (exists) mode = old_stat.st_mode & 0777;
-    else {
-      const mode_t mask = ::umask(0);
-      ::umask(mask);
-      mode = 0666 & ~mask;
-    }
-    const bool okay = ::fchmod(fd, mode) == 0;
-    ::close(fd);
-    return okay;
-  }
-  const std::string &TemporaryPath() const { return temporary_; }
-  bool Publish() {
-    if (::rename(temporary_.c_str(), destination_.c_str()) != 0) return false;
-    temporary_.clear();
-    return true;
-  }
- private:
-  ScopedFileLock writer_lock_;
-  std::string destination_;
-  std::string temporary_;
-};
 
 // --- Compile-time forward declarations (defined later in this file) ---
 
@@ -1361,12 +1259,7 @@ uint32_t InternString(std::string_view sv, std::vector<std::string> &pool,
 }
 
 std::string_view GraphString(const GraphDb &db, uint32_t id) {
-  if (db.mapping) {
-    if (id + uint64_t{1} >= db.mapped_string_offsets.size()) return {};
-    const uint32_t begin = db.mapped_string_offsets[id];
-    const uint32_t end = db.mapped_string_offsets[size_t(id) + 1];
-    return std::string_view(db.mapped_string_blob + begin, end - begin);
-  }
+  if (db.mapping) return ReadMappedGraphString(db, id);
   if (id >= db.strings.size()) return {};
   return db.strings[id];
 }
@@ -2547,7 +2440,7 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
                  std::vector<std::string> &signal_paths, const slang::SourceManager &sm,
                  const TraceDb &hier_db, const std::vector<std::vector<size_t>> *buckets,
                  size_t &signal_count,
-                 CompileContext &compile_ctx, bool low_mem, CompileLogger *logger) {
+                 CompileContext &compile_ctx, bool low_mem, CompileLogger *logger, const std::string &fingerprint) {
   using Clock = std::chrono::steady_clock;
   auto fmt_seconds = [](const Clock::time_point &start, const Clock::time_point &end) {
     std::ostringstream os;
@@ -3357,7 +3250,7 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
   if (!WriteBinaryValue(out, coordinate_count) || !WriteBinaryVector(out, graph.coordinates) ||
       !WriteBinaryValue(out, axis_count) || !WriteBinaryVector(out, graph.declared_axes)) return false;
   out.close();
-  if (out.fail() || !publication.Publish()) return false;
+  if (out.fail() || !publication.Publish(fingerprint)) return false;
   const auto t_write_end = Clock::now();
   LogMemPhase("SaveGraphDb:AfterWrite");
   if (logger != nullptr) {
@@ -3467,7 +3360,11 @@ bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db)
   // Lock the same fd that is mapped, for its lifetime. Atomic candidate writers
   // replace this inode safely. This lease cannot make concurrent legacy compiles
   // safe: legacy code can lock an old inode then reopen the newly renamed path.
-  const int fd = ::open(db_path.c_str(), O_RDONLY);
+  std::filesystem::path target;
+  if (!ResolveGraphDestination(db_path, target)) return false;
+  ScopedFileLock startup_lock;
+  if (!startup_lock.AcquireShared(target.string() + ".lock", true)) return false;
+  const int fd = ::open(target.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0) return false;
   struct stat st;
   if (::flock(fd, LOCK_SH) != 0 || ::fstat(fd, &st) != 0 ||
@@ -3484,6 +3381,8 @@ bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db)
     ::flock(fd, LOCK_UN);
     ::close(fd);
   });
+  graph.mapping_bytes = length;
+  graph.mapping_fd = fd;
   GraphMappedReader in(static_cast<const char *>(address), length);
   GraphDbFileHeader header;
   if (!in.ReadValue(header) ||
@@ -3492,6 +3391,7 @@ bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db)
       header.string_count == std::numeric_limits<uint64_t>::max()) return false;
   if (!in.ReadView(graph.mapped_string_offsets, header.string_count + 1)) return false;
   graph.mapped_string_blob = in.ReadBytes(header.string_blob_size);
+  graph.mapped_string_blob_bytes = header.string_blob_size;
   if (graph.mapped_string_blob == nullptr) return false;
   for (size_t i = 0; i < header.string_count; ++i) {
     const uint32_t start = graph.mapped_string_offsets[i];

@@ -56,6 +56,14 @@ if(EXISTS "${RTL_TRACE_PARENT_BIN}")
 else()
   message(STATUS "SKIP: frozen main binary unavailable: ${RTL_TRACE_PARENT_BIN}")
 endif()
+set(RTL_TRACE_REFERENCE_BIN "" CACHE FILEPATH "Frozen reference rtl_trace for compatibility tests")
+set(RTL_TRACE_REFERENCE_ARGS)
+if(RTL_TRACE_REFERENCE_BIN)
+  if(NOT EXISTS "${RTL_TRACE_REFERENCE_BIN}")
+    message(FATAL_ERROR "RTL_TRACE_REFERENCE_BIN does not exist")
+  endif()
+  list(APPEND RTL_TRACE_REFERENCE_ARGS --reference-bin "${RTL_TRACE_REFERENCE_BIN}")
+endif()
 
 add_test(
   NAME rtl_trace_semantic_regression
@@ -128,9 +136,17 @@ add_test(
   COMMAND ${Python3_EXECUTABLE}
           ${CMAKE_CURRENT_SOURCE_DIR}/tests/graph_db_mapping_regression.py
           --rtl-trace $<TARGET_FILE:rtl_trace>
+          ${RTL_TRACE_REFERENCE_ARGS}
 )
 
 add_executable(graph_pod_view_test tests/graph_pod_view_test.cc)
 target_include_directories(graph_pod_view_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(graph_pod_view_test PRIVATE slang::slang)
 add_test(NAME graph_pod_view_test COMMAND graph_pod_view_test)
+add_test(
+  NAME graph_publication_regression
+  COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/graph_publication_regression.py
+          --rtl-trace $<TARGET_FILE:rtl_trace>
+          ${RTL_TRACE_REFERENCE_ARGS}
+)

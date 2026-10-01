@@ -3,6 +3,7 @@
 #include "db/EntryPoints.h"
 #include "db/GraphDbTypes.h"
 #include "db/GraphDbInternals.h"
+#include "db/GraphPublication.h"
 #include "AssignmentUtils.h"
 
 // Slang headers needed for compile-time AST walking
@@ -70,7 +71,7 @@ bool SaveGraphDb(const std::string &db_path,
                  size_t &signal_count,
                  CompileContext &compile_ctx,
                  bool low_mem,
-                 CompileLogger *logger);
+                 CompileLogger *logger, const std::string &fingerprint);
 bool HasUnknownSysNameWarningControl(const std::vector<std::string> &args);
 bool IsDollarTokenDiagnostic(const slang::Diagnostic &diag, const slang::SourceManager &sm);
 bool IsDefparamRelaxDiag(slang::DiagCode code);
@@ -347,24 +348,16 @@ int RunCompile(int argc, char *argv[]) {
     slang_args = std::move(*transformed);
   }
 
-  const std::filesystem::path db_path_fs = std::filesystem::path(db_path);
-  const std::filesystem::path meta_path = db_path_fs.string() + ".meta";
   std::vector<std::string> fingerprint_args = passthrough_args;
   if (mfcu) fingerprint_args.push_back("--mfcu=grouped-v1");
   if (compile_ctx.source_path_mode == SourcePathMode::kPhysicalAbsolute)
     fingerprint_args.push_back("--physical-source-paths");
   const std::string new_fingerprint = ComputeCompileFingerprint(fingerprint_args);
-  if (incremental && std::filesystem::exists(db_path_fs) && std::filesystem::exists(meta_path)) {
-    logger.Log("step: incremental fingerprint check");
-    std::ifstream meta_in(meta_path);
-    std::string old_fingerprint((std::istreambuf_iterator<char>(meta_in)),
-                                std::istreambuf_iterator<char>());
-    if (old_fingerprint == new_fingerprint) {
-      logger.Log("incremental cache hit");
-      std::cout << "db: " << db_path << "\n";
-      std::cout << "signals: incremental-cache-hit\n";
-      return 0;
-    }
+  if (incremental && GraphCompileCacheHit(db_path, new_fingerprint)) {
+    logger.Log("incremental cache hit");
+    std::cout << "db: " << db_path << "\n";
+    std::cout << "signals: incremental-cache-hit\n";
+    return 0;
   }
 
   std::vector<std::string> driver_args;
@@ -471,13 +464,11 @@ int RunCompile(int argc, char *argv[]) {
   size_t written_signal_count = 0;
   LogMem("MemBeforeSaveGraphDb");
   if (!SaveGraphDb(db_path, signals, signal_paths, sm, hier_db, &buckets, written_signal_count, compile_ctx,
-                   low_mem, &logger)) {
+                   low_mem, &logger, new_fingerprint)) {
     std::cerr << "Failed to write DB: " << db_path << "\n";
     return 1;
   }
   LogMem("MemAfterSaveGraphDb");
-  std::ofstream meta_out(meta_path);
-  if (meta_out.is_open()) meta_out << new_fingerprint;
   logger.Log("compile done: db=" + db_path + " signals=" + std::to_string(written_signal_count));
   std::cout << "db: " << db_path << "\n";
   std::cout << "signals: " << written_signal_count << "\n";
