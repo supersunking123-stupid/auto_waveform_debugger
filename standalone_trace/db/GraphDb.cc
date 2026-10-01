@@ -4069,7 +4069,8 @@ bool ParseDefinesPlus(std::string_view tok, std::vector<std::string> &out) {
 // Epoch 5: stable full-field endpoint duplicate removal after compaction/merge (E4d).
 // Epoch6: version6 declared-coordinate metadata and safe selector diagnostics (B fix).
 // Epoch7: narrowing provenance requires different merged coordinates (C fix).
-constexpr int kCompileSemanticsEpoch = 7;
+// Epoch8: stable full-field dedup with cheap singleton and touched-slot reuse (D fix).
+constexpr int kCompileSemanticsEpoch = 8;
 
 std::string ComputeCompileFingerprint(const std::vector<std::string> &passthrough_args) {
   std::vector<std::string> parts;

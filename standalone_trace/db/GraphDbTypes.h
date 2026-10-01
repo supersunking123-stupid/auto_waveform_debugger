@@ -107,7 +107,7 @@ constexpr uint8_t kEndpointMergedRange = 0x01;
 constexpr uint8_t kEndpointLogicalAxes = 0x02;
 // Feature stages are enabled by the following independent fix commits.
 constexpr bool kTrackMergedRangeProvenance = true;
-constexpr bool kEnableEndpointDedup = false;
+constexpr bool kEnableEndpointDedup = true;
 
 constexpr uint32_t kCoordinatePackedOuter = 0x01;
 constexpr uint32_t kCoordinateUnsupported = 0x02;

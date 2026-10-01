@@ -38,10 +38,10 @@ def trace(binary, db, signal, mode='loads', extra=(), fmt='json'):
 
 
 def read_db(path):
-    """Decode v5 lists/ref sets without discarding ref order or endpoint flags."""
+    """Decode v5/v6 lists/ref sets without discarding ref order or endpoint flags."""
     data = path.read_bytes()
     header = HEADER.unpack_from(data)
-    assert header[1] == 5
+    assert header[1] in (5, 6)
     counts = header[3:]
     offset = HEADER.size
     string_offsets = struct.unpack_from('<' + 'I' * (counts[0] + 1), data, offset)
@@ -429,7 +429,7 @@ def parent_checks(binary, parent, source, root, evidence, candidate_db):
         clean = root / (top + '_clean.db')
         compile_db(parent, source, inherited, top)
         before_meta = Path(str(inherited) + '.meta').read_text()
-        assert 'SEMANTICS_EPOCH:4\n' in before_meta
+        assert 'SEMANTICS_EPOCH:7\n' in before_meta
         old_sections = read_db(inherited)
         rebuilt = compile_db(binary, source, inherited, top, incremental=True)
         assert 'incremental-cache-hit' not in rebuilt.stdout
@@ -437,16 +437,16 @@ def parent_checks(binary, parent, source, root, evidence, candidate_db):
         compile_db(binary, source, clean, top)
         before_hit = tuple(Path(str(inherited) + suffix).read_bytes() for suffix in ('', '.meta'))
         assert before_hit == tuple(Path(str(clean) + suffix).read_bytes() for suffix in ('', '.meta'))
-        assert before_meta.replace('SEMANTICS_EPOCH:4', 'SEMANTICS_EPOCH:5') == before_hit[1].decode()
+        assert before_meta.replace('SEMANTICS_EPOCH:7', 'SEMANTICS_EPOCH:8') == before_hit[1].decode()
         assert_only_duplicates_removed(old_sections, read_db(inherited))
         hit = compile_db(binary, source, inherited, top, incremental=True)
         assert 'signals: incremental-cache-hit' in hit.stdout
         assert before_hit == tuple(Path(str(inherited) + suffix).read_bytes() for suffix in ('', '.meta'))
     report = {'removed_drivers': removed[0], 'removed_loads': removed[1],
               'parent_bytes': old['size'], 'candidate_bytes': new['size'],
-              'reverse_sets_equal': True, 'strings_equal': True, 'epoch_4_to_5_rebuild_then_hit': True}
+              'reverse_sets_equal': True, 'strings_equal': True, 'epoch_7_to_8_rebuild_then_hit': True}
     (evidence / 'parent_comparison.json').write_text(json.dumps(report, indent=2) + '\n')
-    print('PASS parent full-key removal/ref sets, old DB exact queries, epoch4 -> 5 rebuild/clean/hit', report)
+    print('PASS parent full-key removal/ref sets, old DB exact queries, epoch7 -> 8 rebuild/clean/hit', report)
 
 
 def main():

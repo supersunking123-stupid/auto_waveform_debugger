@@ -78,3 +78,10 @@ output copy. Traversal, cached records, member coordinates and logical axes
 keep their original bitmaps.
 Epoch 8 reenables full-key dedup with cheap scratch reuse. Each epoch forces an
 incremental rebuild of older semantics, including epochs 3, 4 and 5.
+
+Dedup returns before touching scratch for empty and singleton lists. Active
+lists use an open-address table with original-record indices and cached hashes.
+Only occupied slots are cleared before moving survivors. Full-field equality
+and hashing still include strings, ordered references and coordinate flags.
+Survivors keep their first occurrence and source order. Compaction runs first,
+so duplicate removal does not change the compact-global threshold.

@@ -3,6 +3,7 @@
 #include "db/GraphDbTypes.h"
 
 #include <functional>
+#include <stdexcept>
 #include <type_traits>
 #include <utility>
 
@@ -57,32 +58,70 @@ struct EndpointFullKeyHash {
 
 template <typename Hash = EndpointFullKeyHash>
 struct EndpointDedupScratch {
-  slang::flat_hash_set<EndpointFullKey, Hash> seen;
+  static constexpr size_t kEmpty = std::numeric_limits<size_t>::max();
+  struct Slot {
+    size_t index = kEmpty;
+    size_t hash = 0;
+  };
+  std::vector<Slot> slots;
+  std::vector<size_t> touched;
   std::vector<uint8_t> dropped;
+  Hash hash;
+
+  void ClearTouched() {
+    for (size_t slot : touched) slots[slot].index = kEmpty;
+    touched.clear();
+  }
 
   void Release() {
-    seen = decltype(seen){};
+    slots = decltype(slots){};
+    touched = decltype(touched){};
     dropped = decltype(dropped){};
+    hash = Hash{};
   }
 };
 
-// All lookups finish against stable original records. Clear pointer keys before
+// All lookups finish against stable original records. Clear original indices before
 // moving survivors, preserving their first occurrence and source order.
 template <typename Hash>
 size_t DeduplicateEndpointsInPlace(std::vector<EndpointRecord> &endpoints,
                                    EndpointDedupScratch<Hash> &scratch) {
-  scratch.seen.clear();
-  scratch.dropped.clear();
+  // Most signal lists have zero or one entry. Do not visit a retained table's
+  // capacity, or touch any scratch state, for those lists.
   if (endpoints.size() < 2) return 0;
+  scratch.ClearTouched();
+  if (scratch.slots.size() / 2 < endpoints.size()) {
+    size_t capacity = 8;
+    while (capacity / 2 < endpoints.size()) {
+      if (capacity > scratch.slots.max_size() / 2)
+        throw std::length_error("endpoint dedup table capacity");
+      capacity *= 2;
+    }
+    scratch.slots.assign(capacity, {});
+  }
   scratch.dropped.assign(endpoints.size(), 0);
+  const size_t mask = scratch.slots.size() - 1;
   size_t removed = 0;
   for (size_t i = 0; i < endpoints.size(); ++i) {
-    if (!scratch.seen.insert(EndpointFullKey{&endpoints[i]}).second) {
-      scratch.dropped[i] = 1;
-      ++removed;
+    const size_t hash = scratch.hash(EndpointFullKey{&endpoints[i]});
+    size_t position = hash & mask;
+    while (scratch.slots[position].index != EndpointDedupScratch<Hash>::kEmpty) {
+      const auto &slot = scratch.slots[position];
+      if (slot.hash == hash && SameEndpointFields(endpoints[slot.index], endpoints[i])) {
+        scratch.dropped[i] = 1;
+        ++removed;
+        break;
+      }
+      position = (position + 1) & mask;
+    }
+    if (!scratch.dropped[i]) {
+      scratch.touched.push_back(position);
+      scratch.slots[position] = {i, hash};
     }
   }
-  scratch.seen.clear();
+  // Indices refer to the original stable records until every lookup is done.
+  // Clear only occupied slots before any survivor moves.
+  scratch.ClearTouched();
   if (removed == 0) return 0;
   size_t out = 0;
   for (size_t i = 0; i < endpoints.size(); ++i) {

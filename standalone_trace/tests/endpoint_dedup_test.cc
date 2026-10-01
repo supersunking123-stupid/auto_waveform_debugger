@@ -46,7 +46,9 @@ void CheckStableOrder() {
   Require(entries.size() == 3 && SameEndpointFields(entries[0], a) &&
           SameEndpointFields(entries[1], b) && SameEndpointFields(entries[2], c), "unstable survivors");
   Require(entries[1].path.data() == first_b_storage, "retained a later occurrence");
-  Require(scratch.seen.empty(), "pointer keys survived compaction");
+  Require(scratch.touched.empty() && std::all_of(scratch.slots.begin(), scratch.slots.end(),
+          [](const auto &slot) { return slot.index == EndpointDedupScratch<Hash>::kEmpty; }),
+          "original indices survived compaction");
   Require(DeduplicateEndpointsInPlace(entries, scratch) == 0, "unique entries changed");
   entries.assign(1000, b);
   Require(DeduplicateEndpointsInPlace(entries, scratch) == 999 && entries.size() == 1 &&
@@ -60,6 +62,28 @@ void CheckStableOrder() {
           DeduplicateEndpointsInPlace(signal.loads, scratch) == 1 &&
           signal.drivers.size() == 1 && signal.loads.size() == 1, "lists deduped across directions");
   scratch.Release();
+}
+
+void CheckTrivialListsDoNotTouchScratch() {
+  EndpointDedupScratch<> scratch;
+  scratch.slots = {{9, 123}};
+  scratch.touched = {0};
+  scratch.dropped = {7, 8};
+  std::vector<EndpointRecord> entries;
+  for (int count : {0, 1}) {
+    entries.assign(count, Record("a"));
+    Require(DeduplicateEndpointsInPlace(entries, scratch) == 0, "trivial list changed");
+    Require(scratch.slots.size() == 1 && scratch.slots[0].index == 9 &&
+            scratch.slots[0].hash == 123 && scratch.touched == std::vector<size_t>{0} &&
+            scratch.dropped == std::vector<uint8_t>({7, 8}), "trivial list touched scratch");
+  }
+  // The next active pass clears only the recorded occupied slot, then grows.
+  entries.assign(2, Record("a"));
+  Require(DeduplicateEndpointsInPlace(entries, scratch) == 1 && scratch.touched.empty(),
+          "dirty scratch recovery failed");
+  scratch.Release();
+  Require(scratch.slots.empty() && scratch.touched.empty() && scratch.dropped.empty(),
+          "scratch release retained storage");
 }
 
 void CheckEveryField() {
@@ -124,5 +148,6 @@ int main() {
   CheckStableOrder<rtl_trace::EndpointFullKeyHash>();
   CheckStableOrder<ConstantHash>();
   CheckEveryField();
+  CheckTrivialListsDoNotTouchScratch();
   std::cout << "PASS stable full-field endpoint dedup, flags, refs, collisions, scratch reuse\n";
 }
