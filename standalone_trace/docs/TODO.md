@@ -5,7 +5,7 @@ Current numbers and how to reproduce them: `COMPILE_BENCHMARK.md` and `BENCHMARK
 Any change to the compile path must produce a DB that is `cmp`-identical to the previous one
 (or come with an explicit, documented DB change).
 
-Suggested order: 4 (remaining hardening) → 5.
+Items 5 and 6 are stacked for review. Main integration remains with the user.
 
 ## 2. Endpoint merge — done, option A (see "Done / dropped")
 
@@ -185,48 +185,92 @@ Verified: small-design sweep (33 designs × 6 variants) default vs `=0` 198/198 
 `test_cases/run_all_tests.sh` 27/27; `semantic_regression.py` (canonical block now compares the
 default against `=0`).
 
-## 5. Item-5 experiments (2026-10-01)
+## 5. Item-5 experiments — fixes complete, integration pending (2026-10-01)
 
-Review: `/tmp/auto_waveform_item5_claude_review_2026-10-01.md`. Codex report and raw data:
-`/tmp/auto_waveform_item5_codex_report_20260930.md`, `/tmp/item5_logs/`.
+The accepted stack is `item5-visible`, then `item5-e3a`, then item 6 below.
+The user will merge it. The round-3 report is
+`/tmp/auto_waveform_item5_round3_report_20261002.md`; raw results are in
+`/tmp/item5_round3_logs/`. Earlier reports remain historical evidence.
 
-The first-round quiet-host rule (at most 0.5 cores of other load) could never be met: this host
-always carries 1–4 cores of background load. So every compile comparison was reported
-inconclusive. The figures below are medians of candidate minus base over all 6 alternating
-Lumion pairs. Differences of a few seconds on a ~45 s compile are not treated as significant.
+- **E1 retained:** all 27 test scripts use the project Python runtime.
+- **E2 discarded on Lumion:** eight tracing threads cost +6.4 s wall and
+  +1.8 GiB RSS in the first experiment. Default tracing remains single-threaded.
+  The prototype remains on `item5-e2`.
+- **E3a ready for review:** mmap supports v6 coordinates and declared axes.
+  Command-specific indexes retain the trace/find gains. Readers open the DB
+  without taking a sidecar lock and keep the legacy DB-inode shared lock.
+  Compile-side cache checks and publication use the exclusive sidecar lock.
+  Staging and atomic renames publish metadata last. No fsync is used.
+  A size and full fixed-header envelope detects missing, truncated or invalid
+  cache files. It cannot detect every same-size interior corruption.
+  Signal-safe guardian cleanup, per-user staging, early group checks, specific
+  errors, and FIFO rejection have regression coverage. See GRAPH_DB_READERS.md
+  for NFS limits and the one-time rebuild of caches without a lock sidecar.
+- **E3b closed:** no extra indexed DB format is needed for these query times.
+- **E4a closed:** endpoint merging uses less memory than unmerged output.
+- **E4b/E4c/E4d ready for review:** logical per-axis coordinates, narrowed
+  merged ranges, and exact endpoint deduplication are retained. The always-true
+  switches and dead branches are removed. Scalar and multidimensional struct
+  members have explicit coverage. Ambiguous selects give rewritten queries.
+  Unsupported DB versions and coordinate types give specific diagnostics.
+  MCP results report error diagnostics as errors and copy warning messages.
+  The MCP signature contract stays unchanged.
 
-- **E1 merged:** all 27 test scripts use `PYTHON`, defaulting to the repository
-  `.venv/bin/python3`, and fail clearly if it is missing. `run_all_tests.sh` passes 27/27.
-- **E2 discarded (this design):** parallel tracing with an ordered commit keeps the DB
-  byte-identical, but `-t 8` is +6.4 s wall and +1.8 GiB (6/6 pairs). Causes: ~8 s of serial
-  prewarm, a commit that never overlaps the workers, a serial fallback for 301k mostly-heavy
-  signals, per-worker cold caches (~2× CPU), static chunks plus a barrier. The serial
-  restructure alone is ~1 s faster. Prototype kept on `item5-e2`. Default stays at 1 thread.
-- **E3a pending fixes (`item5-e3a`):** mmap'd v5 DB with lazy, command-specific indexes. Output
-  is identical on a 60-query Lumion corpus, in one-shot and serve modes. Warm trace
-  1.68 → 0.78 s and 5.5 → 3.4 GB; find 1.69 → 0.21 s; serve startup 1.66 → 1.04 s. Compile
-  cost +0.4 s. Before merging: fsync and atomic `.meta` under the publish lock; a read-only
-  fallback for the `.lock` sidecar; GraphString bounds re-check in a long-lived serve; CTest
-  coverage with `--reference-bin`.
-- **E3b closed:** warm trace after E3a is below 1.0 s, so no v6 indexed format is needed.
-- **E4a closed:** the concern was reversed. Merging uses 122 MiB *less* peak RSS than not
-  merging (6/6 pairs).
-- **E4b/E4c/E4d pending fixes (`item5-visible`):**
-  - E4b: logical per-axis coordinates for multidimensional selects.
-  - E4c: narrowed display of merged root ranges.
-  - E4d: compile-time removal of 1.03M exact-duplicate endpoints (DB −2.2%).
-  - Needed before merging:
-    - E4b must warn when a single index on a multi-axis signal is reinterpreted or is out of
-      range, and must detect old and new DBs in both directions.
-    - E4c must narrow only when different coordinates were merged.
-    - E4d costs about +5.5 s of build_graph, mostly from a per-call hash-set `clear()`; it
-      should be made cheaper.
-    - The accepted stack takes fresh semantics epochs (6 or higher), because experimental
-      binaries already wrote epochs 3–5.
+The B residual HOLD is lifted by the user's review decision: **correct, not
+machine-proven**. Claude checked about 100 records across 18 groups without
+finding a wrong result. His predictor matched 34,228 of 34,244 changed pairs.
+The 16 exceptions are the pre-existing select-chain leak at
+`tl_tx_credit_reserve_req_to_ack.vp:80`. This is an acceptance decision; it does
+not change the historical incomplete machine-accounting reports. No further B
+residual proof tooling is required.
 
-Open idea: an E2 redesign could plausibly save ~17 s of build time. It would use shared
-immutable state, no fallback classes, a frozen path→id map, and dynamic scheduling with a
-reorder buffer. Profile the threaded build first.
+Phase 1 passes 9 CTests, normal and clean-PATH test suites 27/27 each, and
+383 Python tests, with no runtime skips. Both 300-case sweeps are accounted for.
+The Lumion DB adds 1,782 member rows and 4,026 axes (+76,824 bytes); all other
+DB sections stay unchanged. The 60-query corpus has no differences from D.
+Phase 2 passes 12 CTests and the same runtime suites. Its Lumion DB is identical
+to phase 1, and the full corpus matches in one-shot and serve modes. The paired
+compile wall delta is +0.10 s; query timings are in COMPILE_BENCHMARK.md.
+
+## 6. Skip uninstantiated generate blocks — implemented, ready for review (2026-10-02)
+
+Disabled generate branches used to contribute drivers and loads even though the
+hierarchy omitted their scopes. `BodyTraceIndexBuilder` now skips inactive
+blocks and visits generate-array entries through the same guard. Other body
+visitors already have that guard. Parameter values are part of slang's canonical
+body key, so enabled and disabled instances use separate representatives.
+The compile semantics epoch is 9; the DB format remains v6.
+
+Fixtures cover if/case generates, zero-iteration loops, nested branches, child
+ports, active siblings, and repeated instances with different parameters.
+Canonical and actual-body builds must match. Procedural if/case behavior stays
+unchanged. The optional `RTL_TRACE_INACTIVE_SCOPES` manifest walks actual
+instances for the Lumion removal check. Source intervals with ambiguous macro
+or logical filename namespaces cannot supply witnesses.
+
+Verified: 13 CTests, normal and clean-PATH suites 27/27 each, and 383 Python
+tests, with no runtime skips. The 306-case canonical sweep matches exactly.
+The adjacent sweep accounts for 24 changed DBs and the epoch metadata change.
+The Lumion DB has 3,284,930 fewer endpoints and 7,429,082 fewer reference
+occurrences. Every removed old serialized record has an inactive source/scope
+candidate. Records with shared loop intervals or line-only locations retain
+origin limits; the generic machine status stays UNRESOLVED. Reference-set
+replacements, narrowed merged ranges and changed first-contributor order are
+reported explicitly. The brief source review found no wrong result; it does
+not claim exhaustive proof of all replacements.
+
+The g_dma examples at lines 4720, 4742 and 4803 are absent when
+IS_DMA_SUPPORTED is 0. The st_get5 scope is inactive when STARTPTR_WD is 2.
+Physical OOB records fall from 9,366 to 2,004. All 4,898 archived B records map
+to 4,658 unique source/path/coordinate keys; none of those keys remains in the
+new DB. This is exact key absence, not 4,898 distinct physical IDs after dedup. The 60-query corpus changes only
+q050: 48 inactive pipe-mux endpoints and 16 resulting cycle stops disappear.
+Compile wall improves by 6.94 s and peak RSS by 0.8712 GiB over three pairs.
+See COMPILE_BENCHMARK.md and the report for the accounting and disk limits.
+
+Known low-impact bug, deferred: the nested select chain
+`[..][N-1:0]][2:0]` at `tl_tx_credit_reserve_req_to_ack.vp:80` can leak a selector
+between steps. It predates items 5 and 6 and is outside this fix.
 
 ## Done / dropped
 
@@ -276,6 +320,6 @@ reorder buffer. Profile the threaded build first.
   `tests/fixtures/endpoint_merge.sv` updated. Agent-visible effect: per-bit assignments and
   generate loops show as one range (`bits [7:0]` instead of eight endpoints).
 - `--incremental` no longer reuses DBs built with older compile semantics: the compile fingerprint
-  carries a `SEMANTICS_EPOCH` line (now 2, bumped for the endpoint-merge fix), and a `.meta` without
+  carries a `SEMANTICS_EPOCH` line (now 9; item 6 skips inactive generate branches), and a `.meta` without
   it or with an older epoch triggers a full rebuild (f8cd024). Bump `kCompileSemanticsEpoch` in
   `db/GraphDb.cc` whenever the same sources and arguments start producing a different DB.

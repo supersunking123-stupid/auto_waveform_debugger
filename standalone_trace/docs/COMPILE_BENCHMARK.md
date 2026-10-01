@@ -489,5 +489,91 @@ external Python jobs were present in their host records. Their output checks
 remain valid. Future full-corpus checks use the immutable patched source snapshot
 at `/tmp/item5_corpus/lumion_source_snapshot`.
 
-E3a's compile cost (+0.4 s) is within limits. It is not merged yet because publish and
-locking fixes are still pending (see TODO.md §5). Warm trace below 1.0 s closes the E3b v6 gate.
+These first-round measurements are historical. Round 3 closes the publication and
+locking fixes below. Integration into main remains with the user. The E3b indexing
+experiment is closed; v6 now stores coordinate data for item 5, not a query index.
+
+
+### Item-5 round 3 and item 6 (2026-10-01–02)
+
+Raw results: `/tmp/item5_round3_logs/`. These branches are stacked for review.
+No merge into main was performed. Each compile comparison uses three alternating
+base-first pairs with `MAX_OTHER_CPU=99`. Other host work is recorded, without a
+quiet-host exclusion rule. The limits are +5 s wall and +0.5 GiB peak RSS.
+Every timing DB is checked against its verified oracle and deleted after the check.
+VERIFY and optional inactive-scope audit runs are excluded from normal compile costs.
+
+Phase 2 (`item5-e3a`, commit `267fa3c`) versus phase 1 (`c557a33`):
+
+| Pair | Base wall s | A wall s | Base build_graph s | A build_graph s | Base RSS KiB | A RSS KiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 55.96 | 56.54 | 31.349 | 31.830 | 14718032 | 14696372 |
+| 2 | 56.70 | 56.52 | 31.845 | 31.837 | 14794220 | 14738220 |
+| 3 | 56.34 | 56.44 | 31.668 | 31.773 | 14775424 | 14730632 |
+
+Median paired delta: wall +0.10 s, build_graph +0.105 s,
+RSS -0.0427 GiB. Both limits pass. No fourth pair was needed.
+The Lumion DB is byte-identical to phase 1 (2,569,737,188 bytes).
+
+The warm timing corpus has six one-shot queries and a serve session per binary,
+with three repetitions. Runs use the matching immutable source snapshot, so
+assignment text is populated. All nine comparisons match. The table uses medians
+from the saved query measurements.
+
+| Operation | Phase 1 wall s | A wall s | Phase 1 RSS KiB | A RSS KiB |
+| --- | ---: | ---: | ---: | ---: |
+| Trace drivers | 2.119 | 1.334 | 5468508 | 3359076 |
+| Trace loads | 2.120 | 1.317 | 5468512 | 3363364 |
+| Literal find | 2.192 | 0.210 | 5468316 | 2184756 |
+| Regex find | 2.133 | 0.173 | 5468508 | 2184952 |
+| Hierarchy | 2.111 | 0.528 | 5468316 | 1988132 |
+| Whereis | 2.127 | 0.533 | 5468504 | 1987940 |
+
+Serve startup medians: phase 1 2.008 s, A 1.669 s.
+The final FIFO-only correction preserves query behavior for regular DB files. The final binary also
+passes the full 60-query one-shot and serve comparison.
+
+Item 6 (`339cf83`, on `540a976`) versus final A (`267fa3c`):
+
+| Pair | A wall s | Item 6 wall s | A build_graph s | Item 6 build_graph s | A RSS KiB | Item 6 RSS KiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 55.46 | 48.52 | 31.126 | 24.127 | 14775932 | 13775280 |
+| 2 | 54.63 | 47.88 | 30.360 | 23.822 | 14786416 | 13872944 |
+| 3 | 54.71 | 47.60 | 30.622 | 23.616 | 14734908 | 13846064 |
+
+Median paired delta: wall -6.94 s, build_graph -6.999 s,
+RSS -0.8712 GiB. Both regression limits pass. No fourth pair was needed.
+
+The item-6 DB is 2,356,488,063 bytes, 213,249,125 bytes smaller than A.
+Endpoints change 18,631,517 → 15,346,587 (net -3,284,930).
+Reference occurrences change 45,112,203 → 37,683,121 (net -7,429,082).
+Normal cost runs all match the verified DB and metadata hashes. Raw:
+`phase3_compile_pairs/` under the round-3 log root. VERIFY, audit, and untimed
+follow-up checks are excluded from these six samples.
+
+The final 60-query comparison has one expected change in both one-shot and
+serve modes. q050 loses 48 inactive pipe-mux endpoints and 16 resulting cycle
+stops. All 59 other queries match. The independent review binds all 48 removals
+to actual inactive scopes; assignments and survivor order stay unchanged.
+
+Whole-DB light accounting keeps exact counts and bounded source samples.
+It reports 3,538,076 removed old serialized records and 253,146 replacement/new
+records. Every removed record has an inactive source/scope candidate. Shared
+loop images and line-only records do not provide full lexical-origin proof.
+The 4,012 bitmap/flag changes and 56 order changes are kept explicit. Source
+review explains narrowed active ranges, changed reference unions, leaf fallback
+and newly exposed active paths. The final finite check finds all 4,658 unique archived coordinate keys absent
+(representing all 4,898 old archive records). It also checks the exact st_get5
+line-215 endpoints at STARTPTR_WD=2. This untimed check does not add a paired
+cost sample. Raw: `final_scalar_check/`.
+
+The generic machine status remains UNRESOLVED;
+it is not a claim that each full-design replacement was independently proved.
+See `phase3_light_final/delta_accounting/` and
+`accounting/full_light_addendum/README.md` for counts and limits.
+
+The first exhaustive logger exceeded the /tmp reserve and was stopped. Its
+incomplete large files were removed after small samples were kept. A repeat
+used about 6.5 MiB of accounting output. These failed logger runs and the early
+missing-script callback are not compile cost samples. The report records the
+reserve breach and the final free space.
