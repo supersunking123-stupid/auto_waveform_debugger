@@ -117,7 +117,7 @@ def _build_common_context(
         wave_cli_bin=wave_cli_bin,
     )
     ranking = _rank_signal_summaries(summaries)
-    warnings: List[str] = []
+    warnings: List[str] = list(trace_payload.get("warnings", []))
     if trace_payload.get("stops"):
         warnings.append("rtl_trace returned bounded traversal stops")
     return {
@@ -2333,7 +2333,7 @@ def rank_cone_by_time(
             "ranking": _rank_signal_summaries(summaries),
             "explanations": {},
             "unmapped_signals": unmapped,
-            "warnings": [],
+            "warnings": list(trace_payload.get("warnings", [])),
         }, session, time_info)
     except Exception as e:
         return {"status": "error", "message": str(e)}

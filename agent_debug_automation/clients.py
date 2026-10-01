@@ -402,7 +402,20 @@ def _rtl_trace_json(
     except json.JSONDecodeError as e:
         return {"status": "error", "message": f"invalid rtl_trace JSON: {e}", "stdout": stdout}
 
-    payload["status"] = "success"
+    errors = []
+    warnings = list(payload.get("warnings", []))
+    for diagnostic in payload.get("diagnostics", []):
+        severity = diagnostic.get("severity")
+        message = diagnostic.get("message") or diagnostic.get("code") or "rtl_trace diagnostic"
+        if severity == "error":
+            errors.append(message)
+        elif severity == "warning":
+            warnings.append(message)
+    payload["status"] = "error" if errors else "success"
+    if errors:
+        payload["message"] = "; ".join(errors)
+    if warnings:
+        payload["warnings"] = warnings
     payload["raw_command"] = _shell_join(args)
     return payload
 
