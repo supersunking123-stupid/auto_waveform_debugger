@@ -38,7 +38,7 @@ def trace(binary, db, signal, extra=(), mode='drivers'):
 
 def layout(data):
     header = list(HEADER.unpack_from(data))
-    assert header[1] == 5
+    assert header[1] == 6 and header[2] == 1
     strings_count, blob_size, signals_count, endpoints_count = header[3:7]
     blob_start = HEADER.size + 4 * (strings_count + 1)
     offsets = struct.unpack_from('<' + 'I' * (strings_count + 1), data, HEADER.size)
@@ -106,6 +106,34 @@ def patch_records(db, predicate, bitmap=None, approximate=None, scalar_bitmaps=N
 
 def selected(payload, line):
     return [e for e in payload['endpoints'] if e['line'] == line]
+
+
+def remove_coordinates(db, signal):
+    """Test-only scalar owner for the synthetic original-key clipping check.
+
+    The frontend fixture is multidimensional to keep distinct original bitmaps
+    before its scalar merge pass. This synthetic test removes only that owner's
+    declaration, alongside the explicit scalar bitmap conversion above.
+    """
+    from coordinate_diagnostics_regression import footer
+    data = db.read_bytes()
+    begin, rows_start, count, axes_count_pos = footer(data)
+    header, strings, blob_start, _, _ = layout(data)
+    signal_start = blob_start + header[4]
+    owner = next(i for i in range(header[5])
+                 if struct.unpack_from('<I', data, signal_start + 32*i)[0] == strings.index(signal))
+    kept_rows = []
+    kept_axes = bytearray()
+    for i in range(count):
+        signal_id, axis_begin, axis_count, flags = struct.unpack_from('<4I', data, rows_start + 16*i)
+        if signal_id == owner:
+            continue
+        kept_rows.append((signal_id, len(kept_axes)//12, axis_count, flags))
+        kept_axes.extend(data[axes_count_pos+8+12*axis_begin:axes_count_pos+8+12*(axis_begin+axis_count)])
+    assert len(kept_rows) == count-1
+    db.write_bytes(data[:begin] + struct.pack('<Q', len(kept_rows))
+                   + b''.join(struct.pack('<4I', *row) for row in kept_rows)
+                   + struct.pack('<Q', len(kept_axes)//12) + kept_axes)
 
 
 def bitmap_range(bitmap):
@@ -199,11 +227,21 @@ def main():
         assert {e['bit_map'] for e in selected(port, lines['leaf_merged'])} == {'[7:0]'}, port
         member = trace(binary, db, 'merged_range_clip.packet.hi[2]')
         assert {e['bit_map'] for e in selected(member, lines['member_merged'])} == {'[7:0]'}, member
-        logical = trace(binary, db, 'merged_range_clip.m[1]', mode='loads')
+        logical = trace(binary, db, 'merged_range_clip.m[1][0]', mode='loads')
         assert {e['bit_map'] for e in selected(logical, lines['logical_rows'])} == {'[2:1]'}, logical
         unmerged = trace(binary, db, 'merged_range_clip.input_bits[2]', mode='loads')
         assert {e['bit_map'] for e in selected(unmerged, lines['unmerged'])} == {'[7:0]'}, unmerged
         assert all(e['bit_map_approximate'] for e in selected(unmerged, lines['symbolic']))
+        for label, lhs in (('repeated_slice', 'repeated_slice'), ('single_slice', 'single_slice')):
+            records_on_input = [e for e in by_line[lines[label]]
+                                if strings[e[0]] == 'merged_range_clip.input_bits']
+            assert len(records_on_input) == 1 and records_on_input[0][-1] == 0, records_on_input
+            endpoint = selected(unmerged, lines[label])
+            assert len(endpoint) == 1 and endpoint[0]['bit_map'] == '[7:0]', endpoint
+            assert endpoint[0]['lhs'] == ['merged_range_clip.' + lhs]
+            assert endpoint[0]['rhs'] == ['merged_range_clip.input_bits']
+            assert 'input_bits[7:0]' in endpoint[0]['assignment'], endpoint
+        print('PASS: repeated concat slice and single slice retain identical unmerged coordinates and full refs')
         print('PASS: merged 0x01, logical 0x02/0x03; root intersections; cone/port/member/logical/unmerged exclusions')
 
         # Synthetic exact scalar coordinates cover orientations and full int32 bounds
@@ -236,6 +274,7 @@ def main():
         patch_records(duplicate_db, lambda e, _: e[4] in (
             lines['distinct_original_keys'], lines['identical_original_keys']) and e[3] != 0xffffffff,
             scalar_bitmaps={'[1][0]': '[3:0]', '[2][0]': '[7:0]'})
+        remove_coordinates(duplicate_db, 'merged_range_clip.m')
         result = trace(binary, duplicate_db, 'merged_range_clip.m[2]', mode='loads')
         distinct = selected(result, lines['distinct_original_keys'])
         identical = selected(result, lines['identical_original_keys'])
@@ -244,7 +283,7 @@ def main():
         print('PASS: original-key dedup precedes display clipping')
 
         queries = [trace_args(root_signal + suffix) for suffix in ('[2]', '[5]', '', '[2]')]
-        queries += [trace_args('merged_range_clip.m[1]', mode='loads'),
+        queries += [trace_args('merged_range_clip.m[1][0]', mode='loads'),
                     trace_args('merged_range_clip.packet.hi[2]')]
         client = Serve(binary, db)
         try:
@@ -270,10 +309,10 @@ def main():
             merged_count = assert_flag_only_delta(parent_db.read_bytes(), db.read_bytes())
             before_meta = Path(str(parent_db) + '.meta').read_text()
             after_meta = Path(str(db) + '.meta').read_text()
-            assert before_meta.replace('SEMANTICS_EPOCH:3', 'SEMANTICS_EPOCH:4') == after_meta
+            assert before_meta.replace('SEMANTICS_EPOCH:6', 'SEMANTICS_EPOCH:7') == after_meta
             for mode, signal in (('drivers', root_signal + '[2]'), ('drivers', root_signal),
                                  ('drivers', 'merged_range_clip.packet.hi[2]'),
-                                 ('loads', 'merged_range_clip.m[1]')):
+                                 ('loads', 'merged_range_clip.m[1][0]')):
                 for fmt in ('json', 'text'):
                     command = trace_args(signal, mode=mode, fmt=fmt)
                     before = run(parent, ['trace', '--db', parent_db, *command[1:]])
@@ -283,7 +322,7 @@ def main():
                           ('--cone-level','3','--depth','1'),
                           ('--cone-level','3','--max-nodes','2'),
                           ('--cone-level','3','--prefer-port-hop')):
-                before = trace(parent, db, root_signal + '[2]', extra)
+                before = trace(parent, parent_db, root_signal + '[2]', extra)
                 after = trace(binary, db, root_signal + '[2]', extra)
                 restored = copy.deepcopy(after)
                 for endpoint in selected(restored, lines['root_merged']):
@@ -294,7 +333,7 @@ def main():
             assert parent_db.read_bytes() == db.read_bytes()
             hit = compile_db(binary, fixture, parent_db, incremental=True)
             assert 'cache hit' in (hit.stdout + hit.stderr).lower()
-            print(f'PASS: {merged_count} merged flags are the only DB-byte deltas; old DB outputs exact; traversal unchanged; epoch 3 -> 4 rebuild then hit')
+            print(f'PASS: {merged_count} merged flags are the only DB-byte deltas; old DB outputs exact; traversal unchanged; epoch 6 -> 7 rebuild then hit')
 
 
 if __name__ == '__main__':

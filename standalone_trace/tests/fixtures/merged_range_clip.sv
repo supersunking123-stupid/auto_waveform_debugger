@@ -13,6 +13,8 @@ module merged_range_clip(
     output logic [7:0] x, single, port_output, logical_rows,
     output logic [11:0] overlap,
     output logic [15:0] duplicate,
+    output logic [15:0] repeated_slice,
+    output logic [7:0] single_slice,
     output logic [3:0] nibble,
     output logic symbolic, logical_point);
   logic [15:0] y;
@@ -29,5 +31,7 @@ module merged_range_clip(
   assign nibble = input_bits[3:0]; // CASE nibble_unmerged
   assign logical_rows = {m[1], m[2]}; // CASE logical_rows
   assign logical_point = m[1][0]; // CASE logical_point
+  assign repeated_slice = {input_bits[7:0], input_bits[7:0]}; // CASE repeated_slice
+  assign single_slice = input_bits[7:0]; // CASE single_slice
   clip_leaf u(.a(input_bits), .p(port_output));
 endmodule

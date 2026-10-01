@@ -97,9 +97,9 @@ add_test(
           --source-dir ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-# The B snapshot measures logical coordinates alone. C and D are reenabled by
-# their separate epoch7/8 fixes; their independent C++ unit checks still run.
-set_tests_properties(merged_range_regression endpoint_dedup_regression PROPERTIES DISABLED TRUE)
+# The C snapshot includes coordinate and provenance fixes. D is reenabled by
+# its separate epoch8 fix; its independent C++ unit check still runs.
+set_tests_properties(endpoint_dedup_regression PROPERTIES DISABLED TRUE)
 
 add_test(
   NAME coordinate_diagnostics_regression

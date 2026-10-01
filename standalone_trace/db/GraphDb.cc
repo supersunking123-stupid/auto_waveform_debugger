@@ -1478,7 +1478,11 @@ void MergeEndpointBitRangesInPlace(std::vector<EndpointRecord> &endpoints, Endpo
     }
     any_dropped = true;
     // Grouping is complete: provenance can now change without invalidating key lookups.
-    endpoints[first_index].bit_map_merged = kTrackMergedRangeProvenance;
+    const bool different_coordinates = std::any_of(items.begin() + run_begin, items.begin() + i,
+        [&](const auto &member) {
+          return member.lo != items[run_begin].lo || member.hi != items[run_begin].hi;
+        });
+    endpoints[first_index].bit_map_merged |= kTrackMergedRangeProvenance && different_coordinates;
     // Keep the source's range direction when every multi-bit member used [lo:hi].
     endpoints[first_index].bit_map = (any_ascending && !any_descending && cur_lo != cur_hi)
                                          ? "[" + std::to_string(cur_lo) + ":" + std::to_string(cur_hi) + "]"
@@ -4064,7 +4068,8 @@ bool ParseDefinesPlus(std::string_view tok, std::vector<std::string> &out) {
 // Epoch 4: persist merged-range provenance for root-only display narrowing (E4c).
 // Epoch 5: stable full-field endpoint duplicate removal after compaction/merge (E4d).
 // Epoch6: version6 declared-coordinate metadata and safe selector diagnostics (B fix).
-constexpr int kCompileSemanticsEpoch = 6;
+// Epoch7: narrowing provenance requires different merged coordinates (C fix).
+constexpr int kCompileSemanticsEpoch = 7;
 
 std::string ComputeCompileFingerprint(const std::vector<std::string> &passthrough_args) {
   std::vector<std::string> parts;

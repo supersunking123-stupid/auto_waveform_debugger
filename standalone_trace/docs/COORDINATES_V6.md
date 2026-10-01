@@ -71,5 +71,10 @@ Epoch 6 measures these coordinate changes. Ordinary range merging remains
 enabled. Merged-range display provenance and full-key endpoint dedup are
 disabled for this snapshot; their feature tests are explicitly disabled.
 Epoch 7 reenables provenance only for merges of different coordinates.
+Collapsing exact copies of `[7:0]` leaves its original flag unset. A selected
+query keeps that complete range, as it does for a single `[7:0]` access. When
+different coordinates merge, display narrowing applies only to the root's
+output copy. Traversal, cached records, member coordinates and logical axes
+keep their original bitmaps.
 Epoch 8 reenables full-key dedup with cheap scratch reuse. Each epoch forces an
 incremental rebuild of older semantics, including epochs 3, 4 and 5.
