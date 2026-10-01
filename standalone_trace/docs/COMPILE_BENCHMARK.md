@@ -444,14 +444,21 @@ Follow-up evidence: `/tmp/item4_fix_ctest.log`, `/tmp/item4_fix_testcases.log`,
 
 ### Item-5 experimental measurements (2026-10-01)
 
-These are isolated prototypes, not the current implementation on `item5`.
+These are isolated prototypes on the `item5-e2` and `item5-e3a` branches, not merged code.
 The full report and raw medians/min-max are in
 `/tmp/auto_waveform_item5_codex_report_20260930.md` and `/tmp/item5_logs/`.
 
-E2's default1thread and8thread compile comparisons each obtained0quiet pairs in
-6attempts. E3a's default compile comparison did likewise. All runs are preserved;
-no compile gain or regression decision follows from their diagnostic numbers.
-Default thread count remains1.
+Compile comparisons, as medians of candidate − base over 6 alternating pairs. The host carried
+1–4 cores of background load throughout, so the original 0.5-core quiet rule admitted no pairs.
+
+| Comparison | Wall | build_graph | Max RSS |
+|---|---|---|---|
+| E2 serial restructure, 1 thread | −1.10 s | −0.89 s | −26 MiB |
+| E2 parallel, 8 threads | +6.43 s | +6.19 s | +1.82 GiB |
+| E3a default | +0.40 s | +0.25 s | −7 MiB |
+| E4a unmerged − merged | −0.14 s | −0.15 s | +122 MiB |
+
+Default thread count remains 1.
 
 E3a warm measurements used three alternating pairs per query. Both processes ran
 from the matching source directory. Assignment text was populated and compared.
@@ -482,5 +489,5 @@ external Python jobs were present in their host records. Their output checks
 remain valid. Future full-corpus checks use the immutable patched source snapshot
 at `/tmp/item5_corpus/lumion_source_snapshot`.
 
-E3a's compile regression gate remains inconclusive, so the prototype is not
-retained. Warm trace below 1.0 s closes the E3b v6 gate.
+E3a's compile cost (+0.4 s) is within limits. It is not merged yet because publish and
+locking fixes are still pending (see TODO.md §5). Warm trace below 1.0 s closes the E3b v6 gate.

@@ -187,33 +187,46 @@ default against `=0`).
 
 ## 5. Item-5 experiments (2026-10-01)
 
-- **E1 retained:** all27 test scripts use `PYTHON`, defaulting to the repository
-  `.venv/bin/python3`. Normal and clean `/usr/bin:/bin` PATH suites pass27/27.
-  The old system-Python failure claim was not reproduced. Missing interpreters fail
-  clearly; an executable interpreter path can override `PYTHON`.
-- **E2 inconclusive:** ordered serial commit and parallel tracing preserve DB/meta
-  bytes on300-design/variant sweeps and Lumion. Full-slang TSan and debug freeze
-  checks pass. Both default1thread and8thread timing comparisons exhausted6attempts
-  without3quiet pairs. The prototype is on `item5-e2`, not retained here.
-  Default remains1; no new default is recommended from invalid timing data.
-- **E3a inconclusive compile gate:** mmap v5 and command-specific indexes preserve
-  output. Source-correct warm Lumion trace median 1.8609 s -> 0.8430 s;
-  RSS 5,523,320 -> 3,405,920 kB. Assignment text was populated and compared.
-  Literal find also exceeds the30% gain threshold; serve metrics do not regress.
-  Compile timings exhausted6attempts without3quiet pairs. The prototype remains
-  on `item5-e3a`; this branch keeps the existing loader/writer.
-- **E3b gate closed:** warm trace after E3a is below1.0s. No v6 indexed format.
-- **E4a inconclusive:** merged/unmerged RSS trials exhausted6attempts with
-  no valid quiet pairs. The fix gate did not open; no merge code change retained.
-- **E4b/E4c/E4d pending user decision:** logical multidimensional coordinates,
-  merged root-range display intersection, and full-field stable dedup are separate
-  experiments. They change DB bytes or query output and belong on `item5-visible`.
-  They are not accepted by this branch.
-
-All Lumion comparisons use the same predeclared quiet-host rule. Invalid runs are
-preserved and do not decide retention. Report and complete raw evidence:
+Review: `/tmp/auto_waveform_item5_claude_review_2026-10-01.md`. Codex report and raw data:
 `/tmp/auto_waveform_item5_codex_report_20260930.md`, `/tmp/item5_logs/`.
-No silent background-serve substitution or MCP interface change was attempted.
+
+The first-round quiet-host rule (at most 0.5 cores of other load) could never be met: this host
+always carries 1–4 cores of background load. So every compile comparison was reported
+inconclusive. The figures below are medians of candidate minus base over all 6 alternating
+Lumion pairs. Differences of a few seconds on a ~45 s compile are not treated as significant.
+
+- **E1 merged:** all 27 test scripts use `PYTHON`, defaulting to the repository
+  `.venv/bin/python3`, and fail clearly if it is missing. `run_all_tests.sh` passes 27/27.
+- **E2 discarded (this design):** parallel tracing with an ordered commit keeps the DB
+  byte-identical, but `-t 8` is +6.4 s wall and +1.8 GiB (6/6 pairs). Causes: ~8 s of serial
+  prewarm, a commit that never overlaps the workers, a serial fallback for 301k mostly-heavy
+  signals, per-worker cold caches (~2× CPU), static chunks plus a barrier. The serial
+  restructure alone is ~1 s faster. Prototype kept on `item5-e2`. Default stays at 1 thread.
+- **E3a pending fixes (`item5-e3a`):** mmap'd v5 DB with lazy, command-specific indexes. Output
+  is identical on a 60-query Lumion corpus, in one-shot and serve modes. Warm trace
+  1.68 → 0.78 s and 5.5 → 3.4 GB; find 1.69 → 0.21 s; serve startup 1.66 → 1.04 s. Compile
+  cost +0.4 s. Before merging: fsync and atomic `.meta` under the publish lock; a read-only
+  fallback for the `.lock` sidecar; GraphString bounds re-check in a long-lived serve; CTest
+  coverage with `--reference-bin`.
+- **E3b closed:** warm trace after E3a is below 1.0 s, so no v6 indexed format is needed.
+- **E4a closed:** the concern was reversed. Merging uses 122 MiB *less* peak RSS than not
+  merging (6/6 pairs).
+- **E4b/E4c/E4d pending fixes (`item5-visible`):**
+  - E4b: logical per-axis coordinates for multidimensional selects.
+  - E4c: narrowed display of merged root ranges.
+  - E4d: compile-time removal of 1.03M exact-duplicate endpoints (DB −2.2%).
+  - Needed before merging:
+    - E4b must warn when a single index on a multi-axis signal is reinterpreted or is out of
+      range, and must detect old and new DBs in both directions.
+    - E4c must narrow only when different coordinates were merged.
+    - E4d costs about +5.5 s of build_graph, mostly from a per-call hash-set `clear()`; it
+      should be made cheaper.
+    - The accepted stack takes fresh semantics epochs (6 or higher), because experimental
+      binaries already wrote epochs 3–5.
+
+Open idea: an E2 redesign could plausibly save ~17 s of build time. It would use shared
+immutable state, no fallback classes, a frozen path→id map, and dynamic scheduling with a
+reorder buffer. Profile the threaded build first.
 
 ## Done / dropped
 
