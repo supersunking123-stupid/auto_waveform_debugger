@@ -82,7 +82,7 @@ def main():
                 same_line = [e for e in endpoints if e['line'] == labels['same_line']]
                 assert {e['bit_map'] for e in same_line} == {'[0]', '[2]'}, same_line
                 loop = [e for e in endpoints if e['line'] == labels['loop']]
-                assert len(loop) == (2 if enabled else 0), (signal, loop)
+                assert {e['bit_map'] for e in loop} == ({'[6:5]'} if enabled else set()), (signal, loop)
                 active = ['case_one', 'outer_on'] if enabled else ['case_zero', 'outer_off', 'disabled_class_active']
                 assert all(labels[label] in lines for label in active), (signal, mode, endpoints)
         for name in on['strings']:
@@ -127,6 +127,67 @@ def main():
         assert not (root/'failed.db').exists()
         assert not list(root.glob('.rtl_trace_stage_*'))
         print('PASS: audit binds actual owners/original offset namespaces, rejects same-line range claims, bypasses cache and fails visibly on write error')
+        alias_include = root/'alias_include.sv'
+        alias_include.write_text('`line 10 "shared_alias.vp" 0\nmodule unused_alias; endmodule\n')
+        aliased = root/'aliased.sv'
+        aliased.write_text('`include "'+str(alias_include)+'"\n`line 10 "shared_alias.vp" 0\n'
+                           'module inactive_top(input logic a, output logic q);\n'
+                           'if (0) begin:g_off\nassign q=a;\nend\nendmodule\n')
+        alias_manifest = root/'alias.jsonl'
+        compile_db(binary, aliased, root/'alias.db', {'RTL_TRACE_INACTIVE_SCOPES':str(alias_manifest)})
+        alias_rows = [json.loads(line) for line in alias_manifest.read_text().splitlines()]
+        row = next(r for r in alias_rows if r['record']=='inactive_scope')
+        assert row['original_span']['namespace_unambiguous'] is False
+        assert row['logical_range_exclusive'] is False
+        macro = root/'macro.sv'
+        macro.write_text('`define OFF_BLOCK begin:g_macro assign q=a; end\n'
+                         'module inactive_top(input logic a, output logic q);\n'
+                         'if (0) `OFF_BLOCK\nendmodule\n')
+        macro_manifest = root/'macro.jsonl'
+        compile_db(binary, macro, root/'macro.db', {'RTL_TRACE_INACTIVE_SCOPES':str(macro_manifest)})
+        macro_rows = [json.loads(line) for line in macro_manifest.read_text().splitlines()]
+        row = next(r for r in macro_rows if r['record']=='inactive_scope')
+        assert row['macro_boundary'] is True and row['original_span'] is None
+        assert row['logical_range_exclusive'] is False
+        print('PASS: aliased logical filenames and macro invocation boundaries cannot claim an offset/line witness')
+        fifo = root/'audit_fifo'
+        os.mkfifo(fifo)
+        run(binary, ['compile', '--db', root/'fifo.db', '--single-unit', source, '--top', 'inactive_top'],
+            {'RTL_TRACE_INACTIVE_SCOPES':str(fifo)}, expected=1)
+        assert not (root/'fifo.db').exists()
+        print('PASS: requested audit FIFO fails fast instead of blocking')
+        interior = root/'interior_macro.sv'
+        interior.write_text('module inactive_top(input logic a, output logic q);\n'
+                            'if (0) begin:g_off\n'
+                            '`define A_ASSIGN assign q = a;\n'
+                            '`A_ASSIGN\nend\n'
+                            '`line 4 "'+str(interior)+'" 0\n'
+                            '`A_ASSIGN\nendmodule\n')
+        interior_manifest = root/'interior_macro.jsonl'
+        interior_db = root/'interior_macro.db'
+        compile_db(binary, interior, interior_db, {'RTL_TRACE_INACTIVE_SCOPES':str(interior_manifest)})
+        rows = [json.loads(line) for line in interior_manifest.read_text().splitlines()]
+        row = next(r for r in rows if r['record']=='inactive_scope')
+        assert row['contains_macro_definition'] is True and row['macro_boundary'] is False
+        assert row['original_span'] is None and row['logical_range_exclusive'] is False
+        for signal, mode in [('inactive_top.q','drivers'),('inactive_top.a','loads')]:
+            payload = trace(binary, interior_db, signal, mode)
+            assert any(e['kind']=='expr' and e['assignment']=='q = a' for e in payload['endpoints']), payload
+        # A repeated line alias without macros also cannot claim exclusive lines.
+        repeated = root/'repeated_alias.sv'
+        repeated.write_text('`line 10 "repeated.vp" 0\n'
+                            'module inactive_top(input logic a, output logic q);\n'
+                            'if (0) begin:g_off\nassign q=a;\nend\n'
+                            '`line 12 "repeated.vp" 0\nassign q=a;\nendmodule\n')
+        repeated_manifest = root/'repeated.jsonl'
+        compile_db(binary, repeated, root/'repeated.db', {'RTL_TRACE_INACTIVE_SCOPES':str(repeated_manifest)})
+        rows = [json.loads(line) for line in repeated_manifest.read_text().splitlines()]
+        row = next(r for r in rows if r['record']=='inactive_scope')
+        assert row['original_span'] is not None and row['logical_range_exclusive'] is False
+        print('PASS: active macro invocation survives; interior definitions and repeated line aliases cannot claim inactive witnesses')
+
+
+
 
 
 if __name__ == '__main__':

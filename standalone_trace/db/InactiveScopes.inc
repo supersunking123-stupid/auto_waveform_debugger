@@ -13,7 +13,15 @@ class InactiveSourceNamespaces {
   InactiveSourceNamespaces(const slang::SourceManager &sm, CompileContext &ctx) {
     std::unordered_map<std::string, std::string_view> physical_text;
     for (const auto buffer : sm.getAllBuffers()) {
-      if (sm.getFullPath(buffer).empty()) continue; // Macro buffers have no file namespace.
+      if (sm.getFullPath(buffer).empty()) {
+        // Stored locations use an invocation image; assignment offsets use the
+        // fully-original macro image. Include both in logical namespace checks.
+        const slang::SourceLocation expanded(buffer, 0);
+        const auto original = sm.getFullyOriginalLoc(expanded);
+        if (original.valid() && !sm.getFullPath(original.buffer()).empty())
+          macro_original_files_[GetStoredSourcePath(expanded, sm, ctx)].insert(GetAbsoluteSourcePath(original, sm, ctx));
+        continue;
+      }
       const auto text = sm.getSourceText(buffer);
       const std::string physical = GetAbsoluteSourcePath(slang::SourceLocation(buffer, 0), sm, ctx);
       auto [found, inserted] = physical_text.emplace(physical, text);
@@ -44,6 +52,9 @@ class InactiveSourceNamespaces {
     const auto found = segments_.find(file);
     if (found == segments_.end() || ambiguous_physical_.contains(physical)) return false;
     for (const auto &segment : found->second) if (segment.physical != physical) return false;
+    const auto macros = macro_original_files_.find(file);
+    if (macros != macro_original_files_.end())
+      for (const auto &original : macros->second) if (original != physical) return false;
     return true;
   }
   bool ExclusiveLines(const std::string &file, const std::string &physical, uint32_t buffer,
@@ -66,14 +77,67 @@ class InactiveSourceNamespaces {
  private:
   std::unordered_map<std::string, std::vector<InactiveSourceSegment>> segments_;
   std::unordered_set<std::string> ambiguous_physical_;
+  std::unordered_map<std::string, std::unordered_set<std::string>> macro_original_files_;
+};
+
+// Keep explicitly requested audit outputs nonblocking and regular, and avoid
+// reopening a checked pathname. This also fails fast for FIFO/device/symlink paths.
+class InactiveManifestBuffer : public std::streambuf {
+ public:
+  explicit InactiveManifestBuffer(int fd) : fd_(fd) { setp(bytes_, bytes_ + sizeof(bytes_)); }
+  ~InactiveManifestBuffer() override { if (fd_ >= 0) ::close(fd_); }
+  bool Close() {
+    bool okay = Flush();
+    if (::close(fd_) != 0) okay = false;
+    fd_ = -1;
+    return okay;
+  }
+ protected:
+  int sync() override { return Flush() ? 0 : -1; }
+  int_type overflow(int_type value) override {
+    if (!Flush()) return traits_type::eof();
+    if (!traits_type::eq_int_type(value, traits_type::eof())) {
+      *pptr() = traits_type::to_char_type(value); pbump(1);
+    }
+    return traits_type::not_eof(value);
+  }
+  std::streamsize xsputn(const char *source, std::streamsize count) override {
+    std::streamsize done = 0;
+    while (done < count) {
+      if (pptr() == epptr() && !Flush()) break;
+      const auto take = std::min<std::streamsize>(epptr() - pptr(), count - done);
+      std::memcpy(pptr(), source + done, static_cast<size_t>(take));
+      pbump(static_cast<int>(take)); done += take;
+    }
+    return done;
+  }
+ private:
+  bool Flush() {
+    const auto count = static_cast<size_t>(pptr() - pbase());
+    size_t done = 0;
+    while (done < count) {
+      const auto written = ::write(fd_, pbase() + done, count - done);
+      if (written < 0 && errno == EINTR) continue;
+      if (written <= 0) return false;
+      done += static_cast<size_t>(written);
+    }
+    setp(bytes_, bytes_ + sizeof(bytes_));
+    return true;
+  }
+  int fd_;
+  char bytes_[8192];
 };
 
 bool WriteInactiveScopeManifest(const slang::ast::RootSymbol &root,
                                 const slang::SourceManager &sm, CompileContext &ctx,
                                 const std::string &path) {
   if (!std::filesystem::path(path).is_absolute()) return false;
-  std::ofstream out(path, std::ios::binary | std::ios::trunc);
-  if (!out) return false;
+  const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC, 0666);
+  if (fd < 0) return false;
+  struct stat status;
+  if (::fstat(fd, &status) != 0 || !S_ISREG(status.st_mode)) { ::close(fd); return false; }
+  InactiveManifestBuffer output_buffer(fd);
+  std::ostream out(&output_buffer);
   const InactiveSourceNamespaces namespaces(sm, ctx);
   auto quoted = [](std::string_view value) { return "\"" + JsonEscape(value) + "\""; };
   std::error_code ec;
@@ -96,9 +160,18 @@ bool WriteInactiveScopeManifest(const slang::ast::RootSymbol &root,
     const slang::SourceRange original = valid_range ? sm.getFullyOriginalRange(range) : slang::SourceRange{};
     const auto start = original.start(), end = original.end();
     const bool same_buffer = start.valid() && end.valid() && start.buffer() == end.buffer();
-    const bool valid_original = same_buffer && start.offset() <= end.offset() &&
+    // A macro definition can be expanded in both active and inactive siblings.
+    // Original offsets alone cannot distinguish those invocation images.
+    const bool direct_boundary = valid_range && same_buffer &&
+        range.start().buffer() == start.buffer() && range.end().buffer() == end.buffer();
+    const bool valid_interval = direct_boundary && start.offset() <= end.offset() &&
         end.offset() <= sm.getSourceText(start.buffer()).size() &&
         end.offset() <= std::numeric_limits<uint32_t>::max();
+    // An inactive block can define a macro later invoked from active code.
+    // Its definition offsets cannot prove which invocation produced an endpoint.
+    const bool contains_macro_definition = valid_interval &&
+        sm.getSourceText(start.buffer()).substr(start.offset(), end.offset() - start.offset()).find("`define") != std::string_view::npos;
+    const bool valid_original = valid_interval && !contains_macro_definition;
     if (!valid_original) ++invalid;
     if (start.valid() && end.valid() && !same_buffer) ++cross_buffer;
     const std::string stored_first = valid_range ? GetStoredSourcePath(range.start(), sm, ctx) : "";
@@ -120,6 +193,8 @@ bool WriteInactiveScopeManifest(const slang::ast::RootSymbol &root,
     out << ",\"stored_start\":{\"file\":" << quoted(stored_first) << ",\"line\":" << first_line
         << "},\"stored_end\":{\"file\":" << quoted(stored_last) << ",\"line\":" << last_line
         << "},\"same_original_buffer\":" << (same_buffer ? "true" : "false")
+        << ",\"contains_macro_definition\":" << (contains_macro_definition ? "true" : "false")
+        << ",\"macro_boundary\":" << (valid_range && !direct_boundary ? "true" : "false")
         << ",\"logical_range_exclusive\":" << (exclusive ? "true" : "false") << ",\"original_span\":";
     if (valid_original && !physical.empty()) {
       out << "{\"file\":" << quoted(physical) << ",\"raw_file\":" << quoted(sm.getRawFileName(start.buffer()))
@@ -151,6 +226,7 @@ bool WriteInactiveScopeManifest(const slang::ast::RootSymbol &root,
       << ",\"inactive_scopes\":" << inactive << ",\"invalid_original_ranges\":" << invalid
       << ",\"cross_buffer_ranges\":" << cross_buffer
       << ",\"write_ok\":true,\"close_checked_by_compile_exit\":true}\n";
-  out.close();
-  return !out.fail();
+  out.flush();
+  const bool okay = static_cast<bool>(out);
+  return output_buffer.Close() && okay;
 }
