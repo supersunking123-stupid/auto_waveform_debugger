@@ -68,16 +68,25 @@ def layout(data):
     param_count = struct.unpack_from('<Q', data, position)[0]
     take('param_count', 1, 8)
     take('params', param_count, 12)
+    if header[1] == 6:
+        row_count = struct.unpack_from('<Q', data, position)[0]
+        take('coordinate_count', 1, 8)
+        take('coordinates', row_count, 16)
+        axis_count = struct.unpack_from('<Q', data, position)[0]
+        take('axis_count', 1, 8)
+        take('axes', axis_count, 12)
     assert position == len(data), (position, len(data))
     return sections
 
 
 def legacy_bytes(data, sections, version):
     output = bytearray(data[:HEADER.size])
-    struct.pack_into('<I', output, 16, version)
+    struct.pack_into('<II', output, 16, version, 0)
     for name, (offset, count, width) in sections.items():
+        if name in ('coordinate_count', 'coordinates', 'axis_count', 'axes'):
+            continue
         part = data[offset:offset + count * width]
-        if name == 'signals':
+        if name == 'signals' and version <= 4:
             part = b''.join(part[i:i + 20] for i in range(0, len(part), 32))
         elif name == 'hierarchy' and version <= 2:
             part = b''.join(part[i:i + 8] + part[i + 16:i + 24] for i in range(0, len(part), 24))
@@ -151,7 +160,7 @@ def main():
             if reference:
                 want = query(reference, db, command)
                 assert (got.returncode, got.stdout, got.stderr) == (want.returncode, want.stdout, want.stderr)
-        for version in (1, 2, 3, 4):
+        for version in (1, 2, 3, 4, 5):
             compat = root / f'compat_v{version}.db'
             compat.write_bytes(legacy_bytes(original, sections, version))
             for command in QUERIES:
@@ -161,7 +170,28 @@ def main():
                     assert (got.stdout, got.stderr) == (want.stdout, want.stderr), (version, command)
                 elif command[0] in ('find', 'trace', 'hier'):
                     assert got.stdout == query(binary, db, command).stdout, (version, command)
-        print('PASS: v1-v5 queries and unaligned mapped sections')
+        print('PASS: v1-v6 queries, empty v6 footer and unaligned mapped sections')
+        multidim = root / 'axes.sv'
+        multidim.write_text('module mapped_top(input logic [3:0][1:0] p, output logic y); assign y=p[2][1]; endmodule\n')
+        axes_db = root / 'axes.db'
+        compile_db(binary, axes_db, multidim)
+        for signal in ('mapped_top.p', 'mapped_top.p[2][1]'):
+            command = ['trace', '--mode', 'loads', '--signal', signal, '--format', 'json']
+            got = query(binary, axes_db, command)
+            if reference:
+                want = query(reference, axes_db, command)
+                assert (got.stdout, got.stderr) == (want.stdout, want.stderr)
+        axes_data = axes_db.read_bytes()
+        axes_layout = layout(axes_data)
+        corrupt_axes = root / 'axes_corrupt.db'
+        for offset, fmt, value in [(axes_layout['coordinate_count'][0], '<Q', 2**64-1),
+                                   (axes_layout['axis_count'][0], '<Q', 2**64-1),
+                                   (axes_layout['coordinates'][0]+12, '<I', 16),
+                                   (axes_layout['axes'][0]+8, '<I', 4)]:
+            bad = bytearray(axes_data); struct.pack_into(fmt, bad, offset, value)
+            corrupt_axes.write_bytes(bad)
+            run(binary, ['find', '--db', corrupt_axes, '--query', 'p'], expected=1)
+        print('PASS: mapped v6 coordinates/axes queries and malformed footer reject')
         other_source = root / 'other.sv'
         other_source.write_text(SOURCE.replace('logic [7:0] mid;', 'logic [7:0] mid; logic other_marker;'))
         other_db = root / 'other.db'
@@ -196,7 +226,7 @@ def main():
             readonly.chmod(0o755)
         print('PASS: read-only DB queries require no sidecar')
 
-        mutations = [('short_header', original[:HEADER.size - 1])]
+        mutations = [('short_header', original[:HEADER.size - 1]), ('trailing_v6', original+b'x')]
         def mutate(name, offset, fmt, value):
             payload = bytearray(original)
             struct.pack_into(fmt, payload, offset, value)
@@ -224,7 +254,7 @@ def main():
             corrupt.write_bytes(payload)
             for command in QUERIES:
                 got = run(binary, [command[0], '--db', corrupt, *command[1:]], expected=1)
-                assert not got.stdout and b'Failed to read DB:' in got.stderr, name
+                assert not got.stdout and (b'unsupported DB version' in got.stderr if name == 'bad_version' else b'Failed to read DB:' in got.stderr), name
                 if reference:
                     want = run(reference, [command[0], '--db', corrupt, *command[1:]], expected=1)
                     assert got.stderr == want.stderr, (name, command)

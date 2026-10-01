@@ -71,7 +71,7 @@ bool SaveGraphDb(const std::string &db_path,
                  size_t &signal_count,
                  CompileContext &compile_ctx,
                  bool low_mem,
-                 CompileLogger *logger, const std::string &fingerprint);
+                 CompileLogger *logger, const std::string &fingerprint, AtomicGraphOutput &publication);
 bool HasUnknownSysNameWarningControl(const std::vector<std::string> &args);
 bool IsDollarTokenDiagnostic(const slang::Diagnostic &diag, const slang::SourceManager &sm);
 bool IsDefparamRelaxDiag(slang::DiagCode code);
@@ -360,6 +360,14 @@ int RunCompile(int argc, char *argv[]) {
     return 0;
   }
 
+  // Check destination group/mode permissions before elaboration or graph building.
+  // Only compilers/cache checks use the sidecar; readers remain lock-free.
+  AtomicGraphOutput publication;
+  if (!publication.Prepare(db_path)) {
+    std::cerr << "Failed to prepare DB: " << publication.Error() << "\n";
+    return 1;
+  }
+
   std::vector<std::string> driver_args;
   driver_args.reserve(slang_args.size() + 4);
   driver_args.emplace_back("rtl_trace_compile");
@@ -464,8 +472,9 @@ int RunCompile(int argc, char *argv[]) {
   size_t written_signal_count = 0;
   LogMem("MemBeforeSaveGraphDb");
   if (!SaveGraphDb(db_path, signals, signal_paths, sm, hier_db, &buckets, written_signal_count, compile_ctx,
-                   low_mem, &logger, new_fingerprint)) {
-    std::cerr << "Failed to write DB: " << db_path << "\n";
+                   low_mem, &logger, new_fingerprint, publication)) {
+    if (publication.Error().empty()) publication.Fail("write staged DB", publication.TemporaryPath());
+    std::cerr << "Failed to write DB: " << publication.Error() << "\n";
     return 1;
   }
   LogMem("MemAfterSaveGraphDb");

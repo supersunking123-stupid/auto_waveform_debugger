@@ -66,7 +66,7 @@ def main():
             out, err = process.communicate(timeout=20)
             assert process.returncode == expected, (process.returncode, out, err)
 
-        for stage in ('prepared', 'db_synced', 'meta_synced', 'meta_invalidated', 'db_published', 'meta_published'):
+        for stage in ('prepared', 'db_closed', 'meta_closed', 'meta_invalidated', 'db_published', 'meta_published'):
             compile_db(binary, destination, a)
             process = publish(b, stage)
             wait_for(lambda: stopped(process))
@@ -96,27 +96,42 @@ def main():
         reader = subprocess.Popen([str(binary), 'find', '--db', str(destination), '--query', 'changed_marker'],
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         time.sleep(0.15)
-        assert incremental.poll() is None and reader.poll() is None
+        assert incremental.poll() is None
+        finish(reader)
         process.send_signal(signal.SIGCONT); finish(process)
         stdout, stderr = incremental.communicate(timeout=20)
         assert incremental.returncode == 0 and b'incremental-cache-hit' in stdout, (incremental.returncode, stdout, stderr)
-        stdout, stderr = reader.communicate(timeout=20)
-        assert reader.returncode == 0 and b'changed_marker' in stdout and not stderr, (reader.returncode, stdout, stderr)
-        print('PASS: metadata/cache-hit and reader startup ordering use the same publication lock')
+        print('PASS: cache check waits for metadata-last publication; readers finish while sidecar stays exclusively locked')
 
         # Guardian death must produce an ordinary failure, not SIGPIPE termination.
         process = publish(a, 'prepared')
         wait_for(lambda: stopped(process))
         guardian = children(process)[0]
         os.kill(guardian, signal.SIGKILL)
-        process.send_signal(signal.SIGCONT); finish(process, 1)
+        process.send_signal(signal.SIGCONT); finish(process)
         assert not list(root.glob('.rtl_trace_stage_*'))
         assert (destination.read_bytes(), metadata.read_bytes()) == oracle[a]
-        print('PASS: dead guardian disarm fails without SIGPIPE, leaked lock or temporary file')
+        print('PASS: dead guardian after successful publish warns without failing, SIGPIPE, leaked lock or temporary file')
+
+        for stage in ('prepared', 'db_closed', 'meta_closed'):
+            compile_db(binary, destination, a)
+            process = publish(b, stage, group=True)
+            wait_for(lambda: stopped(process))
+            os.killpg(process.pid, signal.SIGINT)
+            process.send_signal(signal.SIGCONT)
+            finish(process, -signal.SIGINT)
+            wait_for(lambda: not list(root.glob('.rtl_trace_stage_*')))
+            assert (destination.read_bytes(), metadata.read_bytes()) == oracle[a]
+        print('PASS: process-group SIGINT at prepared/write stages kills compiler but guardian cleans all staging')
+        env = {**os.environ, 'RTL_TRACE_TEST_GUARDIAN_FORK_FAILURE': '1'}
+        fallback = subprocess.run([str(binary), 'compile', '--db', str(destination), '--single-unit', str(a), '--top', 'mapped_top'], env=env, capture_output=True, timeout=20)
+        assert fallback.returncode == 0 and b'continuing without it' in fallback.stderr
+        assert not list(root.glob('.rtl_trace_stage_*'))
+        print('PASS: injected guardian fork failure continues successfully with local cleanup')
 
         # Killing the entire group defeats the guardian. Recovery belongs to the
         # next writable compile; never claim immediate cleanup for this case.
-        process = publish(b, 'meta_synced', group=True)
+        process = publish(b, 'meta_closed', group=True)
         wait_for(lambda: stopped(process))
         guardian = children(process)[0]
         os.kill(guardian, signal.SIGSTOP)
@@ -134,11 +149,13 @@ def main():
             fcntl.flock(lease, fcntl.LOCK_EX)
             reader = subprocess.Popen([str(binary), 'find', '--db', str(destination), '--query', 'mapped_top'],
                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            time.sleep(0.15); assert reader.poll() is None
-            fcntl.flock(lease, fcntl.LOCK_UN)
             finish(reader)
+            fcntl.flock(lease, fcntl.LOCK_UN)
         compile_db(binary, destination, a)  # advisory EX flock also accepts readonly existing lock fd
-        print('PASS: actual reader and writer use an existing readonly lock without directory-sidecar creation')
+        lock.chmod(0o000)
+        query(binary, destination, ['find', '--query', 'mapped_top'])
+        lock.chmod(0o644)
+        print('PASS: readers ignore exclusively held and unreadable sidecars; writer supports readonly lock')
 
         masked = root/'masked.db'
         process = subprocess.Popen([str(binary), 'compile', '--db', str(masked),
@@ -170,7 +187,29 @@ def main():
         assert b'incremental-cache-hit' in hit.stdout
         print('PASS: symlink aliases bind DB, metadata and lock to the canonical target')
 
+        # A header/size envelope gives cheap corruption detection, not a checksum.
+        clean_db, clean_meta = oracle[a]
+        import struct
+        mutations = [('truncated_db', clean_db[:-1], clean_meta),
+                     ('short_header', clean_db[:100], clean_meta),
+                     ('old_meta', clean_db, clean_meta.split(b'RTL_TRACE_CACHE_ENVELOPE:')[0]),
+                     ('bad_meta', clean_db, b'invalid'),
+                     ('large_meta', clean_db, clean_meta+b'x'*4096)]
+        for label, offset, fmt, value in [('magic', 0, '<I', 0), ('version', 16, '<I', 7),
+                                          ('header_count', 40, '<Q', 2**64-1)]:
+            changed = bytearray(clean_db); struct.pack_into(fmt, changed, offset, value)
+            mutations.append((label, changed, clean_meta))
+        for label, damaged_db, damaged_meta in mutations:
+            destination.write_bytes(damaged_db); metadata.write_bytes(damaged_meta)
+            rebuilt = run(binary, ['compile', '--db', destination, '--single-unit', a, '--top', 'mapped_top', '--incremental'])
+            assert b'incremental-cache-hit' not in rebuilt.stdout, label
+            assert (destination.read_bytes(), metadata.read_bytes()) == oracle[a], label
+        print('PASS: truncation, bad/incomplete header, old/malformed/oversized metadata force rebuild')
+
         if args.reference_bin:
+            reference_db = root/'reference.db'
+            compile_db(args.reference_bin, reference_db, a)
+            reference_a = reference_db.read_bytes()
             compile_db(binary, destination, a)
             client = Serve(binary, destination)
             old = subprocess.Popen([str(args.reference_bin), 'compile', '--db', str(destination),
@@ -197,7 +236,7 @@ def main():
             new_snapshot = Serve(binary, destination)
             assert b'changed_marker' in new_snapshot.query('find --query changed_marker')
             old_snapshot.close(); finish(legacy)
-            assert destination.read_bytes() == oracle[a][0]
+            assert destination.read_bytes() == reference_a
             assert len(oracle[a][0]) != len(oracle[b][0])
             assert new_snapshot.query('find --query mapped_top') == b''
             new_snapshot.query('quit'); new_snapshot.process.stdin.close(); new_snapshot.process.wait(timeout=5)

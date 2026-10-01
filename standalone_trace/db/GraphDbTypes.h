@@ -253,6 +253,14 @@ struct GraphDb {
   std::vector<uint32_t> global_sinks;
   std::vector<GraphSignalCoordinates> coordinates;
   std::vector<GraphDeclaredAxis> declared_axes;
+  GraphPodView<GraphSignalCoordinates> mapped_coordinates;
+  GraphPodView<GraphDeclaredAxis> mapped_declared_axes;
+  GraphPodView<GraphSignalCoordinates> ReadCoordinates() const {
+    return mapped_coordinates.empty() ? GraphPodView<GraphSignalCoordinates>(coordinates) : mapped_coordinates;
+  }
+  GraphPodView<GraphDeclaredAxis> ReadDeclaredAxes() const {
+    return mapped_declared_axes.empty() ? GraphPodView<GraphDeclaredAxis>(declared_axes) : mapped_declared_axes;
+  }
   // Compiler writes use the owned vectors above. Runtime reads use immutable mappings.
   std::shared_ptr<void> mapping;
   size_t mapping_bytes = 0;

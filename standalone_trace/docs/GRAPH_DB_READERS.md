@@ -1,70 +1,57 @@
 # Graph DB snapshots
 
-The v1-v5 reader maps the DB file as an immutable snapshot. Strings use views into
-its offset table and blob. POD sections use checked, read-only views. Each record
-is copied with `memcpy` because the v5 section offsets can be unaligned. The
-compiler keeps its existing owned vectors and writes the same v5 bytes.
+The reader supports v1-v6 and maps the DB as an immutable snapshot. POD records
+are copied with memcpy because section offsets may be unaligned. Version 6
+coordinates and declared axes use mapped views with the same eager validation:
+sorted unique signal IDs, contiguous axes, known flags, bounded counts and exact
+footer EOF. Versions 1-4 retain their small record conversions. The compiler
+keeps owned vectors and writes exactly the visible stack's v6 bytes, including
+member declaration coverage (header feature bits 3).
 
-All prior content validation remains eager. Header sizes and section counts are
-checked against the mapped file length before access or allocation. Invalid
-unused sections still reject the DB. There are no newly accepted malformed DB
-cases. Eager validation still faults in sections during cold queries.
+Writers use an exclusive lock on the resolved DB path plus .lock. They prepare
+private staging files in the destination directory before parsing/elaboration.
+This probes actual group/mode permission before graph building. Stage names
+include the effective uid and a bounded destination-path hash. The writer never
+changes umask. Replacements preserve mode/group, and read-only destinations fail
+before building. An unprivileged replacement cannot preserve another uid's owner.
 
-Runtime maps are built for each command. `find` needs only the name views.
-`hier` and `whereis-instance` build only hierarchy data. `trace` builds names,
-reverse references, and global nets. `serve` keeps these maps and the hierarchy
-ready so its startup and status responses remain unchanged.
+After checked DB close, writers restore attributes, write and close metadata,
+remove old metadata, rename the DB, then rename metadata last. All publication
+steps stay under the exclusive sidecar lock. There are no DB, metadata or
+directory fsync calls: this is a regenerable cache, without crash durability.
+Two names cannot be atomically replaced together. A process interruption can
+leave old/new complete DB data with missing metadata, which forces a rebuild.
 
-Writers lock a stable `<resolved-db-path>.lock` sidecar. DB symlink aliases use
-the canonical target for the DB, `.meta`, and `.lock` paths. Writers stage both
-files in the destination directory. They restore the mode and group, then
-`fsync` each file. Under the same lock, they remove the old metadata and sync
-the directory before renaming the DB. They sync the directory after the DB
-rename and again after the metadata rename.
+The metadata keeps the compile fingerprint plus a bounded cache envelope with
+schema 1, DB byte size and all fixed header bytes. Compile cache checks hold the
+shared sidecar lock, open the DB, fstat it and read its fixed header. Wrong size,
+magic/version/header, unreadable data or malformed/old metadata causes a rebuild.
+This cheap check does not detect same-sized interior corruption or every
+power-loss tear. It is deliberately not a full DB checksum.
 
-Two file names cannot be replaced as one atomic operation. An interruption can
-leave a complete old or new DB with missing metadata. Incremental compilation
-then rebuilds. It cannot treat an old fingerprint as proof for a new DB.
-Readers and incremental cache checks hold a shared sidecar lock while loading
-the published state. A legacy DB without a sidecar cannot give an incremental
-cache hit; its first updated compile rebuilds under an exclusive lock. The
-lock file must remain in place: deleting it could
-split the writer mutex across two inodes.
+A DB without .lock gets one forced incremental rebuild under the exclusive
+writer lock. Old fingerprint-only metadata also rebuilds once. Keep the sidecar
+in place: deleting it can split the compiler mutex across two inodes. Readers
+neither create nor open the sidecar. An unreadable sidecar or a suspended compiler
+must not block a readable DB query. Readers hold a shared lock on the DB inode
+itself to cooperate with legacy truncate writers; the opened FD is the mapped FD.
+Atomic writers rename a new inode without waiting for the old serve snapshot.
+Reload opens and validates the replacement before changing sessions.
 
-A small cleanup child holds the writer lock and watches the compiler's lifetime.
-Compiler-only termination, including `SIGKILL`, removes that writer's staging
-files before releasing the lock. Normal completion disarms and reaps the child.
-Killing the entire process group or losing power can leave staging files. The
-next actual writer removes owned, regular, singly linked staging files under
-the same exclusive lock. A cache hit or read-only query does not do recovery.
-Foreign-owned files, symlinks, and hard links in the reserved staging namespace
-are rejected rather than removed.
+The cleanup guardian retains the exclusive writer lock and watches parent EOF.
+It ignores SIGINT, SIGTERM, SIGHUP and SIGQUIT; these are blocked around fork so
+there is no child startup race. Compiler-only SIGKILL and process-group SIGINT
+clean the current user's owned, regular, singly-linked staging files. Whole-group
+SIGKILL or power loss can leave stages. The next actual writer recovers those
+stages under the lock. Guardian creation failure warns and continues with local
+cleanup; guardian failure after a successful publish warns without failing it.
 
-New files use mode `0666` filtered by the caller's umask. Replacements preserve
-the existing mode and group or fail before publication. Read-only DB or metadata
-files cannot be silently replaced. An unprivileged writer can change the owner
-when replacing another user's writable file; it cannot preserve that other uid.
-The writer does not change the process umask. An existing read-only sidecar can
-be opened read-only for advisory locking. All retained file descriptors use
-`O_CLOEXEC`.
+NFS behavior depends on server/filesystem lock and rename support. flock may map
+to POSIX server locks. Remote replacement can invalidate an existing mapped
+snapshot and cause ESTALE or SIGBUS. There is no guarantee for such invalidation.
 
-Readers open and map the same file descriptor. They never create a sidecar and
-can query DBs in read-only directories. A shared inode lock stays held until
-the mapping is released. The shared sidecar lock is released after loading.
-Atomic writers can replace the DB while a `serve` session retains its previous
-snapshot. `reload` opens the new snapshot before replacing the session.
-
-Each string access checks the offset-table bounds, offset order, blob length,
-and mapping length before constructing a view. These checks use stored sizes;
-they do not call `fstat` per string. `serve` also checks the inode length at each
-command boundary and drops a session whose file length has changed.
-
-All concurrent compile writers must use the updated atomic writer. Concurrent
-legacy compile writers are unsupported: the old writer can lock an old inode,
-then reopen the path after an atomic rename and truncate the new inode. A reader's
-shared inode lease does not prevent that race. Reading old DB formats remains
-supported. On an unchanged inode, a cooperating legacy writer waits for the
-reader's shared lease. Bounds and length checks do not prevent `SIGBUS` if an
-uncooperative writer truncates a mapped inode during a query. They also cannot
-detect every same-size rewrite. Concurrent mixed legacy and atomic writers are
-outside the supported snapshot contract.
+String access checks stored bounds; serve checks mapped inode size at command
+boundaries. These do not guarantee protection against a concurrent in-place
+truncate during a query. Mixed legacy and atomic compile writers are unsupported:
+a legacy writer can lock an old inode and then reopen/truncate a new path inode.
+An unchanged inode's cooperating legacy writer waits for the reader lease.

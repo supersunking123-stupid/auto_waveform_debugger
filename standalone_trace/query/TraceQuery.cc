@@ -92,7 +92,7 @@ TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
 
   const bool is_drivers_mode = (opts.mode == "drivers");
   const auto root_id = LookupSignalId(session, opts.root_signal);
-  const bool root_is_member = root_id && session.graph->signals[*root_id].parent_signal_id !=
+  const bool root_is_member = root_id && session.graph->ReadSignals()[*root_id].parent_signal_id !=
                                              std::numeric_limits<uint32_t>::max();
   auto root_matches = [&](const EndpointRecord &e) {
     if (opts.signal_select_axes.size() != 1)
@@ -100,7 +100,7 @@ TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
     auto select = opts.signal_select_axes.front();
     uint32_t parent_id = *root_id;
     if (root_is_member) {
-      const auto &member = session.graph->signals[*root_id];
+      const auto &member = session.graph->ReadSignals()[*root_id];
       parent_id = member.parent_signal_id;
       select.first = static_cast<int32_t>(int64_t(select.first) + member.member_bit_offset);
       select.second = static_cast<int32_t>(int64_t(select.second) + member.member_bit_offset);
@@ -499,16 +499,22 @@ int RunTraceWithSession(TraceSession &session, const TraceOptions &parsed_opts) 
     }
     return 1;
   };
-  const auto &coordinate_rows = session.graph->coordinates;
-  const auto coordinate = std::lower_bound(coordinate_rows.begin(), coordinate_rows.end(), id,
-      [](const GraphSignalCoordinates &row, uint32_t value) { return row.signal_id < value; });
-  const bool has_coordinates = coordinate != coordinate_rows.end() && coordinate->signal_id == id;
+  const auto coordinate_rows = session.graph->ReadCoordinates();
+  size_t lo = 0, hi = coordinate_rows.size();
+  while (lo < hi) {
+    const size_t mid = lo + (hi - lo) / 2;
+    if (coordinate_rows[mid].signal_id < id) lo = mid + 1;
+    else hi = mid;
+  }
+  const bool has_coordinates = lo < coordinate_rows.size() && coordinate_rows[lo].signal_id == id;
+  const GraphSignalCoordinates coordinate = has_coordinates ? coordinate_rows[lo] : GraphSignalCoordinates{};
   if (has_coordinates) {
     opts.coordinate_encoding = "declared_axes";
-    opts.declared_axes.assign(session.graph->declared_axes.begin() + coordinate->axis_begin,
-                             session.graph->declared_axes.begin() + coordinate->axis_begin + coordinate->axis_count);
+    const auto axes = session.graph->ReadDeclaredAxes();
+    for (size_t axis = coordinate.axis_begin; axis < coordinate.axis_begin + coordinate.axis_count; ++axis)
+      opts.declared_axes.push_back(axes[axis]);
   }
-  if (session.graph->signals[id].parent_signal_id != std::numeric_limits<uint32_t>::max())
+  if (session.graph->ReadSignals()[id].parent_signal_id != std::numeric_limits<uint32_t>::max())
     opts.coordinate_encoding = "parent_struct_bits";
   const auto selector = [](int32_t left, int32_t right) {
     return "[" + std::to_string(left) + (left == right ? "" : ":" + std::to_string(right)) + "]";
@@ -534,7 +540,7 @@ int RunTraceWithSession(TraceSession &session, const TraceOptions &parsed_opts) 
     return " Flattened bit " + std::to_string(selected.first) + " → " + query + ".";
   };
   if (!opts.signal_select_axes.empty()) {
-    const bool member = session.graph->signals[id].parent_signal_id != std::numeric_limits<uint32_t>::max();
+    const bool member = session.graph->ReadSignals()[id].parent_signal_id != std::numeric_limits<uint32_t>::max();
     if (session.db.format_version < 6 || (member && !session.db.member_declared_axes_verified)) {
       // An old DB does not retain declarations. Even an endpoint-free packed
       // array must not silently be presented as a proven scalar vector.
@@ -552,9 +558,9 @@ int RunTraceWithSession(TraceSession &session, const TraceOptions &parsed_opts) 
         return diagnostic("legacy_multidimensional_select",
                           "Selected signal has multidimensional access evidence but the legacy DB lacks declared-axis metadata. Rebuild the DB with the current compiler.", true);
     } else if (has_coordinates) {
-      if (coordinate->flags & kCoordinateUnsupported)
+      if (coordinate.flags & kCoordinateUnsupported)
         return diagnostic("unsupported_coordinate_type",
-                          "Selected coordinates of " + std::string((coordinate->flags & kCoordinateTerminalAggregate) ?
+                          "Selected coordinates of " + std::string((coordinate.flags & kCoordinateTerminalAggregate) ?
                           "a packed struct or packed union array" : "a nonnumeric associative array or nonintegral element type") +
                           " remain unsupported in the current DB format. Querying the whole signal still works: " + opts.root_signal, true);
       if (opts.signal_select_axes.size() > opts.declared_axes.size())
@@ -569,7 +575,7 @@ int RunTraceWithSession(TraceSession &session, const TraceOptions &parsed_opts) 
                             std::to_string(declared.left) + ":" + std::to_string(declared.right) +
                             "]. Flattened waveform bit indices are not declared array coordinates." + flat_rewrite(), true);
       }
-      if (opts.signal_select_axes.size() == 1 && (coordinate->flags & kCoordinatePackedOuter)) {
+      if (opts.signal_select_axes.size() == 1 && (coordinate.flags & kCoordinatePackedOuter)) {
         const auto selected = opts.signal_select_axes.front();
         std::string row_query = opts.root_signal + selector(selected.first, selected.second);
         for (size_t axis = 1; axis < opts.declared_axes.size(); ++axis)
@@ -583,11 +589,11 @@ int RunTraceWithSession(TraceSession &session, const TraceOptions &parsed_opts) 
                           (member ? " Struct-member multi-axis selects remain unsupported; query the whole member signal." : ""), true);
       }
     } else if (opts.signal_select_axes.size() > 1 &&
-               session.graph->signals[id].parent_signal_id == std::numeric_limits<uint32_t>::max()) {
+               session.graph->ReadSignals()[id].parent_signal_id == std::numeric_limits<uint32_t>::max()) {
       return diagnostic("unsupported_coordinate_type", "Signal has no supported multidimensional declaration; multidimensional selects remain unsupported.", true);
     }
     if (member && opts.signal_select_axes.size() == 1 && !has_coordinates) {
-      const auto &field = session.graph->signals[id];
+      const auto &field = session.graph->ReadSignals()[id];
       const auto &selected = opts.signal_select_axes.front();
       const int64_t low = std::min(selected.first, selected.second);
       const int64_t high = std::max(selected.first, selected.second);
@@ -598,7 +604,7 @@ int RunTraceWithSession(TraceSession &session, const TraceOptions &parsed_opts) 
     }
   }
   if (opts.signal_select_axes.size() > 1) {
-    if (session.graph->signals[id].parent_signal_id != std::numeric_limits<uint32_t>::max()) {
+    if (session.graph->ReadSignals()[id].parent_signal_id != std::numeric_limits<uint32_t>::max()) {
       return diagnostic("unsupported_struct_member_axes", "Multi-dimensional selects of struct members remain unsupported: " + opts.root_signal, true);
     }
     if (session.db.global_nets.contains(opts.root_signal) ||

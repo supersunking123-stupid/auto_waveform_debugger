@@ -56,7 +56,7 @@ if(EXISTS "${RTL_TRACE_PARENT_BIN}")
 else()
   message(STATUS "SKIP: frozen main binary unavailable: ${RTL_TRACE_PARENT_BIN}")
 endif()
-set(RTL_TRACE_REFERENCE_BIN "" CACHE FILEPATH "Frozen reference rtl_trace for compatibility tests")
+set(RTL_TRACE_REFERENCE_BIN "/tmp/rtl_trace_item5_round3_main" CACHE FILEPATH "Frozen reference rtl_trace for compatibility tests")
 set(RTL_TRACE_REFERENCE_ARGS)
 if(RTL_TRACE_REFERENCE_BIN)
   if(NOT EXISTS "${RTL_TRACE_REFERENCE_BIN}")
@@ -131,12 +131,19 @@ add_test(
           --source-dir ${CMAKE_CURRENT_SOURCE_DIR}
           ${RTL_TRACE_PARENT_ARGS}
 )
+set(RTL_TRACE_MAPPING_REFERENCE_BIN "/tmp/rtl_trace_item5_round3_phase1" CACHE FILEPATH
+    "Frozen visible v6 binary for mmap compatibility tests")
+set(RTL_TRACE_MAPPING_REFERENCE_ARGS)
+if(EXISTS "${RTL_TRACE_MAPPING_REFERENCE_BIN}")
+  list(APPEND RTL_TRACE_MAPPING_REFERENCE_ARGS --reference-bin "${RTL_TRACE_MAPPING_REFERENCE_BIN}")
+endif()
+
 add_test(
   NAME graph_db_mapping_regression
   COMMAND ${Python3_EXECUTABLE}
           ${CMAKE_CURRENT_SOURCE_DIR}/tests/graph_db_mapping_regression.py
           --rtl-trace $<TARGET_FILE:rtl_trace>
-          ${RTL_TRACE_REFERENCE_ARGS}
+          ${RTL_TRACE_MAPPING_REFERENCE_ARGS}
 )
 
 add_executable(graph_pod_view_test tests/graph_pod_view_test.cc)

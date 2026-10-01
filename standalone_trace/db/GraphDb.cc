@@ -2440,7 +2440,7 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
                  std::vector<std::string> &signal_paths, const slang::SourceManager &sm,
                  const TraceDb &hier_db, const std::vector<std::vector<size_t>> *buckets,
                  size_t &signal_count,
-                 CompileContext &compile_ctx, bool low_mem, CompileLogger *logger, const std::string &fingerprint) {
+                 CompileContext &compile_ctx, bool low_mem, CompileLogger *logger, const std::string &fingerprint, AtomicGraphOutput &publication) {
   using Clock = std::chrono::steady_clock;
   auto fmt_seconds = [](const Clock::time_point &start, const Clock::time_point &end) {
     std::ostringstream os;
@@ -3218,8 +3218,6 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
 
   LogMemPhase("SaveGraphDb:BeforeWrite");
   const auto t_write_start = Clock::now();
-  AtomicGraphOutput publication;
-  if (!publication.Prepare(db_path)) return false;
   std::ofstream out(publication.TemporaryPath(), std::ios::binary | std::ios::trunc);
   if (!out.is_open()) return false;
   if (!WriteBinaryValue(out, header) || !WriteBinaryVector(out, string_offsets)) return false;
@@ -3271,20 +3269,20 @@ bool ValidateGraphDb(const GraphDb &graph) {
   uint64_t next_axis = 0;
   uint32_t previous_signal = 0;
   bool first_coordinate = true;
-  for (const auto &row : graph.coordinates) {
-    if (row.signal_id >= graph.signals.size() || (!first_coordinate && row.signal_id <= previous_signal) ||
+  for (const auto &row : graph.ReadCoordinates()) {
+    if (row.signal_id >= graph.ReadSignals().size() || (!first_coordinate && row.signal_id <= previous_signal) ||
         row.axis_count < 2 || row.axis_begin != next_axis || (row.flags & ~0x0fu) ||
         ((row.flags & kCoordinateTerminalEnum) && (row.flags & kCoordinateTerminalAggregate)) ||
         ((row.flags & kCoordinateTerminalAggregate) && !(row.flags & kCoordinateUnsupported)) ||
-        !ValidateGraphRange(row.axis_begin, row.axis_count, graph.declared_axes.size())) return false;
+        !ValidateGraphRange(row.axis_begin, row.axis_count, graph.ReadDeclaredAxes().size())) return false;
     first_coordinate = false;
     previous_signal = row.signal_id;
-    const auto &outer = graph.declared_axes[row.axis_begin];
+    const auto &outer = graph.ReadDeclaredAxes()[row.axis_begin];
     if (bool(row.flags & kCoordinatePackedOuter) != bool(outer.flags & kAxisPacked)) return false;
     next_axis += row.axis_count;
   }
-  if (next_axis != graph.declared_axes.size()) return false;
-  for (const auto &axis : graph.declared_axes) {
+  if (next_axis != graph.ReadDeclaredAxes().size()) return false;
+  for (const auto &axis : graph.ReadDeclaredAxes()) {
     if ((axis.flags & ~0x03u) || ((axis.flags & kAxisPacked) && !(axis.flags & kAxisFixed)) ||
         (!(axis.flags & kAxisFixed) && (axis.left != 0 || axis.right != 0))) return false;
   }
@@ -3350,20 +3348,22 @@ class GraphMappedReader {
     position_ += static_cast<size_t>(count);
     return p;
   }
+  bool AtEnd() const { return position_ == length_; }
  private:
   const char *data_;
   size_t length_;
   size_t position_ = 0;
 };
 
-bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db) {
+bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db,
+                 std::string *error) {
+  if (error) *error = "Failed to read DB: " + db_path;
+  graph = GraphDb{};
   // Lock the same fd that is mapped, for its lifetime. Atomic candidate writers
   // replace this inode safely. This lease cannot make concurrent legacy compiles
   // safe: legacy code can lock an old inode then reopen the newly renamed path.
   std::filesystem::path target;
   if (!ResolveGraphDestination(db_path, target)) return false;
-  ScopedFileLock startup_lock;
-  if (!startup_lock.AcquireShared(target.string() + ".lock", true)) return false;
   const int fd = ::open(target.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd < 0) return false;
   struct stat st;
@@ -3387,8 +3387,13 @@ bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db)
   GraphDbFileHeader header;
   if (!in.ReadValue(header) ||
       std::memcmp(header.magic, kGraphDbMagic, sizeof(header.magic)) != 0 ||
-      header.version < 1 || header.version > 5 ||
       header.string_count == std::numeric_limits<uint64_t>::max()) return false;
+  if (header.version < 1 || header.version > 6) {
+    if (error) *error = "unsupported DB version " + std::to_string(header.version) +
+                        " (this binary reads 1–6); recompile: " + db_path;
+    return false;
+  }
+  if (header.version == 6 && header.reserved != 1 && header.reserved != 3) return false;
   if (!in.ReadView(graph.mapped_string_offsets, header.string_count + 1)) return false;
   graph.mapped_string_blob = in.ReadBytes(header.string_blob_size);
   graph.mapped_string_blob_bytes = header.string_blob_size;
@@ -3448,6 +3453,13 @@ bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db)
     if (!in.ReadValue(range_count) || !in.ReadView(graph.mapped_hierarchy_param_ranges, range_count) ||
         !in.ReadValue(param_count) || !in.ReadView(graph.mapped_hierarchy_params, param_count))
       return false;
+  }
+  if (header.version == 6) {
+    uint64_t row_count = 0, axis_count = 0;
+    if (!in.ReadValue(row_count) || row_count > header.signal_count ||
+        !in.ReadView(graph.mapped_coordinates, row_count) ||
+        !in.ReadValue(axis_count) || axis_count > std::numeric_limits<uint32_t>::max() ||
+        !in.ReadView(graph.mapped_declared_axes, axis_count) || !in.AtEnd()) return false;
   }
   // Preserve all prior content rejection rules, including unrelated sections. Mapped
   // sections avoid copies; command-specific indexes and compat maps are built later.
@@ -3594,10 +3606,10 @@ bool EndpointMatchesParentStructBits(const TraceSession &session, const Endpoint
   // bitmap fallback when the queried parent is itself a nested member.
   const auto endpoint_id = LookupSignalId(session, EndpointPath(session.db, e));
   if (e.kind != EndpointKind::kPort && endpoint_id &&
-      session.graph->signals[parent_id].parent_signal_id == std::numeric_limits<uint32_t>::max()) {
+      session.graph->ReadSignals()[parent_id].parent_signal_id == std::numeric_limits<uint32_t>::max()) {
     uint32_t field_id = *endpoint_id;
     while (field_id != std::numeric_limits<uint32_t>::max()) {
-      const auto &field = session.graph->signals[field_id];
+      const auto &field = session.graph->ReadSignals()[field_id];
       if (field.parent_signal_id == parent_id && field.member_bit_width != 0) {
         const int64_t low = field.member_bit_offset;
         const int64_t high = low + field.member_bit_width - 1;
