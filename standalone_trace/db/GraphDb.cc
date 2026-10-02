@@ -994,6 +994,21 @@ std::vector<TraceResult> CollectPortConnectionResults(
 }
 
 template <bool DRIVERS>
+bool HasLocalPortBridge(const BodyTraceIndex &index, const slang::ast::Symbol *sym) {
+  const auto &opposite = DRIVERS ? index.loads : index.drivers;
+  const auto it = opposite.find(sym);
+  if (it == opposite.end()) return false;
+  // An expression on this exact port stays local during Compute and supplies
+  // a reverse bridge. Connections forwarded to children and member paths do
+  // not certify a bridge on the port itself.
+  return std::any_of(it->second.begin(), it->second.end(), [sym](const TraceResult &entry) {
+    const auto *expr = std::get_if<ExprTraceResult>(&entry);
+    return expr != nullptr && expr->symbol == sym && !expr->context_from_instance_port &&
+           expr->member_path.empty();
+  });
+}
+
+template <bool DRIVERS>
 std::vector<TraceResult> ComputeIndexedTraceResults(
     const slang::ast::Symbol *sym, TraceCompileCache &cache,
     std::unordered_set<const slang::ast::Symbol *> &visited,
@@ -1011,20 +1026,15 @@ std::vector<TraceResult> ComputeIndexedTraceResults(
   }();
   const auto it = entries.find(sym);
   if (it == entries.end()) return {};
-  const auto &local_opposite = DRIVERS ? index.loads : index.drivers;
-  const auto opposite = local_opposite.find(sym);
-  // Used ports already have compact reverse bridges. Only a port without
-  // local uses/drivers needs a new upward route. Continue that route through
-  // enclosing ports, but do not carry it into downward instance traversal.
-  const bool follow_parent = following_parent || opposite == local_opposite.end() || opposite->second.empty();
 
   std::vector<TraceResult> out;
   out.reserve(out.size() + it->second.size());
   for (const TraceResult &entry : it->second) {
     if (const auto *port = std::get_if<const slang::ast::PortSymbol *>(&entry)) {
       bool followed = false;
-      if (follow_parent && (*port)->direction ==
-          (DRIVERS ? slang::ast::ArgumentDirection::In : slang::ast::ArgumentDirection::Out)) {
+      if ((*port)->direction ==
+          (DRIVERS ? slang::ast::ArgumentDirection::In : slang::ast::ArgumentDirection::Out) &&
+          (following_parent || !HasLocalPortBridge<DRIVERS>(index, sym))) {
         std::vector<TraceResult> parent = CollectPortConnectionResults(**port, sym, visited);
         for (const TraceResult &connection : parent) {
           const auto *parent_expr = std::get_if<ExprTraceResult>(&connection);
@@ -4132,7 +4142,8 @@ bool ParseDefinesPlus(std::string_view tok, std::vector<std::string> &out) {
 // Epoch9: omit endpoints/references in uninstantiated generate branches.
 // Epoch10: follow child input/output ports through actual parent connections.
 // Epoch11: restrict new upward routes to ports without local opposite traces.
-constexpr int kCompileSemanticsEpoch = 11;
+// Epoch12: require a local expression on the exact port to certify its bridge.
+constexpr int kCompileSemanticsEpoch = 12;
 
 std::string ComputeCompileFingerprint(const std::vector<std::string> &passthrough_args) {
   std::vector<std::string> parts;

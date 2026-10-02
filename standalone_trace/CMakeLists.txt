@@ -159,7 +159,7 @@ add_test(
 )
 
 set(RTL_TRACE_GENERATE_PARENT_BIN "" CACHE FILEPATH
-    "Optional pre-epoch-11 binary for inactive-generate incremental rebuild regression")
+    "Optional pre-epoch-12 binary for inactive-generate incremental rebuild regression")
 set(RTL_TRACE_GENERATE_PARENT_ARGS)
 if(EXISTS "${RTL_TRACE_GENERATE_PARENT_BIN}")
   list(APPEND RTL_TRACE_GENERATE_PARENT_ARGS --parent-bin "${RTL_TRACE_GENERATE_PARENT_BIN}")
@@ -183,6 +183,13 @@ add_test(
   NAME global_port_compaction_regression
   COMMAND ${Python3_EXECUTABLE}
           ${CMAKE_CURRENT_SOURCE_DIR}/tests/global_port_compaction_regression.py
+          --rtl-trace $<TARGET_FILE:rtl_trace>
+          --source-dir ${CMAKE_CURRENT_SOURCE_DIR}
+)
+add_test(
+  NAME forwarded_port_traversal_regression
+  COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/forwarded_port_traversal_regression.py
           --rtl-trace $<TARGET_FILE:rtl_trace>
           --source-dir ${CMAKE_CURRENT_SOURCE_DIR}
 )

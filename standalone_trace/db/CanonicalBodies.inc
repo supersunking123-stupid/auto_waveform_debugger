@@ -581,14 +581,12 @@ class CanonicalTracer {
     const auto &entries = DRIVERS ? index.drivers : index.loads;
     const auto it = entries.find(sym);
     if (it == entries.end()) return;
-    const auto &local_opposite = DRIVERS ? index.loads : index.drivers;
-    const auto opposite = local_opposite.find(sym);
-    const bool follow_parent = following_parent || opposite == local_opposite.end() || opposite->second.empty();
     for (const TraceResult &entry : it->second) {
       if (const auto *port = std::get_if<const slang::ast::PortSymbol *>(&entry)) {
         bool followed = false;
-        if (follow_parent && (*port)->direction ==
-            (DRIVERS ? slang::ast::ArgumentDirection::In : slang::ast::ArgumentDirection::Out)) {
+        if ((*port)->direction ==
+            (DRIVERS ? slang::ast::ArgumentDirection::In : slang::ast::ArgumentDirection::Out) &&
+            (following_parent || !HasLocalPortBridge<DRIVERS>(index, sym))) {
           std::vector<Res> parent;
           Escape(**port, *body, f, visited, parent);
           for (Res &connection : parent) {
