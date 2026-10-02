@@ -606,7 +606,7 @@ Final VERIFY covers 3,798,275 signals with zero mismatched lists. The fixed-seed
 4,000-signal differential scan has 1,961 differing lists, zero query errors and
 zero port-stop losses. All 24 named checks pass. The expanded 72-query corpus
 has three explained differences: visited count only (q025), unchanged inactive
-removals (q050), and removal of an intermediate output-port stop (q052).
+removals (q050), and removal of an intermediate output-port endpoint (q052); its terminal stop is unchanged.
 Normal and clean-PATH runtime suites each pass 27/27; Python passes 387 with
 zero skips; CTest passes 17/17; canonical sweep passes 330/330.
 
