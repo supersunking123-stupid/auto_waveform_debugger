@@ -271,7 +271,9 @@ See COMPILE_BENCHMARK.md and the report for the accounting and disk limits.
 Round-4 blockers fixed (2026-10-02): struct-member loads now filter sibling
 members before approximate bitmap matching. Inactive-only child ports now follow
 parent connections without a reverse-reference dependency. The stored port
-traversal change takes semantics epoch 10. The raw MCP serve tool reports
+traversal change takes semantics epoch 11. Epoch 10 was written by the first
+round-4 candidate; epoch 11 narrows new parent routes to missing local uses or
+drivers and preserves compact fanout for active ports. The raw MCP serve tool reports
 error-severity diagnostics as errors. Regression and full-stack results are in
 `/tmp/auto_waveform_item5_round4_report_20261002.md`.
 
@@ -327,6 +329,6 @@ between steps. It predates items 5 and 6 and is outside this fix.
   `tests/fixtures/endpoint_merge.sv` updated. Agent-visible effect: per-bit assignments and
   generate loops show as one range (`bits [7:0]` instead of eight endpoints).
 - `--incremental` no longer reuses DBs built with older compile semantics: the compile fingerprint
-  carries a `SEMANTICS_EPOCH` line (now 10; item 6 follows parent ports and skips inactive generate branches), and a `.meta` without
+  carries a `SEMANTICS_EPOCH` line (now 11; item 6 follows missing-use parent ports and skips inactive generate branches), and a `.meta` without
   it or with an older epoch triggers a full rebuild (f8cd024). Bump `kCompileSemanticsEpoch` in
   `db/GraphDb.cc` whenever the same sources and arguments start producing a different DB.
