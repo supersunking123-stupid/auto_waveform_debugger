@@ -38,7 +38,7 @@ def trace(binary, db, signal, extra=(), mode='drivers'):
 
 def layout(data):
     header = list(HEADER.unpack_from(data))
-    assert header[1] == 6 and header[2] in (1, 3)
+    assert header[1] == 6 and header[2] in (1, 3, 7)
     strings_count, blob_size, signals_count, endpoints_count = header[3:7]
     blob_start = HEADER.size + 4 * (strings_count + 1)
     offsets = struct.unpack_from('<' + 'I' * (strings_count + 1), data, HEADER.size)

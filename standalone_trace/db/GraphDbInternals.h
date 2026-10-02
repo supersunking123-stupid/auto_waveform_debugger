@@ -57,6 +57,9 @@ bool ParseSignalQuery(const std::string &input, std::string &base_signal,
                       std::vector<std::pair<int32_t, int32_t>> &bit_select_axes);
 std::optional<std::vector<std::optional<std::pair<int32_t, int32_t>>>> ParseEndpointAxes(
     std::string_view bit_map);
+bool EndpointMatchesPortOwner(const TraceSession &session, const EndpointRecord &e,
+                              uint32_t queried_id,
+                              const std::vector<std::pair<int32_t, int32_t>> &axes);
 bool EndpointMatchesSignalAxes(const EndpointRecord &e,
                                const std::vector<std::pair<int32_t, int32_t>> &axes);
 EndpointRecord ClipRootMergedEndpointCopy(const EndpointRecord &e, const TraceOptions &opts,

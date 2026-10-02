@@ -72,15 +72,15 @@ def main():
         print('PASS: distinct parent connections across canonical duplicate instances; canonical on/off bytes and VERIFY match')
 
         meta = Path(str(db)+'.meta')
-        assert 'SEMANTICS_EPOCH:12\n' in meta.read_text()
-        meta.write_text(meta.read_text().replace('SEMANTICS_EPOCH:12\n', 'SEMANTICS_EPOCH:11\n'))
+        assert 'SEMANTICS_EPOCH:13\n' in meta.read_text()
+        meta.write_text(meta.read_text().replace('SEMANTICS_EPOCH:13\n', 'SEMANTICS_EPOCH:11\n'))
         rebuilt = compile_db(binary, source, db, incremental=True)
         assert 'incremental-cache-hit' not in rebuilt.stdout
         assert db.read_bytes() == off.read_bytes()
-        assert 'SEMANTICS_EPOCH:12\n' in meta.read_text()
+        assert 'SEMANTICS_EPOCH:13\n' in meta.read_text()
         hit = compile_db(binary, source, db, incremental=True)
         assert 'incremental-cache-hit' in hit.stdout
-        print('PASS: epoch 11 fingerprint forces epoch 12 rebuild, then cache hit')
+        print('PASS: epoch 11 fingerprint forces epoch 13 rebuild, then cache hit')
 
 
 if __name__ == '__main__':

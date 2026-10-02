@@ -572,59 +572,126 @@ class CanonicalTracer {
     if (g_canon_stats.on) CanonStatsOnEscape(*inst, CanonStatsRssKB() - canon_rss0);
   }
 
+  struct MappingEscape {
+    const slang::ast::InstanceSymbol *instance = nullptr;
+    const slang::ast::Expression *expr = nullptr;
+    const CanonFrame *frame = nullptr;
+  };
+  MappingEscape EscapeMapping(const slang::ast::PortSymbol &port,
+                              const slang::ast::InstanceBodySymbol &body, const CanonFrame *frame) {
+    const auto *instance = body.parentInstance;
+    const auto *outer = frame;
+    if (frame && frame->rep == &body) { instance = frame->image; outer = frame->outer; }
+    if (!instance) return {};
+    const slang::ast::PortSymbol *target = &port;
+    if (&instance->body != &body) {
+      const auto rep = body.getPortList(), image = instance->body.getPortList();
+      target = nullptr;
+      for (size_t i = 0; i < rep.size() && i < image.size(); ++i)
+        if (rep[i] == &port) { target = image[i]->as_if<slang::ast::PortSymbol>(); break; }
+      if (!target) { ++stats_.port_map_fail; return {}; }
+    }
+    return {instance, PortActualConnection(*instance, *target), outer};
+  }
   template <bool DRIVERS>
   void Compute(const slang::ast::Symbol *sym, const CanonFrame *f, VisitedSet &visited,
-               std::vector<Res> &out, bool following_parent = false) {
-    const slang::ast::InstanceBodySymbol *body = GetContainingInstance(sym);
-    if (body == nullptr) return;
+               std::vector<Res> &out, bool following_parent = false,
+               const PortProjection *projection = nullptr, size_t map_depth = 0) {
+    const auto *body = GetContainingInstance(sym);
+    if (!body) return;
+    auto marker = [&](const PortProjection &p, const slang::ast::PortSymbol *port, bool constant, bool unresolved) {
+      out.push_back(Res{PortMappingMarker(p, port, constant, unresolved),
+                       constant || unresolved ? p.owner_frame : f});
+    };
+    if (projection && map_depth >= kPortMapMaxDepth) { marker(*projection, nullptr, false, true); return; }
     const BodyTraceIndex &index = GetOrBuildBodyTraceIndex(*body, cache_);
     const auto &entries = DRIVERS ? index.drivers : index.loads;
     const auto it = entries.find(sym);
     if (it == entries.end()) return;
-    for (const TraceResult &entry : it->second) {
+    const auto current_entries = it->second; // recursive body-cache eviction cannot invalidate this list
+    const bool has_bridge = HasLocalPortBridge<DRIVERS>(index, sym);
+    for (const TraceResult &entry : current_entries) {
       if (const auto *port = std::get_if<const slang::ast::PortSymbol *>(&entry)) {
-        bool followed = false;
-        if ((*port)->direction ==
-            (DRIVERS ? slang::ast::ArgumentDirection::In : slang::ast::ArgumentDirection::Out) &&
-            (following_parent || !HasLocalPortBridge<DRIVERS>(index, sym))) {
-          std::vector<Res> parent;
-          Escape(**port, *body, f, visited, parent);
-          for (Res &connection : parent) {
-            const auto *parent_expr = std::get_if<ExprTraceResult>(&connection.result);
-            const size_t before = out.size();
-            if (parent_expr != nullptr && parent_expr->symbol != nullptr && parent_expr->member_path.empty())
-              Compute<DRIVERS>(parent_expr->symbol, connection.frame, visited, out, true);
-            if (out.size() == before) out.push_back(std::move(connection));
+        if ((*port)->direction == (DRIVERS ? slang::ast::ArgumentDirection::In : slang::ast::ArgumentDirection::Out) &&
+            (following_parent || !has_bridge)) {
+          const auto escape = EscapeMapping(**port, *body, f);
+          if (escape.expr) {
+            const auto initial = projection ? *projection : PortIdentityProjection(sym, f);
+            const auto map = GetCachedPortConnectionMap(*escape.expr, *escape.instance, cache_);
+            if (initial.pieces.empty() || map.empty()) {
+              if (initial.pieces.empty()) out.push_back(Res{*port, f});
+              else marker(initial, *port, false, true);
+              continue;
+            }
+            auto routes = PortComposeUp(initial, map);
+            if (routes.empty() || routes.size() > kPortMapMaxPieces) { marker(initial, *port, false, true); continue; }
+            for (auto &route : routes) {
+              const auto &piece = route.pieces.front();
+              if (piece.kind != PortMapPiece::Exact) {
+                marker(route, *port, piece.kind == PortMapPiece::Constant, piece.kind == PortMapPiece::Unsupported); continue;
+              }
+              auto branch_visited = visited;
+              if (!branch_visited.insert({piece.source, escape.frame}).second) { marker(route, *port, false, true); continue; }
+              const size_t before = out.size();
+              Compute<DRIVERS>(piece.source, escape.frame, branch_visited, out, true, &route, map_depth + 1);
+              if (out.size() == before) marker(route, *port, false, true);
+            }
+            continue;
           }
-          followed = !parent.empty();
         }
-        if (!followed) out.push_back(Res{*port, f});
+        if (projection) marker(*projection, *port, false, false);
+        else out.push_back(Res{*port, f});
         continue;
       }
       const auto *expr = std::get_if<ExprTraceResult>(&entry);
+      if (!expr) continue;
+      std::optional<PortCoverage> coverage;
+      if (projection) {
+        coverage = PortLocalCoverage(*projection, *expr);
+        if (!coverage) { marker(*projection, nullptr, false, true); continue; }
+        if (coverage->empty()) continue;
+      }
       bool followed = false;
-      if (expr != nullptr && expr->context_from_instance_port && expr->context_port != nullptr &&
-          expr->context_port->internalSymbol != nullptr && expr->member_path.empty()) {
-        const slang::ast::Symbol *internal = expr->context_port->internalSymbol;
-        const slang::ast::Symbol *csym = internal;
-        const CanonFrame *cf = f;
-        const slang::ast::InstanceSymbol *child = expr->context_instance;
-        if (child != nullptr && IsCrossing(*child)) {
-          if (const slang::ast::Symbol *mapped = MapDown(*child, *internal, *child->getCanonicalBody())) {
-            csym = mapped;
-            cf = InternFrame(f, *child);
-          } else {
-            ++stats_.down_map_fail;  // fall back to the actual (skipped) child body in frame f: correct, binds it
-          }
+      if (expr->context_from_instance_port && expr->context_port && expr->context_port->internalSymbol && expr->context_instance) {
+        const auto *internal = expr->context_port->internalSymbol;
+        const auto *child = expr->context_instance;
+        const auto *csym = internal;
+        const auto *cf = f;
+        if (IsCrossing(*child)) {
+          if (const auto *mapped = MapDown(*child, *internal, *child->getCanonicalBody())) {
+            csym = mapped; cf = InternFrame(f, *child);
+          } else ++stats_.down_map_fail;
         }
-        if (visited.insert({csym, cf}).second) {
-          CanonStatsReasonScope canon_reason(CanonicalStats::kDownward);
+        const auto *connection = PortActualConnection(*child, *expr->context_port);
+        const auto map = connection ? GetCachedPortConnectionMap(*connection, *child, cache_) : std::vector<PortMapPiece>{};
+        const auto initial = projection ? *projection : PortIdentityProjection(sym, f);
+        const bool identity = map.size() == 1 && map[0].kind == PortMapPiece::Exact && map[0].source == sym &&
+            map[0].owner_low == 0 && map[0].source_low == 0 && map[0].logical_axes.empty() &&
+            initial.pieces.size() == 1 && map[0].width == initial.pieces[0].width;
+        if ((projection || !identity) && !initial.pieces.empty()) {
+          auto downward = PortComposeDown(initial, map, csym);
+          auto branch_visited = visited;
+          const size_t before = out.size();
+          if (!downward.pieces.empty() && downward.pieces.size() <= kPortMapMaxPieces &&
+              branch_visited.insert({csym, cf}).second)
+            Compute<DRIVERS>(csym, cf, branch_visited, out, false, &downward, map_depth + 1);
+          followed = out.size() > before;
+          if (!followed) {
+            auto m = PortMappingMarker(initial, nullptr, false, true);
+            if (auto local = PortLocalCoverage(initial, *expr); local && !local->empty()) m.coverage = *local;
+            out.push_back(Res{std::move(m), initial.owner_frame}); followed = true;
+          }
+        } else if (expr->member_path.empty() && visited.insert({csym, cf}).second) {
           const size_t before = out.size();
           Compute<DRIVERS>(csym, cf, visited, out);
           followed = out.size() > before;
         }
       }
-      if (!followed && expr != nullptr) out.push_back(Res{*expr, f});
+      if (!followed) {
+        auto result = *expr;
+        if (coverage) result.port_query_coverage = *coverage;
+        out.push_back(Res{std::move(result), f});
+      }
     }
   }
 

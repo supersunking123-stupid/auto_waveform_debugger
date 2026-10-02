@@ -95,6 +95,8 @@ TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
   const bool root_is_member = root_id && session.graph->ReadSignals()[*root_id].parent_signal_id !=
                                              std::numeric_limits<uint32_t>::max();
   auto root_matches = [&](const EndpointRecord &e) {
+    if (!e.port_query_coverage.empty())
+      return EndpointMatchesPortOwner(session, e, *root_id, opts.signal_select_axes);
     if (opts.signal_select_axes.size() != 1)
       return EndpointMatchesSignalAxes(e, opts.signal_select_axes);
     auto select = opts.signal_select_axes.front();
@@ -178,6 +180,18 @@ TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
           const std::string &e_path = EndpointPath(db, e);
           if (sig == opts.root_signal && !root_matches(e)) {
             record_stop(e_path, "bit_filter", "endpoint-does-not-overlap-selected-bits", depth);
+            continue;
+          }
+          if (e.port_mapping_constant || e.port_mapping_unresolved) {
+            record_stop(e_path, e.port_mapping_constant ? "constant_connection" : "unresolved_connection_mapping",
+                        e.port_mapping_constant ? "selected-domain-has-no-signal-driver" : "selected-domain-mapping-is-unproven", depth);
+            continue;
+          }
+          if (e.kind == EndpointKind::kPort && !e.port_query_coverage.empty()) {
+            // A mapped terminal source port has no expandable exact relation.
+            // Do not escape its selected domain through unqualified reverse refs.
+            record_stop(e_path, "port_boundary", "mapped-terminal-source-port", depth);
+            if (endpoint_allowed(e) && seen_logic.insert(EndpointKey(db, e)).second) logic_endpoints.push_back(e);
             continue;
           }
           if (e.kind != EndpointKind::kPort) {
@@ -575,7 +589,7 @@ int RunTraceWithSession(TraceSession &session, const TraceOptions &parsed_opts) 
                             std::to_string(declared.left) + ":" + std::to_string(declared.right) +
                             "]. Flattened waveform bit indices are not declared array coordinates." + flat_rewrite(), true);
       }
-      if (opts.signal_select_axes.size() == 1 && (coordinate.flags & kCoordinatePackedOuter)) {
+      if (opts.signal_select_axes.size() == 1 && coordinate.axis_count > 1 && (coordinate.flags & kCoordinatePackedOuter)) {
         const auto selected = opts.signal_select_axes.front();
         std::string row_query = opts.root_signal + selector(selected.first, selected.second);
         for (size_t axis = 1; axis < opts.declared_axes.size(); ++axis)

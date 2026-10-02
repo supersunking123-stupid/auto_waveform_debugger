@@ -109,6 +109,9 @@ void CheckEveryField() {
   change([](auto &e) { e.bit_map_approximate = true; });
   change([](auto &e) { e.bit_map_logical_axes = true; });
   change([](auto &e) { e.bit_map_merged = true; });
+  change([](auto &e) { e.port_query_coverage = {{0, 3}}; });
+  change([](auto &e) { e.port_mapping_constant = true; });
+  change([](auto &e) { e.port_mapping_unresolved = true; });
   change([](auto &e) { e.lhs_signal_ids.push_back(9); });
   change([](auto &e) { e.rhs_signal_ids.push_back(9); });
   change([](auto &e) { e.lhs_signals.push_back("z"); });

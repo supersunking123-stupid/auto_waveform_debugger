@@ -29,7 +29,7 @@ def trace(binary, db, signal, mode='loads', expected=0, text=False):
 
 def footer(data):
     h = struct.unpack_from('<16sII15Q', data)
-    assert h[1] == 6 and h[2] in (1, 3), h[:3]
+    assert h[1] == 6 and h[2] in (1, 3, 7), h[:3]
     pos = 144 + 4 * (h[3] + 1) + h[4]
     pos += sum(n * size for n, size in zip(h[5:], (32, 48, 4, 12, 4, 12, 4, 12, 4, 24, 4, 16, 4)))
     count = struct.unpack_from('<Q', data, pos)[0]
@@ -116,7 +116,7 @@ def main():
             assert multi['diagnostics'][-1]['code'] == 'unsupported_struct_member_axes'
             trace(binary, db, 'coordinate_diagnostics.member_packet.matrix', mode)
             trace(binary, db, 'coordinate_diagnostics.member_packet.vector[2]', mode)
-        assert struct.unpack_from('<I', data, 20)[0] == 3
+        assert struct.unpack_from('<I', data, 20)[0] == 7
         round2 = root / 'round2_features.db'
         round2_data = bytearray(data); struct.pack_into('<I', round2_data, 20, 1)
         round2.write_bytes(round2_data)
@@ -153,7 +153,7 @@ def main():
         malformed = []
         for name, offset, fmt, value in [('feature', 20, '<I', 0), ('huge_rows', start, '<Q', 2**64-1),
                                          ('id', rows_start, '<I', struct.unpack_from('<Q', data, 40)[0]),
-                                         ('overlap', rows_start+4, '<I', 1), ('unknown_flags', rows_start+12, '<I', 16),
+                                         ('overlap', rows_start+4, '<I', 1), ('unknown_flags', rows_start+12, '<I', 64),
                                          ('duplicate_id', rows_start+16, '<I', struct.unpack_from('<I', data, rows_start)[0]),
                                          ('huge_axes', axes_count_pos, '<Q', 2**64-1),
                                          ('axis_flags', axes_count_pos+8+8, '<I', 4)]:
@@ -162,7 +162,7 @@ def main():
         for name, changed in malformed:
             bad = root / (name+'.db'); bad.write_bytes(changed)
             failed = run(binary, ['find', '--db', bad, '--query', 'p'], expected=1)
-            assert 'Failed to read DB' in failed.stderr, failed.stderr
+            assert ('unsupported v6 DB feature flags' if name == 'feature' else 'Failed to read DB') in failed.stderr, failed.stderr
         print('PASS: sparse row IDs/flags/coverage, bounded allocations, truncation and trailing bytes reject')
         for version in (0, 7, 999):
             bad = root / ('version_'+str(version)+'.db')

@@ -155,10 +155,15 @@ def main():
         compile_db(binary, db, source)
         original = db.read_bytes()
         sections = layout(original)
+        reference_db = root / 'feature3.db'
+        feature3 = bytearray(original); struct.pack_into('<I', feature3, 20, 3)
+        reference_db.write_bytes(feature3)
+        if reference:
+            run(reference, ['find', '--db', db, '--query', 'mapped_top'], expected=1)
         for command in QUERIES:
             got = query(binary, db, command)
             if reference:
-                want = query(reference, db, command)
+                want = query(reference, reference_db, command)
                 assert (got.returncode, got.stdout, got.stderr) == (want.returncode, want.stdout, want.stderr)
         for version in (1, 2, 3, 4, 5):
             compat = root / f'compat_v{version}.db'
@@ -179,14 +184,17 @@ def main():
             command = ['trace', '--mode', 'loads', '--signal', signal, '--format', 'json']
             got = query(binary, axes_db, command)
             if reference:
-                want = query(reference, axes_db, command)
+                old_axes = root/'axes_feature3.db'
+                old_data = bytearray(axes_db.read_bytes()); struct.pack_into('<I', old_data, 20, 3)
+                old_axes.write_bytes(old_data)
+                want = query(reference, old_axes, command)
                 assert (got.stdout, got.stderr) == (want.stdout, want.stderr)
         axes_data = axes_db.read_bytes()
         axes_layout = layout(axes_data)
         corrupt_axes = root / 'axes_corrupt.db'
         for offset, fmt, value in [(axes_layout['coordinate_count'][0], '<Q', 2**64-1),
                                    (axes_layout['axis_count'][0], '<Q', 2**64-1),
-                                   (axes_layout['coordinates'][0]+12, '<I', 16),
+                                   (axes_layout['coordinates'][0]+12, '<I', 64),
                                    (axes_layout['axes'][0]+8, '<I', 4)]:
             bad = bytearray(axes_data); struct.pack_into(fmt, bad, offset, value)
             corrupt_axes.write_bytes(bad)
@@ -254,7 +262,7 @@ def main():
             corrupt.write_bytes(payload)
             for command in QUERIES:
                 got = run(binary, [command[0], '--db', corrupt, *command[1:]], expected=1)
-                assert not got.stdout and (b'unsupported DB version' in got.stderr if name == 'bad_version' else b'Failed to read DB:' in got.stderr), name
+                assert not got.stdout and (b'unsupported DB version' in got.stderr if name == 'bad_version' else b'Failed to read DB:' in got.stderr), (name,got.stdout,got.stderr)
                 if reference:
                     want = run(reference, [command[0], '--db', corrupt, *command[1:]], expected=1)
                     # The frozen reader used a Unicode range dash in this error.

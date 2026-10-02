@@ -18,6 +18,9 @@ inline bool SameEndpointFields(const EndpointRecord &a, const EndpointRecord &b)
          a.assignment_start == b.assignment_start && a.assignment_end == b.assignment_end &&
          a.bit_map == b.bit_map && a.bit_map_approximate == b.bit_map_approximate &&
          a.bit_map_logical_axes == b.bit_map_logical_axes && a.bit_map_merged == b.bit_map_merged &&
+         a.port_query_coverage == b.port_query_coverage &&
+         a.port_mapping_constant == b.port_mapping_constant &&
+         a.port_mapping_unresolved == b.port_mapping_unresolved &&
          a.lhs_signal_ids == b.lhs_signal_ids && a.rhs_signal_ids == b.rhs_signal_ids &&
          a.lhs_signals == b.lhs_signals && a.rhs_signals == b.rhs_signals;
 }
@@ -50,6 +53,9 @@ struct EndpointFullKeyHash {
     value(e.assignment_start); value(e.assignment_end);
     value(e.bit_map); value(e.bit_map_approximate);
     value(e.bit_map_logical_axes); value(e.bit_map_merged);
+    value(e.port_mapping_constant); value(e.port_mapping_unresolved);
+    value(e.port_query_coverage.size());
+    for (const auto &range : e.port_query_coverage) { value(range.first); value(range.second); }
     refs(e.lhs_signal_ids); refs(e.rhs_signal_ids);
     refs(e.lhs_signals); refs(e.rhs_signals);
     return h;
