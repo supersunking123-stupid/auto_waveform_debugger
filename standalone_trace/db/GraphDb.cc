@@ -4700,13 +4700,32 @@ EndpointRecord ClipRootMergedEndpointCopy(const EndpointRecord &e, const TraceOp
 }
 
 std::string EndpointKey(const TraceDb &db, const EndpointRecord &e) {
-  return std::to_string(static_cast<int>(e.kind)) + "\t" + EndpointPath(db, e) + "\t" +
-         EndpointFile(db, e) + "\t" + std::to_string(e.line) + "\t" + e.direction + "\t" +
-         (e.has_assignment_range ? "1" : "0") + "\t" + std::to_string(e.assignment_start) + "\t" +
-         std::to_string(e.assignment_end) + "\t" + e.assignment_text + "\t" + e.bit_map + "\t" +
-         (e.bit_map_approximate ? "1" : "0") + (e.bit_map_logical_axes ? "\tlogical-axes" : "") +
-         (e.port_mapping_constant ? "\tconstant" : "") +
-         (e.port_mapping_unresolved ? "\tunresolved" : "");
+  // Query records already contain public path names. Reference IDs and hidden
+  // port relations belong to compiler identity, not native query identity.
+  // Timing accesses in different generated instances can share every source
+  // field but have different LHS refs. Keep those records distinct.
+  std::string key;
+  auto field = [&](std::string_view text) {
+    key += std::to_string(text.size());
+    key += ':';
+    key.append(text);
+  };
+  field(std::to_string(static_cast<int>(e.kind)));
+  field(EndpointPath(db, e)); field(EndpointFile(db, e));
+  field(std::to_string(e.line)); field(e.direction);
+  field(e.has_assignment_range ? "1" : "0");
+  field(std::to_string(e.assignment_start)); field(std::to_string(e.assignment_end));
+  field(e.assignment_text); field(e.bit_map);
+  field(e.bit_map_approximate ? "1" : "0");
+  field(e.bit_map_logical_axes ? "1" : "0");
+  field(e.port_mapping_constant ? "1" : "0");
+  field(e.port_mapping_unresolved ? "1" : "0");
+  auto refs = [&](const std::vector<std::string> &names) {
+    field(std::to_string(names.size()));
+    for (const auto &name : names) field(name);
+  };
+  refs(e.lhs_signals); refs(e.rhs_signals);
+  return key;
 }
 
 size_t EditDistance(const std::string &a, const std::string &b) {

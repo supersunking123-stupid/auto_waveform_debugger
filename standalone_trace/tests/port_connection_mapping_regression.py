@@ -202,7 +202,9 @@ endmodule
             assert not body['endpoints'] and any(s['reason']=='unresolved_connection_mapping'
                                                 for s in body['stops']),body
             count+=1
-        print(f'PASS: {count} exact/constant/unsupported/array queries; canonical bytes, VERIFY, epoch16 and strict envelopes')
+        from query_reference_identity_regression import check as check_query_refs
+        count += check_query_refs(binary, fixtures, root)
+        print(f'PASS: {count} exact/constant/unsupported/array/context queries; canonical bytes, VERIFY, epoch16 and strict envelopes')
 
 
 def malformed_envelopes(binary,db,root):
