@@ -1,5 +1,5 @@
 module member_loads(input logic a, b, input logic [1:0] idx,
-                    output logic [7:0] y);
+                    output logic [10:0] y);
   typedef struct packed {
     logic [3:0][1:0] matrix;
     logic [7:0] vector;
@@ -38,4 +38,16 @@ module member_loads(input logic a, b, input logic [1:0] idx,
   assign unpacked_matrix[3][0] = b;
   assign y[6] = unpacked_matrix[2][1];
   assign y[7] = unpacked_matrix[idx][0];
+
+  // Repeated field names expose legacy nested rows made from the root type.
+  // The actual nested matrix bit below is root bit 13, despite those rows.
+  typedef struct packed { logic [3:0][1:0] a; logic [3:0] b; } inner_t;
+  typedef struct packed { inner_t a; logic [7:0] b; } outer_t;
+  outer_t nested_packet;
+  assign nested_packet.a.a[0][1] = a;
+  assign nested_packet.a.b[1] = b;
+  assign nested_packet.b[1] = a;
+  assign y[8] = nested_packet.a.a[0][1];
+  assign y[9] = nested_packet.a.b[1];
+  assign y[10] = nested_packet.b[1];
 endmodule

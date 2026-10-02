@@ -64,6 +64,19 @@ def main():
             assert any(e['bit_map'] == '[2][1]' for e in unpacked), unpacked
             oob = trace(binary, db, 'unpacked_matrix[4][1]', mode, 1)
             assert oob['diagnostics'][-1]['code'] == 'axis_out_of_bounds', oob
+            nested = trace(binary, db, 'nested_packet[13]', mode)['endpoints']
+            assert len(nested) == 1 and nested[0]['path'] == 'member_loads.nested_packet.a.a', (mode, nested)
+            for name in ('nested_packet[1]', 'nested_packet.b', 'nested_packet.b[1]'):
+                endpoints = trace(binary, db, name, mode)['endpoints']
+                assert len(endpoints) == 1 and endpoints[0]['path'] == 'member_loads.nested_packet.b', (name, mode, endpoints)
+            for name, path in (('nested_packet.a', 'nested_packet.a.a'),
+                               ('nested_packet.a.a', 'nested_packet.a.a'),
+                               ('nested_packet.a.b[1]', 'nested_packet.a.b')):
+                endpoints = trace(binary, db, name, mode)['endpoints']
+                assert 'member_loads.'+path in {e['path'] for e in endpoints}, (name, mode, endpoints)
+                assert all(e['path'] != 'member_loads.nested_packet.b' for e in endpoints), endpoints
+            unsupported = trace(binary, db, 'nested_packet.a.a[0][1]', mode, 1)
+            assert unsupported['diagnostics'][-1]['code'] == 'unsupported_struct_member_axes', unsupported
         # A whole-struct driver still reaches each member. Filtering only known
         # sibling member identity must not remove whole-parent assignments.
         driver = trace(binary, db, 'whole.vector[2]', 'drivers')['endpoints']
@@ -72,12 +85,21 @@ def main():
         assert len(loads) == 1 and loads[0]['path'] == 'member_loads.whole.vector', loads
         print('PASS: member loads/drivers isolate siblings, local selects translate offsets, OOB errors and whole-struct drivers survive')
         print('PASS: packed multidimensional member queries keep explicit limits; unpacked roots filter axes and unpacked struct members remain explicitly missing')
+        print('PASS: nested reused field names retain root bit 13 and inner members; verified outer sibling bounds stay isolated')
         if args.baseline_bin:
             old = root/'baseline.db'
             compile_db(args.baseline_bin.resolve(), source, old)
             assert old.read_bytes() == original, 'query-only fix changed DB bytes'
             assert Path(str(old)+'.meta').read_bytes() == Path(str(db)+'.meta').read_bytes()
             assert len(trace(args.baseline_bin.resolve(), old, 'packet.vector', 'loads')['endpoints']) == 2
+            for mode in ('drivers', 'loads'):
+                for name in ('nested_packet[13]', 'nested_packet.a', 'nested_packet.a.a'):
+                    baseline = trace(args.baseline_bin.resolve(), old, name, mode)['endpoints']
+                    candidate = trace(binary, db, name, mode)['endpoints']
+                    assert [e['path'] for e in candidate] == [e['path'] for e in baseline], (name, mode, baseline, candidate)
+                baseline = trace(args.baseline_bin.resolve(), old, 'nested_packet.a.b[1]', mode)['endpoints']
+                candidate = trace(binary, db, 'nested_packet.a.b[1]', mode)['endpoints']
+                assert {e['path'] for e in baseline} <= {e['path'] for e in candidate}, (mode, baseline, candidate)
             old.unlink()
             print('PASS: frozen pre-fix reproduces leak; fresh DB and fingerprint bytes remain identical')
         if args.parent_bin:
@@ -88,6 +110,17 @@ def main():
                     parent = trace(args.parent_bin.resolve(), old, name, mode)['endpoints']
                     new = trace(binary, db, name, mode)['endpoints']
                     assert [e['path'] for e in parent] == [e['path'] for e in new], (name, mode, parent, new)
+                for name, path in (('nested_packet[13]', 'nested_packet.a.a'),
+                                   ('nested_packet.a.b[1]', 'nested_packet.a.b')):
+                    parent = trace(args.parent_bin.resolve(), old, name, mode)['endpoints']
+                    new = trace(binary, db, name, mode)['endpoints']
+                    if name == 'nested_packet[13]':
+                        assert 'member_loads.'+path in {e['path'] for e in parent}, (name, mode, parent)
+                    # Main does not translate the inner scalar member select.
+                    # Preserve its conservative endpoints and include the real
+                    # selected field with the current local-offset translation.
+                    assert {e['path'] for e in parent} <= {e['path'] for e in new}, (name, mode, parent, new)
+                    assert 'member_loads.'+path in {e['path'] for e in new}, (name, mode, new)
             old.unlink()
             print('PASS: main member, sub-select and parent-struct select endpoints match in both modes')
         off = root/'off.db'

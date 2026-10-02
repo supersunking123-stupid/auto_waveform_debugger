@@ -3618,22 +3618,24 @@ const std::string &SessionSignalName(const TraceSession &session, uint32_t id) {
 bool EndpointMatchesParentStructBits(const TraceSession &session, const EndpointRecord &e,
                                      uint32_t parent_id,
                                      const std::pair<int32_t, int32_t> &select) {
-  // Approximate selectors do not erase a known member's declaration bounds.
-  // Restrict only members of this parent; projected endpoints can name another
-  // signal whose coordinates are unrelated to the queried struct.
+  // Only direct fields of the root struct have verified declaration bounds:
+  // legacy nested decomposition reuses the root type when creating child rows.
+  // Use the direct ancestor's bounds for nested endpoints, and retain the
+  // bitmap fallback when the queried parent is itself a nested member.
   const auto endpoint_id = LookupSignalId(session, EndpointPath(session.db, e));
-  if (e.kind != EndpointKind::kPort && endpoint_id) {
-    const auto &field = session.graph->signals[*endpoint_id];
-    uint32_t ancestor = field.parent_signal_id;
-    while (ancestor != std::numeric_limits<uint32_t>::max()) {
-      if (ancestor == parent_id && field.member_bit_width != 0) {
+  if (e.kind != EndpointKind::kPort && endpoint_id &&
+      session.graph->signals[parent_id].parent_signal_id == std::numeric_limits<uint32_t>::max()) {
+    uint32_t field_id = *endpoint_id;
+    while (field_id != std::numeric_limits<uint32_t>::max()) {
+      const auto &field = session.graph->signals[field_id];
+      if (field.parent_signal_id == parent_id && field.member_bit_width != 0) {
         const int64_t low = field.member_bit_offset;
         const int64_t high = low + field.member_bit_width - 1;
         if (std::max(select.first, select.second) < low ||
             std::min(select.first, select.second) > high) return false;
         break;
       }
-      ancestor = session.graph->signals[ancestor].parent_signal_id;
+      field_id = field.parent_signal_id;
     }
   }
   return EndpointMatchesSignalSelect(e, select);
