@@ -173,7 +173,7 @@ def main():
             for command in commands:
                 # Serve reports startup errors within its response loop and exits normally.
                 failed = run(binary, [command[0], '--db', bad, *command[1:]], expected=0 if command[0] == 'serve' else 1)
-                assert f'unsupported DB version {version} (this binary reads 1–6); recompile' in failed.stderr, failed.stderr
+                assert f'unsupported DB version {version} (this binary reads 1-6); recompile' in failed.stderr, failed.stderr
                 assert 'Failed to read DB' not in failed.stderr
         print('PASS: trace/find/hier/whereis/serve report specific unsupported DB versions')
 

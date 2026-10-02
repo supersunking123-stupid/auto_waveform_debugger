@@ -257,7 +257,10 @@ def main():
                 assert not got.stdout and (b'unsupported DB version' in got.stderr if name == 'bad_version' else b'Failed to read DB:' in got.stderr), name
                 if reference:
                     want = run(reference, [command[0], '--db', corrupt, *command[1:]], expected=1)
-                    assert got.stderr == want.stderr, (name, command)
+                    # The frozen reader used a Unicode range dash in this error.
+                    expected_stderr = want.stderr.replace("(this binary reads 1–6)".encode(),
+                                                         b"(this binary reads 1-6)")
+                    assert got.stderr == expected_stderr, (name, command)
         # Huge counts must fail before allocation. Do not feed these to an eager reference
         # loader that can abort or attempt a huge allocation.
         for count_offset in (24, 32, 40, 48, 56, 64, 80, 96, 112, 128):
