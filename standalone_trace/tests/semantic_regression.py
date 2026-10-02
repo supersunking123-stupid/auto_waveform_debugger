@@ -289,13 +289,14 @@ def main():
         if r0.get("bit_map") != "[7:4]" or r0.get("bit_map_approximate"):
             raise AssertionError(f"unexpected bit_map for [7:4] query: {r0}")
 
-        # 6) traversal controls: depth / node limits should emit stops
+        # 6) traversal controls limit query-time logic-cone expansion. Port
+        # connections are already resolved while building directional lists.
         depth_limit = run_trace_json(
             rtl_trace,
             db,
             "drivers",
-            "semantic_top.u_cons.in_bus",
-            extra=["--depth", "0"],
+            "semantic_top.hit",
+            extra=["--cone-level", "2", "--depth", "0"],
         )
         if not any(s.get("reason") == "depth_limit" for s in depth_limit.get("stops", [])):
             raise AssertionError(f"expected depth_limit stop: {depth_limit}")
@@ -304,8 +305,8 @@ def main():
             rtl_trace,
             db,
             "drivers",
-            "semantic_top.u_cons.in_bus",
-            extra=["--max-nodes", "1"],
+            "semantic_top.hit",
+            extra=["--cone-level", "2", "--max-nodes", "1"],
         )
         if not any(s.get("reason") == "node_limit" for s in node_limit.get("stops", [])):
             raise AssertionError(f"expected node_limit stop: {node_limit}")

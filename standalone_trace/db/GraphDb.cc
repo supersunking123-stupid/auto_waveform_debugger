@@ -15,7 +15,6 @@
 
 // Slang AST headers needed for compile-time trace building
 #include "slang/ast/ASTVisitor.h"
-#include "slang/syntax/SyntaxNode.h"
 #include "slang/ast/Compilation.h"
 #include "slang/ast/EvalContext.h"
 #include "slang/ast/Expression.h"
@@ -423,11 +422,11 @@ const slang::ast::InstanceBodySymbol *GetContainingInstance(const slang::ast::Sy
 }
 
 const slang::ast::InstanceSymbol *GetContainingInstanceSymbol(const slang::ast::Symbol *sym) {
-  while (sym != nullptr && sym->kind != slang::ast::SymbolKind::Instance) {
-    if (sym->kind == slang::ast::SymbolKind::Root) return nullptr;
-    sym = &sym->getHierarchicalParent()->asSymbol();
-  }
-  return sym->as_if<slang::ast::InstanceSymbol>();
+  if (sym == nullptr) return nullptr;
+  if (const auto *inst = sym->as_if<slang::ast::InstanceSymbol>()) return inst;
+  // Hierarchical parents skip the InstanceSymbol at an InstanceBody boundary.
+  const auto *body = GetContainingInstance(sym);
+  return body != nullptr ? body->parentInstance : nullptr;
 }
 
 bool IsTraceable(const slang::ast::Symbol *sym) {
@@ -546,7 +545,7 @@ class BodyTraceIndexBuilder : public slang::ast::ASTVisitor<BodyTraceIndexBuilde
   }
 
   void handle(const slang::ast::GenerateBlockArraySymbol &array) {
-    // Explicit entries traversal also keeps a zero-trip array empty.
+    // Visit generate blocks explicitly to skip the genvar declaration.
     for (const auto *block : array.entries)
       if (block != nullptr) block->visit(*this);
   }
@@ -1017,22 +1016,22 @@ std::vector<TraceResult> ComputeIndexedTraceResults(
   for (const TraceResult &entry : it->second) {
     if (const auto *port = std::get_if<const slang::ast::PortSymbol *>(&entry)) {
       bool followed = false;
-      if constexpr (DRIVERS) {
-        if ((*port)->direction == slang::ast::ArgumentDirection::In) {
-          std::vector<TraceResult> parent = CollectPortConnectionResults(**port, sym, visited);
-          if (!parent.empty()) {
-            out.insert(out.end(), std::make_move_iterator(parent.begin()), std::make_move_iterator(parent.end()));
-            followed = true;
+      if ((*port)->direction ==
+          (DRIVERS ? slang::ast::ArgumentDirection::In : slang::ast::ArgumentDirection::Out)) {
+        std::vector<TraceResult> parent = CollectPortConnectionResults(**port, sym, visited);
+        for (const TraceResult &connection : parent) {
+          const auto *parent_expr = std::get_if<ExprTraceResult>(&connection);
+          if (parent_expr != nullptr && parent_expr->symbol != nullptr && parent_expr->member_path.empty()) {
+            auto results = ComputeIndexedTraceResults<DRIVERS>(parent_expr->symbol, cache, visited);
+            if (!results.empty()) {
+              out.insert(out.end(), std::make_move_iterator(results.begin()), std::make_move_iterator(results.end()));
+              continue;
+            }
           }
+          // Preserve a leaf connection and member-specific coordinates.
+          out.push_back(connection);
         }
-      } else {
-        if ((*port)->direction == slang::ast::ArgumentDirection::Out) {
-          std::vector<TraceResult> parent = CollectPortConnectionResults(**port, sym, visited);
-          if (!parent.empty()) {
-            out.insert(out.end(), std::make_move_iterator(parent.begin()), std::make_move_iterator(parent.end()));
-            followed = true;
-          }
-        }
+        followed = !parent.empty();
       }
       if (!followed) out.push_back(*port);
       continue;
@@ -2232,7 +2231,6 @@ void DecomposeStructMembers(std::vector<SignalCompileItem> &signals, std::vector
   }
 }
 
-#include "db/InactiveScopes.inc"
 
 void CollectInstanceHierarchy(const slang::ast::RootSymbol &root, const slang::SourceManager &sm,
                               TraceDb &db, CompileContext &compile_ctx) {
@@ -4125,7 +4123,8 @@ bool ParseDefinesPlus(std::string_view tok, std::vector<std::string> &out) {
 // Epoch7: narrowing provenance requires different merged coordinates (C fix).
 // Epoch8: stable full-field dedup with cheap singleton and touched-slot reuse (D fix).
 // Epoch9: omit endpoints/references in uninstantiated generate branches.
-constexpr int kCompileSemanticsEpoch = 9;
+// Epoch10: follow child input/output ports through actual parent connections.
+constexpr int kCompileSemanticsEpoch = 10;
 
 std::string ComputeCompileFingerprint(const std::vector<std::string> &passthrough_args) {
   std::vector<std::string> parts;

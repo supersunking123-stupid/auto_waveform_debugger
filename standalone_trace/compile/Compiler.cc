@@ -49,9 +49,6 @@ struct TraceCompileCache;
 void CollectTraceableSymbols(const slang::ast::RootSymbol &root,
                              std::vector<SignalCompileItem> &out,
                              std::vector<std::string> &out_paths);
-bool WriteInactiveScopeManifest(const slang::ast::RootSymbol &root,
-                                const slang::SourceManager &sm, CompileContext &compile_ctx,
-                                const std::string &path);
 void CollectInstanceHierarchy(const slang::ast::RootSymbol &root,
                               const slang::SourceManager &sm,
                               TraceDb &db,
@@ -356,9 +353,7 @@ int RunCompile(int argc, char *argv[]) {
   if (compile_ctx.source_path_mode == SourcePathMode::kPhysicalAbsolute)
     fingerprint_args.push_back("--physical-source-paths");
   const std::string new_fingerprint = ComputeCompileFingerprint(fingerprint_args);
-  const char *inactive_manifest = std::getenv("RTL_TRACE_INACTIVE_SCOPES");
-  const bool audit_requested = inactive_manifest && *inactive_manifest;
-  if (incremental && !audit_requested && GraphCompileCacheHit(db_path, new_fingerprint)) {
+  if (incremental && GraphCompileCacheHit(db_path, new_fingerprint)) {
     logger.Log("incremental cache hit");
     std::cout << "db: " << db_path << "\n";
     std::cout << "signals: incremental-cache-hit\n";
@@ -453,12 +448,6 @@ int RunCompile(int argc, char *argv[]) {
   hier_db.hierarchy.reserve(signals.size() / 4 + 1024);
   CollectInstanceHierarchy(root, sm, hier_db, compile_ctx);
   LogMem("MemAfterCollectHierarchy");
-  if (audit_requested && !WriteInactiveScopeManifest(root, sm, compile_ctx, inactive_manifest)) {
-    std::cerr << "Failed to write requested inactive scope manifest: " << inactive_manifest << "\n";
-    return 1;
-  }
-
-
   std::vector<PartitionRecord> parts;
   std::vector<std::vector<size_t>> buckets;
   if (partition_budget > 0) {

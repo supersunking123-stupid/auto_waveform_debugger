@@ -530,18 +530,11 @@ class CanonicalTracer {
     std::set<std::pair<const slang::ast::Symbol *, std::string>> visited_member_keys_;
   };
 
-  // Upward follow of `port` (a port of body X, traced in frame f) into the instantiating port connection.
-  // Mirrors CollectPortConnectionResults, which starts from GetContainingInstanceSymbol(sym). That helper
-  // climbs with getHierarchicalParent(), which steps from an InstanceBody to its instance's *parent scope*, so
-  // it never meets a SymbolKind::Instance and returns nullptr: the baseline upward follow never fires. Keep the
-  // same gate so the output stays identical; the frame logic below is what it would need if that were fixed.
-  void Escape(const slang::ast::PortSymbol &port, const slang::ast::Symbol &sym,
-              const slang::ast::InstanceBodySymbol &x, const CanonFrame *f, VisitedSet &visited,
+  // Follow the actual instantiating connection, leaving the current canonical
+  // frame when it represents this body. No reverse endpoint references are needed.
+  void Escape(const slang::ast::PortSymbol &port, const slang::ast::InstanceBodySymbol &x,
+              const CanonFrame *f, VisitedSet &visited,
               std::vector<Res> &out) {
-    if (GetContainingInstanceSymbol(&sym) == nullptr) {
-      ++stats_.escape_dead;
-      return;
-    }
     const slang::ast::InstanceSymbol *inst = x.parentInstance;
     const CanonFrame *ef = f;
     if (f != nullptr && f->rep == &x) {
@@ -592,9 +585,16 @@ class CanonicalTracer {
         bool followed = false;
         if ((*port)->direction ==
             (DRIVERS ? slang::ast::ArgumentDirection::In : slang::ast::ArgumentDirection::Out)) {
-          const size_t before = out.size();
-          Escape(**port, *sym, *body, f, visited, out);
-          followed = out.size() > before;
+          std::vector<Res> parent;
+          Escape(**port, *body, f, visited, parent);
+          for (Res &connection : parent) {
+            const auto *parent_expr = std::get_if<ExprTraceResult>(&connection.result);
+            const size_t before = out.size();
+            if (parent_expr != nullptr && parent_expr->symbol != nullptr && parent_expr->member_path.empty())
+              Compute<DRIVERS>(parent_expr->symbol, connection.frame, visited, out);
+            if (out.size() == before) out.push_back(std::move(connection));
+          }
+          followed = !parent.empty();
         }
         if (!followed) out.push_back(Res{*port, f});
         continue;

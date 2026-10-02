@@ -40,7 +40,10 @@ module inactive_unit #(parameter bit EN = 0, parameter int N = 0)
       assign q[12] = a[12]; // CASE nested_outer_off
     end
   end
-  if (EN) assign q[13] = a[13]; else assign q[14] = a[14]; // CASE unnamed_arms
+  if (EN)
+    assign q[13] = a[13]; // CASE unnamed_on
+  else
+    assign q[14] = a[14]; // CASE unnamed_off
   always_comb begin
     if (1'b0) q[15] = a[15]; else q[15] = 1'b0; // CASE procedural_dead_arm_retained
   end

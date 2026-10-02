@@ -158,8 +158,8 @@ add_test(
           ${RTL_TRACE_REFERENCE_ARGS}
 )
 
-set(RTL_TRACE_GENERATE_PARENT_BIN "/tmp/rtl_trace_item5_round3_phase2_v2" CACHE FILEPATH
-    "Frozen epoch 8 binary for inactive-generate incremental rebuild regression")
+set(RTL_TRACE_GENERATE_PARENT_BIN "" CACHE FILEPATH
+    "Optional pre-epoch-10 binary for inactive-generate incremental rebuild regression")
 set(RTL_TRACE_GENERATE_PARENT_ARGS)
 if(EXISTS "${RTL_TRACE_GENERATE_PARENT_BIN}")
   list(APPEND RTL_TRACE_GENERATE_PARENT_ARGS --parent-bin "${RTL_TRACE_GENERATE_PARENT_BIN}")
@@ -171,4 +171,11 @@ add_test(
           --rtl-trace $<TARGET_FILE:rtl_trace>
           --source-dir ${CMAKE_CURRENT_SOURCE_DIR}
           ${RTL_TRACE_GENERATE_PARENT_ARGS}
+)
+add_test(
+  NAME port_parent_traversal_regression
+  COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/port_parent_traversal_regression.py
+          --rtl-trace $<TARGET_FILE:rtl_trace>
+          --source-dir ${CMAKE_CURRENT_SOURCE_DIR}
 )
