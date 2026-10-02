@@ -77,22 +77,22 @@ def main():
         assert Path(str(off)+'.meta').read_bytes() == Path(str(db)+'.meta').read_bytes()
         verified = compile_db(binary, source, root/'verify.db', {'RTL_TRACE_CANONICAL_VERIFY':'1'})
         assert 'mismatched_lists=0' in verified.stdout
-        assert 'SEMANTICS_EPOCH:10\n' in Path(str(db)+'.meta').read_text()
+        assert 'SEMANTICS_EPOCH:11\n' in Path(str(db)+'.meta').read_text()
         print('PASS: two copies of each parameter class redirect canonically; canonical on/off bytes and VERIFY lists match')
 
         if args.parent_bin:
             inherited = root/'parent.db'
             compile_db(args.parent_bin.resolve(), source, inherited)
             old_epoch = int(re.search(r'SEMANTICS_EPOCH:(\d+)', Path(str(inherited)+'.meta').read_text()).group(1))
-            assert old_epoch < 10, old_epoch
+            assert old_epoch < 11, old_epoch
             rebuilt = compile_db(binary, source, inherited, incremental=True)
             assert 'incremental-cache-hit' not in rebuilt.stdout
             assert inherited.read_bytes() == db.read_bytes()
             hit = compile_db(binary, source, inherited, incremental=True)
             assert 'incremental-cache-hit' in hit.stdout
-            print(f'PASS: real epoch {old_epoch} parent forces epoch 10 rebuild then cache hit')
+            print(f'PASS: real epoch {old_epoch} parent forces epoch 11 rebuild then cache hit')
         else:
-            print('SKIP: actual pre-epoch-10 parent rebuild comparison (--parent-bin missing)')
+            print('SKIP: actual pre-epoch-11 parent rebuild comparison (--parent-bin missing)')
 
 
 if __name__ == '__main__':

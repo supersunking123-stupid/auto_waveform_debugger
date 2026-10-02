@@ -573,17 +573,21 @@ class CanonicalTracer {
   }
 
   template <bool DRIVERS>
-  void Compute(const slang::ast::Symbol *sym, const CanonFrame *f, VisitedSet &visited, std::vector<Res> &out) {
+  void Compute(const slang::ast::Symbol *sym, const CanonFrame *f, VisitedSet &visited,
+               std::vector<Res> &out, bool following_parent = false) {
     const slang::ast::InstanceBodySymbol *body = GetContainingInstance(sym);
     if (body == nullptr) return;
     const BodyTraceIndex &index = GetOrBuildBodyTraceIndex(*body, cache_);
     const auto &entries = DRIVERS ? index.drivers : index.loads;
     const auto it = entries.find(sym);
     if (it == entries.end()) return;
+    const auto &local_opposite = DRIVERS ? index.loads : index.drivers;
+    const auto opposite = local_opposite.find(sym);
+    const bool follow_parent = following_parent || opposite == local_opposite.end() || opposite->second.empty();
     for (const TraceResult &entry : it->second) {
       if (const auto *port = std::get_if<const slang::ast::PortSymbol *>(&entry)) {
         bool followed = false;
-        if ((*port)->direction ==
+        if (follow_parent && (*port)->direction ==
             (DRIVERS ? slang::ast::ArgumentDirection::In : slang::ast::ArgumentDirection::Out)) {
           std::vector<Res> parent;
           Escape(**port, *body, f, visited, parent);
@@ -591,7 +595,7 @@ class CanonicalTracer {
             const auto *parent_expr = std::get_if<ExprTraceResult>(&connection.result);
             const size_t before = out.size();
             if (parent_expr != nullptr && parent_expr->symbol != nullptr && parent_expr->member_path.empty())
-              Compute<DRIVERS>(parent_expr->symbol, connection.frame, visited, out);
+              Compute<DRIVERS>(parent_expr->symbol, connection.frame, visited, out, true);
             if (out.size() == before) out.push_back(std::move(connection));
           }
           followed = !parent.empty();

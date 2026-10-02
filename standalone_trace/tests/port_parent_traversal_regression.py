@@ -22,8 +22,7 @@ def main():
     labels = {line.split('// CASE ', 1)[1].strip(): number
               for number, line in enumerate(source.read_text().splitlines(), 1) if '// CASE ' in line}
     owners = [('u_direct0', 'x0', 'r0'), ('u_direct1', 'x1', 'r1'),
-              ('u_nested0.u_leaf', 'x0', 'r2'), ('u_nested1.u_leaf', 'x1', 'r3'),
-              ('u_active', 'x0', 'r4')]
+              ('u_nested0.u_leaf', 'x0', 'r2'), ('u_nested1.u_leaf', 'x1', 'r3')]
     with tempfile.TemporaryDirectory(prefix='rtl_parent_ports_') as directory:
         root = Path(directory)
         db = root/'canonical.db'
@@ -48,6 +47,13 @@ def main():
                 assert payload['endpoints'][0]['line'] == labels[label], payload
                 assert payload['endpoints'][0]['assignment'], payload
                 assert not any(stop['reason'] in ('depth_limit', 'node_limit') for stop in payload['stops']), payload
+        for field, mode, label in [('d', 'drivers', 'drive_x0'), ('q', 'loads', 'use_r4')]:
+            signal = 'port_parent_top.u_active.'+field
+            entries = decoded['lists'][signal][0 if mode == 'drivers' else 1]
+            assert len(entries) == 1 and entries[0][7] == 1, (signal, entries)
+            payload = json.loads(run(binary, ['trace', '--db', db, '--signal', signal,
+                '--mode', mode, '--format', 'json']).stdout)
+            assert len(payload['endpoints']) == 1 and payload['endpoints'][0]['line'] == labels[label], payload
         for owner in ('u_direct0', 'u_direct1', 'u_nested0.u_leaf', 'u_nested1.u_leaf'):
             for field, mode in [('d', 1), ('q', 0)]:
                 assert not decoded['lists']['port_parent_top.'+owner+'.'+field][mode], owner
@@ -66,15 +72,15 @@ def main():
         print('PASS: distinct parent connections across canonical duplicate instances; canonical on/off bytes and VERIFY match')
 
         meta = Path(str(db)+'.meta')
-        assert 'SEMANTICS_EPOCH:10\n' in meta.read_text()
-        meta.write_text(meta.read_text().replace('SEMANTICS_EPOCH:10\n', 'SEMANTICS_EPOCH:9\n'))
+        assert 'SEMANTICS_EPOCH:11\n' in meta.read_text()
+        meta.write_text(meta.read_text().replace('SEMANTICS_EPOCH:11\n', 'SEMANTICS_EPOCH:10\n'))
         rebuilt = compile_db(binary, source, db, incremental=True)
         assert 'incremental-cache-hit' not in rebuilt.stdout
         assert db.read_bytes() == off.read_bytes()
-        assert 'SEMANTICS_EPOCH:10\n' in meta.read_text()
+        assert 'SEMANTICS_EPOCH:11\n' in meta.read_text()
         hit = compile_db(binary, source, db, incremental=True)
         assert 'incremental-cache-hit' in hit.stdout
-        print('PASS: epoch 9 fingerprint forces epoch 10 rebuild, then cache hit')
+        print('PASS: epoch 10 fingerprint forces epoch 11 rebuild, then cache hit')
 
 
 if __name__ == '__main__':

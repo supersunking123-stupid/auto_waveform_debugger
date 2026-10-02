@@ -996,7 +996,8 @@ std::vector<TraceResult> CollectPortConnectionResults(
 template <bool DRIVERS>
 std::vector<TraceResult> ComputeIndexedTraceResults(
     const slang::ast::Symbol *sym, TraceCompileCache &cache,
-    std::unordered_set<const slang::ast::Symbol *> &visited) {
+    std::unordered_set<const slang::ast::Symbol *> &visited,
+    bool following_parent = false) {
   const slang::ast::InstanceBodySymbol *body = GetContainingInstance(sym);
   if (body == nullptr) return {};
 
@@ -1010,19 +1011,25 @@ std::vector<TraceResult> ComputeIndexedTraceResults(
   }();
   const auto it = entries.find(sym);
   if (it == entries.end()) return {};
+  const auto &local_opposite = DRIVERS ? index.loads : index.drivers;
+  const auto opposite = local_opposite.find(sym);
+  // Used ports already have compact reverse bridges. Only a port without
+  // local uses/drivers needs a new upward route. Continue that route through
+  // enclosing ports, but do not carry it into downward instance traversal.
+  const bool follow_parent = following_parent || opposite == local_opposite.end() || opposite->second.empty();
 
   std::vector<TraceResult> out;
   out.reserve(out.size() + it->second.size());
   for (const TraceResult &entry : it->second) {
     if (const auto *port = std::get_if<const slang::ast::PortSymbol *>(&entry)) {
       bool followed = false;
-      if ((*port)->direction ==
+      if (follow_parent && (*port)->direction ==
           (DRIVERS ? slang::ast::ArgumentDirection::In : slang::ast::ArgumentDirection::Out)) {
         std::vector<TraceResult> parent = CollectPortConnectionResults(**port, sym, visited);
         for (const TraceResult &connection : parent) {
           const auto *parent_expr = std::get_if<ExprTraceResult>(&connection);
           if (parent_expr != nullptr && parent_expr->symbol != nullptr && parent_expr->member_path.empty()) {
-            auto results = ComputeIndexedTraceResults<DRIVERS>(parent_expr->symbol, cache, visited);
+            auto results = ComputeIndexedTraceResults<DRIVERS>(parent_expr->symbol, cache, visited, true);
             if (!results.empty()) {
               out.insert(out.end(), std::make_move_iterator(results.begin()), std::make_move_iterator(results.end()));
               continue;
@@ -4124,7 +4131,8 @@ bool ParseDefinesPlus(std::string_view tok, std::vector<std::string> &out) {
 // Epoch8: stable full-field dedup with cheap singleton and touched-slot reuse (D fix).
 // Epoch9: omit endpoints/references in uninstantiated generate branches.
 // Epoch10: follow child input/output ports through actual parent connections.
-constexpr int kCompileSemanticsEpoch = 10;
+// Epoch11: restrict new upward routes to ports without local opposite traces.
+constexpr int kCompileSemanticsEpoch = 11;
 
 std::string ComputeCompileFingerprint(const std::vector<std::string> &passthrough_args) {
   std::vector<std::string> parts;
