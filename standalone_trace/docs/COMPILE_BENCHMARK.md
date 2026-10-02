@@ -582,3 +582,33 @@ incomplete large files were removed after small samples were kept. A repeat
 used about 6.5 MiB of accounting output. These failed logger runs and the early
 missing-script callback are not compile cost samples. The report records the
 reserve breach and the final free space.
+
+
+### Item6 round4 final epoch12 (2026-10-02)
+
+The final actual-parent bridge fix uses semantics epoch12. Epoch10 duplicated
+global fanout; epoch11 missed forwarded-only wrapper ports. Both were rejected.
+The final global-network stress DB remains byte-identical to epoch9.
+
+Exactly three base-first Lumion compile pairs used frozen final A and item6
+binaries. Each DB/meta matched its verified oracle and was deleted after checking.
+
+| Pair | A wall s | Item6 wall s | A peak RSS GiB | Item6 peak RSS GiB |
+|---|---:|---:|---:|---:|
+| 1 | 54.73 | 48.59 | 14.0859 | 13.3003 |
+| 2 | 53.12 | 48.11 | 14.0411 | 13.2933 |
+| 3 | 53.20 | 48.57 | 14.0786 | 13.2463 |
+
+Median paired delta: wall -5.01 s, build_graph -4.880 s,
+peak RSS -0.7855 GiB. No regression exceeds +5 s or +0.5 GiB.
+
+Final VERIFY covers 3,798,275 signals with zero mismatched lists. The fixed-seed
+4,000-signal differential scan has 1,961 differing lists, zero query errors and
+zero port-stop losses. All 24 named checks pass. The expanded 72-query corpus
+has three explained differences: visited count only (q025), unchanged inactive
+removals (q050), and removal of an intermediate output-port stop (q052).
+Normal and clean-PATH runtime suites each pass 27/27; Python passes 387 with
+zero skips; CTest passes 17/17; canonical sweep passes 330/330.
+
+Final report: `/tmp/auto_waveform_item5_round4_report_20261002.md`.
+Raw evidence: `local_test_design/bench_out/item5_round4_20261002/`.
