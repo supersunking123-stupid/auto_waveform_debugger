@@ -49,6 +49,38 @@ b100 "
 
 
 class TraceDiagnosticsUnitTests(unittest.TestCase):
+    def test_raw_serve_errors_preserve_stdout_and_stderr(self):
+        diagnostics = [
+            {"severity": "warning", "message": "Dimensions unverified"},
+            {"severity": "error", "message": "Specify both axes"},
+            {"severity": "error", "code": "invalid_coordinate"},
+        ]
+        raw = {"status": "success", "stdout": json.dumps({"diagnostics": diagnostics}),
+               "stderr": "warning: legacy: Dimensions unverified\n"}
+        session = mock.Mock()
+        session.query.return_value = dict(raw)
+        with mock.patch.dict(clients.rtl_serve_sessions, {"diagnostic-session": session}):
+            result = tools.rtl_trace_serve_query("diagnostic-session", "trace --format json")
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["message"], "Specify both axes; invalid_coordinate")
+        self.assertEqual(result["stdout"], raw["stdout"])
+        self.assertEqual(result["stderr"], raw["stderr"])
+
+    def test_raw_serve_warning_and_other_output_remain_success(self):
+        for stdout in (
+            json.dumps({"diagnostics": [{"severity": "warning", "message": "Legacy axes"}]}),
+            json.dumps({"matches": ["top.error"]}),
+            '["error"]\n',
+            "signal top.error\nwarning: legacy: Legacy axes\n",
+        ):
+            with self.subTest(stdout=stdout):
+                raw = {"status": "success", "stdout": stdout, "stderr": "warning: legacy\n"}
+                session = mock.Mock()
+                session.query.return_value = dict(raw)
+                with mock.patch.dict(clients.rtl_serve_sessions, {"diagnostic-session": session}):
+                    result = tools.rtl_trace_serve_query("diagnostic-session", "find --query error")
+                self.assertEqual(result, raw)
+
     def test_error_and_warning_messages_preserve_structured_diagnostics(self):
         diagnostics = [
             {"severity": "warning", "code": "legacy", "message": "Dimensions unverified"},
@@ -146,6 +178,50 @@ class TraceDiagnosticsRealBinaryTests(unittest.TestCase):
 
     def test_ambiguous_packed_select_is_error_for_trace_cone_and_analysis(self):
         self._check_error(self.current_db, "diagnostic_top.p[2]", "ambiguous_single_axis")
+
+    def test_raw_serve_error_diagnostic_and_recovery(self):
+        started = tools.rtl_trace_serve_start(
+            ["--db", str(self.current_db)], rtl_trace_bin=str(self.binary),
+        )
+        self.assertEqual(started["status"], "success", started)
+        sid = started["session_id"]
+        self.addCleanup(tools.rtl_trace_serve_stop, sid)
+        for mode in ("drivers", "loads"):
+            for format in ("json", "text"):
+                with self.subTest(mode=mode, format=format):
+                    result = tools.rtl_trace_serve_query(
+                        sid, f"trace --mode {mode} --signal diagnostic_top.p[2] --format {format}",
+                    )
+                    self.assertEqual(result["status"], "error", result)
+                    if format == "json":
+                        errors = [d for d in json.loads(result["stdout"])["diagnostics"]
+                                  if d["severity"] == "error"]
+                        self.assertIn("ambiguous_single_axis", [d["code"] for d in errors])
+                        self.assertIn(errors[0]["message"], result["message"])
+                    else:
+                        self.assertIn("ambiguous_single_axis", result["message"])
+                    recovered = tools.rtl_trace_serve_query(
+                        sid, f"trace --mode {mode} --signal diagnostic_top.v[2] --format {format}",
+                    )
+                    self.assertEqual(recovered["status"], "success", recovered)
+                    self.assertNotIn("message", recovered)
+
+    def test_raw_serve_legacy_warning_remains_success(self):
+        self._require_legacy()
+        started = tools.rtl_trace_serve_start(
+            ["--db", str(self.legacy_db)], rtl_trace_bin=str(self.binary),
+        )
+        self.assertEqual(started["status"], "success", started)
+        sid = started["session_id"]
+        self.addCleanup(tools.rtl_trace_serve_stop, sid)
+        result = tools.rtl_trace_serve_query(
+            sid, "trace --mode loads --signal diagnostic_top.v[2] --format json",
+        )
+        self.assertEqual(result["status"], "success", result)
+        warnings = [d for d in json.loads(result["stdout"])["diagnostics"]
+                    if d["severity"] == "warning"]
+        self.assertTrue(warnings)
+        self.assertNotIn("message", result)
 
     def test_real_legacy_multidimensional_select_is_error_for_trace_cone_and_analysis(self):
         self._require_legacy()

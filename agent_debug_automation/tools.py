@@ -1,5 +1,6 @@
 """All @mcp.tool handler functions."""
 
+import json
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -212,7 +213,30 @@ def rtl_trace_serve_query(session_id: str, command_line: str):
         sess = rtl_serve_sessions.get(session_id)
     if not sess:
         return {"status": "error", "message": f"session not found: {session_id}"}
-    return sess.query(command_line)
+    result = sess.query(command_line)
+    if result.get("status") != "success":
+        return result
+
+    # A completed serve response can still contain a trace diagnostic error.
+    # Keep the raw streams intact for callers that parse or display them.
+    try:
+        payload = json.loads(result.get("stdout", ""))
+    except json.JSONDecodeError:
+        errors = list(dict.fromkeys(
+            line for stream in ("stdout", "stderr")
+            for line in result.get(stream, "").splitlines()
+            if line.startswith("error: ")
+        ))
+    else:
+        errors = [
+            diagnostic.get("message") or diagnostic.get("code") or "rtl_trace diagnostic"
+            for diagnostic in payload.get("diagnostics", [])
+            if diagnostic.get("severity") == "error"
+        ] if isinstance(payload, dict) else []
+    if errors:
+        result["status"] = "error"
+        result["message"] = "; ".join(errors)
+    return result
 
 
 @mcp.tool()
