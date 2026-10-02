@@ -268,6 +268,13 @@ q050: 48 inactive pipe-mux endpoints and 16 resulting cycle stops disappear.
 Compile wall improves by 6.94 s and peak RSS by 0.8712 GiB over three pairs.
 See COMPILE_BENCHMARK.md and the report for the accounting and disk limits.
 
+Round-4 blockers fixed (2026-10-02): struct-member loads now filter sibling
+members before approximate bitmap matching. Inactive-only child ports now follow
+parent connections without a reverse-reference dependency. The stored port
+traversal change takes semantics epoch 10. The raw MCP serve tool reports
+error-severity diagnostics as errors. Regression and full-stack results are in
+`/tmp/auto_waveform_item5_round4_report_20261002.md`.
+
 Known low-impact bug, deferred: the nested select chain
 `[..][N-1:0]][2:0]` at `tl_tx_credit_reserve_req_to_ack.vp:80` can leak a selector
 between steps. It predates items 5 and 6 and is outside this fix.
@@ -320,6 +327,6 @@ between steps. It predates items 5 and 6 and is outside this fix.
   `tests/fixtures/endpoint_merge.sv` updated. Agent-visible effect: per-bit assignments and
   generate loops show as one range (`bits [7:0]` instead of eight endpoints).
 - `--incremental` no longer reuses DBs built with older compile semantics: the compile fingerprint
-  carries a `SEMANTICS_EPOCH` line (now 9; item 6 skips inactive generate branches), and a `.meta` without
+  carries a `SEMANTICS_EPOCH` line (now 10; item 6 follows parent ports and skips inactive generate branches), and a `.meta` without
   it or with an older epoch triggers a full rebuild (f8cd024). Bump `kCompileSemanticsEpoch` in
   `db/GraphDb.cc` whenever the same sources and arguments start producing a different DB.

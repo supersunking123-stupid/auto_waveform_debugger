@@ -518,7 +518,12 @@ The Lumion DB is byte-identical to phase 1 (2,569,737,188 bytes).
 The warm timing corpus has six one-shot queries and a serve session per binary,
 with three repetitions. Runs use the matching immutable source snapshot, so
 assignment text is populated. All nine comparisons match. The table uses medians
-from the saved query measurements.
+from the saved query measurements. These samples ran on a loaded host; the
+1.334 s A trace median is not a quiet-host result. Claude retimed the same stack
+on a quieter host: main 1.83 s, phase 1 1.80 s, A 0.77–0.89 s, item 6
+0.63–0.77 s, and A literal find 0.19 s. These independent timings are recorded in
+`/tmp/auto_waveform_item5_round3_claude_review_2026-10-02.md`; the historical table
+below remains the measured loaded-host series.
 
 | Operation | Phase 1 wall s | A wall s | Phase 1 RSS KiB | A RSS KiB |
 | --- | ---: | ---: | ---: | ---: |
