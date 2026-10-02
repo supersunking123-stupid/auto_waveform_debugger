@@ -117,7 +117,12 @@ TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
   std::vector<EndpointRecord> unresolved_ports;
   std::unordered_set<std::string> seen_logic;
   std::unordered_set<std::string> seen_ports;
+  using OwnerDomain = std::vector<std::pair<int32_t, int32_t>>;
+  using RouteDomain = std::optional<OwnerDomain>;
+  const RouteDomain root_domain = root_id && !opts.signal_select_axes.empty() ?
+      SessionPortOwnerSelection(session, *root_id, opts.signal_select_axes) : RouteDomain{};
   std::unordered_set<uint32_t> visited_signals;
+  std::unordered_set<std::string> visited_routes;
   std::unordered_set<std::string> stop_once;
   bool node_cap_hit = false;
 
@@ -135,7 +140,7 @@ TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
     return true;
   };
 
-  std::function<void(uint32_t, size_t, size_t)> walk_signal;
+  std::function<void(uint32_t, size_t, size_t, const RouteDomain &)> walk_signal;
   std::function<void(std::string_view, size_t, size_t)> walk_signal_name =
       [&](std::string_view sig_name, size_t depth, size_t cone_depth) {
         std::optional<uint32_t> sig_id = LookupSignalId(session, sig_name);
@@ -143,25 +148,31 @@ TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
           record_stop(std::string(sig_name), "missing_signal", "not-in-db", depth);
           return;
         }
-        walk_signal(*sig_id, depth, cone_depth);
+        walk_signal(*sig_id, depth, cone_depth, RouteDomain{});
       };
 
-  walk_signal = [&](uint32_t sig_id, size_t depth, size_t cone_depth) {
+  walk_signal = [&](uint32_t sig_id, size_t depth, size_t cone_depth, const RouteDomain &domain) {
+        if (domain && domain->empty()) return;
         const std::string_view sig = SessionSignalName(session, sig_id);
         if (depth > opts.depth_limit) {
           record_stop(sig, "depth_limit", "max-depth-reached", depth);
           return;
         }
         if (node_cap_hit) return;
-        if (visited_signals.size() >= opts.max_nodes) {
+        if (visited_routes.size() >= opts.max_nodes) {
           node_cap_hit = true;
           record_stop(sig, "node_limit", "max-nodes-reached", depth);
           return;
         }
-        if (!visited_signals.insert(sig_id).second) {
+        std::string route_key = std::to_string(sig_id);
+        if (domain) for (const auto &[lo,hi] : *domain)
+          route_key += ";" + std::to_string(lo) + ":" + std::to_string(hi);
+        else route_key += "*";
+        if (!visited_routes.insert(route_key).second) {
           record_stop(sig, "cycle", "already-visited", depth);
           return;
         }
+        visited_signals.insert(sig_id);
         if (opts.stop_at_re.has_value() && std::regex_search(sig.begin(), sig.end(), *opts.stop_at_re)) {
           record_stop(sig, "stop_at", "matched-stop-at-regex", depth);
           return;
@@ -176,9 +187,45 @@ TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
           if (!fallback_edges.empty()) active_edges = &fallback_edges;
         }
 
+        std::vector<EndpointRecord> constrained_edges;
+        if (domain) {
+          for (const auto &original : *active_edges) {
+            const auto projected = SessionConstrainPortEndpoint(session, original, sig_id, *domain);
+            if (!projected) {
+              record_stop(EndpointPath(db, original), "unresolved_connection_mapping",
+                          "target-owner-domain-is-unproven", depth);
+              continue;
+            }
+            constrained_edges.insert(constrained_edges.end(), projected->begin(), projected->end());
+          }
+          active_edges = &constrained_edges;
+        }
+        auto follow_bridge = [&](uint32_t source_id, uint32_t target_id, size_t next_cone) {
+          if (!(session.graph->format_features & kDbPortQueryCoverage)) {
+            walk_signal(target_id, depth + 1, next_cone, RouteDomain{});
+            return true;
+          }
+          RouteDomain selected_source;
+          if (source_id == sig_id && domain) selected_source = domain;
+          else if (root_id && source_id == *root_id) selected_source = root_domain;
+          const auto target_domain = SessionPortBridgeDomain(session, is_drivers_mode,
+                                                             source_id, target_id, selected_source);
+          if (!target_domain) {
+            // Historical feature1/3 paths without mapped declarations retain
+            // their whole-signal traversal. A selected or mapped route refuses
+            // an unproved inverse instead of reaching a neighboring array row.
+            if (selected_source || SessionPortOwnerSelection(session, target_id, {})) {
+              record_stop(SessionSignalName(session, target_id), "unresolved_connection_mapping",
+                          "reverse-port-domain-is-unproven", depth);
+              return false;
+            }
+            walk_signal(target_id, depth + 1, next_cone, RouteDomain{});
+          } else walk_signal(target_id, depth + 1, next_cone, target_domain);
+          return true;
+        };
         for (const EndpointRecord &e : *active_edges) {
           const std::string &e_path = EndpointPath(db, e);
-          if (sig == opts.root_signal && !root_matches(e)) {
+          if (sig == opts.root_signal && !(domain && e_path == sig) && !root_matches(e)) {
             record_stop(e_path, "bit_filter", "endpoint-does-not-overlap-selected-bits", depth);
             continue;
           }
@@ -217,7 +264,7 @@ TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
                   if (e_path != sig) {
                     std::optional<uint32_t> direct_id = LookupSignalId(session, e_path);
                     if (direct_id.has_value()) {
-                      walk_signal(*direct_id, depth + 1, cone_depth + 1);
+                      walk_signal(*direct_id, depth + 1, cone_depth + 1, RouteDomain{});
                       expanded = true;
                     }
                   }
@@ -226,7 +273,7 @@ TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
                   if (!bridge_refs.empty()) {
                     for (uint32_t next_sig_id : bridge_refs) {
                       if (next_sig_id == sig_id) continue;
-                      walk_signal(next_sig_id, depth + 1, cone_depth + 1);
+                      walk_signal(next_sig_id, depth + 1, cone_depth + 1, RouteDomain{});
                       expanded = true;
                     }
                   }
@@ -248,7 +295,7 @@ TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
           if (e_path != sig) {
             std::optional<uint32_t> direct_id = LookupSignalId(session, e_path);
             if (direct_id.has_value()) {
-              walk_signal(*direct_id, depth + 1, cone_depth);
+              walk_signal(*direct_id, depth + 1, cone_depth, RouteDomain{});
               expanded = true;
             }
           }
@@ -258,8 +305,12 @@ TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
           if (!bridge_refs.empty()) {
             for (uint32_t next_sig_id : bridge_refs) {
               if (next_sig_id == sig_id) continue;
-              walk_signal(next_sig_id, depth + 1, cone_depth);
-              expanded = true;
+              const auto source_id = LookupSignalId(session, e_path);
+              if (!source_id) {
+                record_stop(e_path, "unresolved_connection_mapping", "missing-source-declaration", depth);
+                continue;
+              }
+              expanded |= follow_bridge(*source_id, next_sig_id, cone_depth);
             }
           }
 

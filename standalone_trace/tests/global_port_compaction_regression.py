@@ -22,9 +22,9 @@ def main():
             header = struct.unpack('<16sII15Q', stream.read(144))
         # Check counts before decoding: a broken broad upward traversal emits
         # about 9.7 million endpoints and would make a Python object heap huge.
-        # Unpacked parent-array routes now stop explicitly rather than emitting
-        # unrelated child uses. Active leaf ports and global sinks stay compact.
-        assert header[6] == 22023 and header[7] == 24228, header
+        # Exact fixed-array parent routes restore the original connected lists.
+        # Active leaf ports and global sinks stay compact.
+        assert header[6] == 26421 and header[7] == 31928, header
         assert db.stat().st_size < 4*1024*1024, db.stat().st_size
         decoded = read_db(db)
         for owner in ('gnet_top.g[0].u', 'gnet_top.g[1099].u'):
@@ -32,7 +32,7 @@ def main():
                 entries = decoded['lists'][owner+'.'+field][mode]
                 assert len(entries) == 1 and entries[0][7] == 1, (owner, field, entries)
         assert len(decoded['globals']) >= 3, decoded['globals'].keys()
-        print('PASS: active-port lists retain compact markers; 22,023 endpoints, 24,228 refs, DB below 4 MiB')
+        print('PASS: active-port lists retain compact markers; 26,421 endpoints, 31,928 refs, DB below 4 MiB')
         off = root/'baseline.db'
         run(binary, ['compile', '--db', off, '--single-unit', source, '--top', 'gnet_top'],
             {'RTL_TRACE_CANONICAL_BODIES': '0'})

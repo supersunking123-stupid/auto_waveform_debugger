@@ -5,6 +5,32 @@ int64_t PortPackedWidth(const slang::ast::Type &type) {
   const auto width = type.getBitWidth();
   return width <= uint64_t(std::numeric_limits<int32_t>::max()) ? int64_t(width) : 0;
 }
+int64_t PortAxisOffset(int32_t left, int32_t right, int32_t index) {
+  return left >= right ? int64_t(index) - right : int64_t(right) - index;
+}
+struct PortOwnerShape {
+  std::vector<std::pair<int32_t, int32_t>> unpacked;
+  int64_t packed_width = 0, total_width = 0;
+};
+std::optional<PortOwnerShape> PortFixedOwnerShape(const slang::ast::Type &root) {
+  PortOwnerShape shape;
+  const auto *type = &root;
+  while (type->isUnpackedArray()) {
+    if (!type->hasFixedRange() || shape.unpacked.size() >= kPortMapMaxDepth) return std::nullopt;
+    const auto range = type->getFixedRange();
+    shape.unpacked.emplace_back(range.left, range.right);
+    type = type->getArrayElementType();
+    if (!type) return std::nullopt;
+  }
+  shape.total_width = shape.packed_width = PortPackedWidth(*type);
+  if (!shape.packed_width) return std::nullopt;
+  for (const auto [left, right] : shape.unpacked) {
+    const int64_t count = std::abs(int64_t(left) - right) + 1;
+    if (count > std::numeric_limits<int32_t>::max() / shape.total_width) return std::nullopt;
+    shape.total_width *= count;
+  }
+  return shape;
+}
 std::optional<int32_t> PortEvalIndex(const slang::ast::Expression &expr,
                                      const slang::ast::Symbol &scope) {
   slang::ast::EvalContext context(scope);
@@ -65,6 +91,49 @@ void PortNormalizeCoverage(PortCoverage &ranges) {
   }
   ranges.resize(used);
 }
+std::optional<int32_t> PortKnownBoolean(const slang::ast::Expression &expr,
+                                      const slang::ast::Symbol &scope) {
+  slang::ast::EvalContext context(scope);
+  const auto value = expr.eval(context);
+  if (!value || !value.isInteger() || value.integer().hasUnknown()) return std::nullopt;
+  const auto integer = value.integer().as<int32_t>();
+  return integer && (*integer == 0 || *integer == 1) ? integer : std::nullopt;
+}
+bool PortCollectBooleanRefs(const slang::ast::Expression &expr, const slang::ast::Symbol &scope,
+                            std::vector<PortMapPiece> &out, size_t depth = 0) {
+  using namespace slang::ast;
+  if (depth >= kPortMapMaxDepth || out.size() >= kPortMapMaxPieces) return false;
+  if (PortKnownBoolean(expr, scope)) return true;
+  if (PortPackedWidth(*expr.type) != 1) return false;
+  if (const auto *conversion = expr.as_if<ConversionExpression>())
+    return PortCollectBooleanRefs(conversion->operand(), scope, out, depth + 1);
+  if (const auto *binary = expr.as_if<BinaryExpression>()) {
+    if (binary->op != BinaryOperator::LogicalAnd && binary->op != BinaryOperator::LogicalOr) return false;
+    const auto left = PortKnownBoolean(binary->left(), scope), right = PortKnownBoolean(binary->right(), scope);
+    if ((binary->op == BinaryOperator::LogicalAnd && (left == 0 || right == 0)) ||
+        (binary->op == BinaryOperator::LogicalOr && (left == 1 || right == 1))) return true;
+    return PortCollectBooleanRefs(binary->left(), scope, out, depth + 1) &&
+           PortCollectBooleanRefs(binary->right(), scope, out, depth + 1);
+  }
+  if (const auto *unary = expr.as_if<UnaryExpression>()) {
+    if (unary->op != UnaryOperator::LogicalNot) return false;
+    return PortCollectBooleanRefs(unary->operand(), scope, out, depth + 1);
+  }
+  if (const auto *conditional = expr.as_if<ConditionalExpression>()) {
+    if (const auto *side = conditional->knownSide()) return PortCollectBooleanRefs(*side, scope, out, depth + 1);
+    if (conditional->conditions.size() != 1 || conditional->conditions[0].pattern) return false;
+    const auto left = PortKnownBoolean(conditional->left(), scope), right = PortKnownBoolean(conditional->right(), scope);
+    if (left && right && left == right) return true;
+    return PortCollectBooleanRefs(*conditional->conditions[0].expr, scope, out, depth + 1) &&
+           PortCollectBooleanRefs(conditional->left(), scope, out, depth + 1) &&
+           PortCollectBooleanRefs(conditional->right(), scope, out, depth + 1);
+  }
+  const auto reference = PortResolveReference(expr);
+  if (!reference.valid || PortPackedWidth(*reference.type) != 1) return false;
+  out.push_back({PortMapPiece::Dependency, reference.symbol, &expr, 0, reference.low, 1,
+                 reference.logical_axes});
+  return true;
+}
 PortCoverage PortProjectionCoverage(const PortProjection &projection) {
   PortCoverage out;
   for (const auto &p : projection.pieces)
@@ -112,6 +181,28 @@ std::vector<PortMapPiece> PortBuildExpressionMap(const slang::ast::Expression &e
     if (low != width) return marker(PortMapPiece::Unsupported);
     return out;
   }
+  if (const auto *conditional = expr.as_if<ConditionalExpression>()) {
+    if (const auto *side = conditional->knownSide()) return PortBuildExpressionMap(*side, scope, depth + 1);
+    if (conditional->conditions.size() == 1 && !conditional->conditions[0].pattern) {
+      const auto left = PortKnownBoolean(conditional->left(), scope), right = PortKnownBoolean(conditional->right(), scope);
+      if (left && right) {
+        if (left == right) return marker(PortMapPiece::Constant);
+        std::vector<PortMapPiece> refs;
+        if (PortCollectBooleanRefs(*conditional->conditions[0].expr, scope, refs, depth + 1)) {
+          if (refs.empty()) return marker(PortMapPiece::Constant);
+          if (width > 1) refs.push_back({PortMapPiece::Constant, nullptr, &expr, 1, 0, width - 1, {}});
+          return refs;
+        }
+      }
+    }
+  }
+  if (width == 1 && (expr.as_if<BinaryExpression>() || expr.as_if<ConditionalExpression>() ||
+                    (expr.as_if<UnaryExpression>() && expr.as<UnaryExpression>().op == UnaryOperator::LogicalNot))) {
+    std::vector<PortMapPiece> refs;
+    if (PortCollectBooleanRefs(expr, scope, refs, depth + 1))
+      return refs.empty() ? marker(PortMapPiece::Constant) : refs;
+    return marker(PortMapPiece::Unsupported);
+  }
   if (const auto *u = expr.as_if<UnaryExpression>()) {
     if (u->op == UnaryOperator::BitwiseNot && PortPackedWidth(*u->operand().type) == width)
       return PortBuildExpressionMap(u->operand(), scope, depth + 1);
@@ -148,10 +239,42 @@ PortProjection PortIdentityProjection(const slang::ast::Symbol *symbol, const Ca
   const auto *type = value ? &value->getType() : nullptr;
   const bool integral_owner = type && type->isIntegral();
   while (type && type->isUnpackedArray()) type = type->getArrayElementType();
-  const int64_t width = type ? PortPackedWidth(*type) : 0;
+  const auto shape = value ? PortFixedOwnerShape(value->getType()) : std::nullopt;
+  const int64_t width = shape ? shape->total_width : type ? PortPackedWidth(*type) : 0;
   if (width > 0) p.pieces.push_back({integral_owner ? PortMapPiece::Exact : PortMapPiece::Unsupported,
                                    symbol, nullptr, 0, 0, width, {}});
   return p;
+}
+PortProjection PortInitialDownProjection(const slang::ast::Symbol *symbol,
+                                        const std::vector<PortMapPiece> &connection,
+                                        const CanonFrame *frame = nullptr) {
+  auto initial = PortIdentityProjection(symbol, frame);
+  const auto *value = symbol->as_if<slang::ast::ValueSymbol>();
+  if (!value || value->getType().isIntegral()) return initial;
+  const auto shape = PortFixedOwnerShape(value->getType());
+  if (!shape || shape->unpacked.empty()) return initial;
+  PortProjection exact; exact.owner = symbol; exact.owner_frame = frame;
+  for (const auto &piece : connection) {
+    if ((piece.kind != PortMapPiece::Exact && piece.kind != PortMapPiece::Dependency) ||
+        piece.source != symbol || piece.logical_axes.size() != shape->unpacked.size() ||
+        piece.source_low < 0 || piece.width <= 0 || piece.source_low + piece.width > shape->packed_width) continue;
+    int64_t prefix = 0;
+    bool valid = true;
+    for (size_t axis = 0; axis < shape->unpacked.size(); ++axis) {
+      const auto [left, right] = shape->unpacked[axis];
+      const auto selected = piece.logical_axes[axis];
+      const int64_t count = std::abs(int64_t(left) - right) + 1;
+      const int64_t offset = PortAxisOffset(left, right, selected.first);
+      if (selected.first != selected.second || offset < 0 || offset >= count) { valid = false; break; }
+      prefix = prefix * count + offset; // checked total shape bounds imply checked prefix
+    }
+    if (!valid) continue;
+    exact.pieces.push_back({PortMapPiece::Exact, symbol, piece.expr,
+                           prefix * shape->packed_width + piece.source_low,
+                           piece.source_low, piece.width, piece.logical_axes});
+    if (exact.pieces.size() > kPortMapMaxPieces) return initial;
+  }
+  return exact.pieces.empty() ? initial : exact;
 }
 // Compose a root->current projection with a formal-current->source connection.
 std::vector<PortProjection> PortComposeUp(const PortProjection &current,
@@ -182,7 +305,8 @@ PortProjection PortComposeDown(const PortProjection &current,
                                const slang::ast::Symbol *child) {
   PortProjection out; out.owner = current.owner; out.owner_frame = current.owner_frame;
   for (const auto &a : current.pieces) for (const auto &b : connection) {
-    if (a.kind != PortMapPiece::Exact || b.kind != PortMapPiece::Exact ||
+    if (a.kind != PortMapPiece::Exact ||
+        (b.kind != PortMapPiece::Exact && b.kind != PortMapPiece::Dependency) ||
         b.source != a.source || b.logical_axes != a.logical_axes) continue;
     const int64_t low = std::max(a.source_low, b.source_low);
     const int64_t high = std::min(a.source_low + a.width, b.source_low + b.width);

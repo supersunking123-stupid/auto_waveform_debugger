@@ -57,6 +57,16 @@ bool ParseSignalQuery(const std::string &input, std::string &base_signal,
                       std::vector<std::pair<int32_t, int32_t>> &bit_select_axes);
 std::optional<std::vector<std::optional<std::pair<int32_t, int32_t>>>> ParseEndpointAxes(
     std::string_view bit_map);
+// All domains below are flattened ordinals in the specified owning signal.
+std::optional<std::vector<std::pair<int32_t, int32_t>>> SessionPortOwnerSelection(
+    const TraceSession &session, uint32_t id,
+    const std::vector<std::pair<int32_t, int32_t>> &axes);
+std::optional<std::vector<std::pair<int32_t, int32_t>>> SessionPortBridgeDomain(
+    TraceSession &session, bool drivers, uint32_t source_id, uint32_t target_id,
+    const std::optional<std::vector<std::pair<int32_t, int32_t>>> &source_domain);
+std::optional<std::vector<EndpointRecord>> SessionConstrainPortEndpoint(
+    const TraceSession &session, const EndpointRecord &endpoint, uint32_t owner_id,
+    const std::vector<std::pair<int32_t, int32_t>> &domain);
 bool EndpointMatchesPortOwner(const TraceSession &session, const EndpointRecord &e,
                               uint32_t queried_id,
                               const std::vector<std::pair<int32_t, int32_t>> &axes);

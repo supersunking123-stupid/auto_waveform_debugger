@@ -27,9 +27,9 @@ def main():
     with tempfile.TemporaryDirectory(prefix='rtl_port_mapping_') as directory:
         root = Path(directory)
         count = 0
-        for name in (*queries, 'mapping_cases'):
+        for name in (*queries, 'mapping_cases', 'fixed_owner_cases'):
             source = fixtures/(name+'.sv')
-            top = 'mapping_cases' if name == 'mapping_cases' else 'top'
+            top = name if name in ('mapping_cases','fixed_owner_cases') else 'top'
             labels = {line.split('// CHECK ',1)[1]: i for i,line in
                       enumerate(source.read_text().splitlines(),1) if '// CHECK ' in line}
             checks = queries.get(name, [])
@@ -58,6 +58,15 @@ def main():
                           ('loads','nested_u.u.q[0]',['nested_high']),
                           ('loads','nested_u.u.q[7]',['nested_low'])]
                 checks = [(mode,'mapping_cases.'+target,want) for mode,target,want in checks]
+            if name == 'fixed_owner_cases':
+                checks = [('loads','a[1][1]',['leaf2']), ('loads','a[1][0]',[]),
+                          ('loads','a[0]',['leaf0','leaf3']),
+                          ('drivers','z[2][2]',['leaf1']), ('drivers','z[2][0]',[]),
+                          ('drivers','reverse_u.d[2]',['r1']),
+                          ('loads','reverse_u.q[2]',['w1']),
+                          ('loads','en',['boolean_use']), ('loads','sel',['boolean_use']),
+                          ('drivers','boolean_u.en',[])]
+                checks = [(mode,'fixed_owner_cases.'+target,want) for mode,target,want in checks]
             dbs=[]
             for canonical in ('0','1'):
                 db = root/(name+canonical+'.db'); dbs.append(db)
@@ -65,7 +74,7 @@ def main():
                              {'RTL_TRACE_CANONICAL_BODIES':canonical,'RTL_TRACE_CANONICAL_VERIFY':'1'})
                 if canonical == '1':
                     assert 'mismatched_lists=0' in compiled.stdout
-                assert 'SEMANTICS_EPOCH:13\n' in Path(str(db)+'.meta').read_text()
+                assert 'SEMANTICS_EPOCH:14\n' in Path(str(db)+'.meta').read_text()
                 for mode,target,want in checks:
                     body=json.loads(run(binary,['trace','--db',db,'--signal',target,
                                                 '--mode',mode,'--format','json']).stdout)
@@ -77,7 +86,7 @@ def main():
                     assert all(not e['bit_map'].startswith('Q1;') for e in endpoints), body
                     if 'constant_u.d[7]' in target:
                         assert any(s['reason']=='constant_connection' for s in body['stops']), body
-                    if 'mixed_u.d' in target or 'signed_u.d[7]' in target:
+                    if 'mixed_u.d' in target or 'signed_u.d[7]' in target or 'boolean_u.en' in target:
                         assert any(s['reason']=='unresolved_connection_mapping' for s in body['stops']), body
                     count += 1
             assert dbs[0].read_bytes()==dbs[1].read_bytes(), name
@@ -85,8 +94,7 @@ def main():
                 malformed_envelopes(binary,dbs[0],root)
             if name=='mapping_cases':
                 assert_marker_refs(dbs[0])
-        # Unpacked parent coordinates are deliberately unsupported owner
-        # mappings. They must stop visibly rather than invent an unconnected use.
+        # Fixed unpacked parent mappings must preserve exact connected rows and bits.
         array_source=root/'array_parent.sv'
         array_source.write_text('''module leaf(input logic [3:0] d, output logic q);
 assign q=^d;
@@ -102,10 +110,23 @@ endmodule
             for target in ('arr[1][0]','arr[2][0]'):
                 body=json.loads(run(binary,['trace','--db',db,'--signal','array_parent.'+target,
                                             '--mode','loads','--format','json']).stdout)
-                assert not body['endpoints'] and any(s['reason']=='unresolved_connection_mapping'
-                                                    for s in body['stops']),body
+                assert not body['endpoints'],body
                 count+=1
-        print(f'PASS: {count} exact/constant/unsupported/array queries; canonical bytes, VERIFY, epoch13 and strict envelopes')
+        # A whole unpacked formal argument has no supported affine expression
+        # map. An empty map must not pass an exact-only active bridge test.
+        formal_source=root/'unpacked_formal.sv'
+        formal_source.write_text('module leaf(input logic d[0:1],output logic q); assign q=d[0]; endmodule\n'
+                                 'module formal_top(input logic a[0:1],output logic y); leaf u(.d(a),.q(y)); endmodule\n')
+        for canonical in ('0','1'):
+            db=root/('formal'+canonical+'.db')
+            run(binary,['compile','--db',db,'--single-unit',formal_source,'--top','formal_top'],
+                {'RTL_TRACE_CANONICAL_BODIES':canonical,'RTL_TRACE_CANONICAL_VERIFY':'1'})
+            body=json.loads(run(binary,['trace','--db',db,'--signal','formal_top.u.d[0]',
+                                        '--mode','drivers','--format','json']).stdout)
+            assert not body['endpoints'] and any(s['reason']=='unresolved_connection_mapping'
+                                                for s in body['stops']),body
+            count+=1
+        print(f'PASS: {count} exact/constant/unsupported/array queries; canonical bytes, VERIFY, epoch14 and strict envelopes')
 
 
 def malformed_envelopes(binary,db,root):

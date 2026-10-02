@@ -15,10 +15,16 @@ module mapped_leaf #(parameter W = 8)(input logic clk, input logic [W-1:0] i,
                                       output logic [W-1:0] o);
   always_ff @(posedge clk) o <= i;
 endmodule
+module mapped_axes(input logic [1:0][1:0] d, output logic y);
+  assign y = d[0][1];
+endmodule
 module mapped_top(input logic clk, input logic [7:0] a, output logic [7:0] y);
   logic [7:0] mid;
   assign mid = a;
   mapped_leaf u_leaf(.clk(clk), .i(mid), .o(y));
+  wire [1:0][1:0] x;
+  assign x = a[3:0];
+  mapped_axes u_axes(.d(x), .y());
 endmodule
 '''
 QUERIES = [
@@ -156,18 +162,25 @@ def main():
         original = db.read_bytes()
         sections = layout(original)
         reference_db = root / 'feature3.db'
-        feature3 = bytearray(original); struct.pack_into('<I', feature3, 20, 3)
-        reference_db.write_bytes(feature3)
+        if reference:
+            # New mapped endpoints cannot be downcast by clearing feature4.
+            # Obtain real historical bytes from the frozen writer instead.
+            compile_db(reference, reference_db, source)
+        else:
+            reference_db.write_bytes(original)
+        compatibility = reference_db.read_bytes()
+        compatibility_sections = layout(compatibility)
         if reference:
             run(reference, ['find', '--db', db, '--query', 'mapped_top'], expected=1)
-        for command in QUERIES:
-            got = query(binary, db, command)
+        axes_query = ['trace', '--mode', 'drivers', '--signal', 'mapped_top.u_axes.d[0][1]', '--format', 'json']
+        for command in [*QUERIES, axes_query]:
+            got = query(binary, reference_db, command)
             if reference:
                 want = query(reference, reference_db, command)
                 assert (got.returncode, got.stdout, got.stderr) == (want.returncode, want.stdout, want.stderr)
         for version in (1, 2, 3, 4, 5):
             compat = root / f'compat_v{version}.db'
-            compat.write_bytes(legacy_bytes(original, sections, version))
+            compat.write_bytes(legacy_bytes(compatibility, compatibility_sections, version))
             for command in QUERIES:
                 got = query(binary, compat, command)
                 if reference:

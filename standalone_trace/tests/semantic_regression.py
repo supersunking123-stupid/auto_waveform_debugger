@@ -525,7 +525,16 @@ def main():
         # per record so the v4 loader (20-byte records) can read it.
         # We also need to truncate the v4-only sections (hierarchy params) at the end.
         import struct as _struct
-        _orig = open(db, "rb").read()
+        # Feature4 Q1 endpoints cannot be downcast to pre-mapping readers.
+        # This check concerns absent parameter metadata only. Use an actual
+        # mapping-free instance rather than clearing flags on mapped records.
+        compat_source = tmpdir / "parameter_compat.sv"
+        compat_source.write_text("module compat_leaf #(parameter W=4)(); wire [W-1:0] x; endmodule\n"
+                                 "module semantic_top(); compat_leaf u_param(); endmodule\n")
+        compat_db = tmpdir / "parameter_compat.db"
+        run_cmd([str(rtl_trace), "compile", "--db", str(compat_db), "--single-unit",
+                 str(compat_source), "--top", "semantic_top"])
+        _orig = compat_db.read_bytes()
         _hdr_size = _struct.calcsize("16sII15Q")  # 16+4+4+120 = 144
         _hdr = _struct.unpack_from("16sII15Q", _orig, 0)
         _fields = _hdr[3:]

@@ -388,7 +388,7 @@ constexpr size_t kPortMapMaxPieces = 256;
 constexpr size_t kPortMapMaxDepth = 64;
 using PortCoverage = std::vector<std::pair<int32_t, int32_t>>;
 struct PortMapPiece {
-  enum Kind { Exact, Constant, Unsupported } kind = Unsupported;
+  enum Kind { Exact, Constant, Unsupported, Dependency } kind = Unsupported;
   const slang::ast::Symbol *source = nullptr;
   const slang::ast::Expression *expr = nullptr;
   int64_t owner_low = 0;
@@ -1066,13 +1066,18 @@ std::vector<TraceResult> ComputeIndexedTraceResults(
   const bool has_bridge = HasLocalPortBridge<DRIVERS>(index, sym);
   for (const TraceResult &entry : current_entries) {
     if (const auto *port = std::get_if<const slang::ast::PortSymbol *>(&entry)) {
-      if ((*port)->direction == (DRIVERS ? slang::ast::ArgumentDirection::In : slang::ast::ArgumentDirection::Out) &&
-          (following_parent || !has_bridge)) {
+      if ((*port)->direction == (DRIVERS ? slang::ast::ArgumentDirection::In : slang::ast::ArgumentDirection::Out)) {
         const auto *instance = GetContainingInstanceSymbol(sym);
         const auto *connection = instance ? PortActualConnection(*instance, **port) : nullptr;
         if (connection) {
           const auto initial = projection ? *projection : PortIdentityProjection(sym);
           const auto map = GetCachedPortConnectionMap(*connection, *instance, cache);
+          if (!following_parent && has_bridge && !map.empty() && std::all_of(map.begin(), map.end(),
+              [](const auto &p) { return p.kind == PortMapPiece::Exact; })) {
+            if (projection) out.push_back(PortMappingMarker(*projection, *port, false, false));
+            else out.push_back(*port);
+            continue;
+          }
           if (initial.pieces.empty() || map.empty()) {
             if (initial.pieces.empty()) out.push_back(*port);
             else out.push_back(PortMappingMarker(initial, *port, false, true));
@@ -1086,7 +1091,7 @@ std::vector<TraceResult> ComputeIndexedTraceResults(
             const auto &piece = route.pieces.front();
             if (piece.kind != PortMapPiece::Exact) {
               out.push_back(PortMappingMarker(route, *port, piece.kind == PortMapPiece::Constant,
-                                             piece.kind == PortMapPiece::Unsupported)); continue;
+                                             piece.kind != PortMapPiece::Constant)); continue;
             }
             auto branch_visited = visited;
             if (!branch_visited.insert(piece.source).second) {
@@ -1118,12 +1123,12 @@ std::vector<TraceResult> ComputeIndexedTraceResults(
       const auto *internal = expr->context_port->internalSymbol;
       const auto *connection = PortActualConnection(*expr->context_instance, *expr->context_port);
       const auto map = connection ? GetCachedPortConnectionMap(*connection, *expr->context_instance, cache) : std::vector<PortMapPiece>{};
-      const auto initial = projection ? *projection : PortIdentityProjection(sym);
-      const bool identity = map.size() == 1 && map[0].kind == PortMapPiece::Exact &&
-          map[0].source == sym && map[0].owner_low == 0 && map[0].source_low == 0 &&
-          map[0].logical_axes.empty() && initial.pieces.size() == 1 &&
-          map[0].width == initial.pieces[0].width;
-      if ((projection || !identity) && !initial.pieces.empty()) {
+      // The raw AST collector can retain refs in a folded connection expression.
+      // A proved constant has no downward signal dependency.
+      if (!map.empty() && std::all_of(map.begin(), map.end(),
+          [](const auto &p) { return p.kind == PortMapPiece::Constant; })) continue;
+      const auto initial = projection ? *projection : PortInitialDownProjection(sym, map);
+      if (!initial.pieces.empty()) {
         auto downward = PortComposeDown(initial, map, internal);
         auto branch_visited = visited;
         if (!downward.pieces.empty() && downward.pieces.size() <= kPortMapMaxPieces &&
@@ -2992,9 +2997,26 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
       const auto t_signal_record_start = profile_save_graph ? Clock::now() : Clock::time_point{};
       const long mem_rss_before_kb = mem_progress ? GetCurrentRSSKB() : 0;
       SignalRecord rec = build_signal_record(item.sym);
-      if (std::any_of(rec.drivers.begin(), rec.drivers.end(), [](const auto &e) { return !e.port_query_coverage.empty(); }) ||
-          std::any_of(rec.loads.begin(), rec.loads.end(), [](const auto &e) { return !e.port_query_coverage.empty(); }))
-        port_mapped_owners.insert(static_cast<uint32_t>(sig_id));
+      auto retain_mapping_axes = [&](const std::vector<EndpointRecord> &entries) {
+        for (const auto &e : entries) {
+          if (e.port_query_coverage.empty()) continue;
+          port_mapped_owners.insert(static_cast<uint32_t>(sig_id));
+          // Names are preinterned in signal order. Validate that contract before
+          // retaining a crossed source declaration; other interned strings are not IDs.
+          uint32_t source = e.path_id;
+          if (source == std::numeric_limits<uint32_t>::max()) {
+            const auto named = string_index.find(e.path);
+            if (named == string_index.end()) continue;
+            source = named->second;
+          }
+          if (source >= graph.signals.size() || graph.signals[source].name_str_id != source) continue;
+          uint32_t root = source;
+          while (graph.signals[root].parent_signal_id != std::numeric_limits<uint32_t>::max())
+            root = graph.signals[root].parent_signal_id;
+          port_mapped_owners.insert(root);
+        }
+      };
+      retain_mapping_axes(rec.drivers); retain_mapping_axes(rec.loads);
       if (profile_save_graph) t_build_signal_record_s += elapsed_seconds(t_signal_record_start, Clock::now());
       bool mem_new_peak = false;
       if (mem_progress) {
@@ -3904,7 +3926,8 @@ std::optional<PortCoverage> PortOwnerSelection(const TraceSession &session, uint
   int64_t total = 1;
   for (size_t axis = row->axis_count; axis-- > 0;) {
     const auto declared = dimensions[row->axis_begin + axis];
-    if (!(declared.flags & kAxisFixed) || !(declared.flags & kAxisPacked)) return std::nullopt;
+    if (!(declared.flags & kAxisFixed) ||
+        (!(declared.flags & kAxisPacked) && !(row->flags & kCoordinatePortMappedOwner))) return std::nullopt;
     strides[axis] = total;
     const int64_t width = std::abs(int64_t(declared.left) - declared.right) + 1;
     if (width > std::numeric_limits<int32_t>::max() / total) return std::nullopt;
@@ -3914,8 +3937,7 @@ std::optional<PortCoverage> PortOwnerSelection(const TraceSession &session, uint
   for (size_t axis = 0; axis < row->axis_count; ++axis) {
     const auto declared = dimensions[row->axis_begin + axis];
     const auto selection = axis < selected.size() ? selected[axis] : std::make_pair(declared.left, declared.right);
-    const auto offset = [&](int32_t i) { return declared.left >= declared.right ?
-        int64_t(i) - declared.right : int64_t(declared.right) - i; };
+    const auto offset = [&](int32_t i) { return PortAxisOffset(declared.left, declared.right, i); };
     const int64_t low = std::min(offset(selection.first), offset(selection.second));
     const int64_t high = std::max(offset(selection.first), offset(selection.second));
     if (low < 0 || high >= std::abs(int64_t(declared.left) - declared.right) + 1) return std::nullopt;
@@ -3961,6 +3983,134 @@ bool EndpointMatchesPortOwner(const TraceSession &session, const EndpointRecord 
   // Unknown owner layout only has explicit unresolved markers, never guessed logic.
   if (!selected) return e.port_mapping_unresolved;
   return PortCoverageOverlaps(e.port_query_coverage, *selected);
+}
+
+std::optional<PortCoverage> SessionPortOwnerSelection(const TraceSession &session, uint32_t id,
+    const std::vector<std::pair<int32_t, int32_t>> &axes) {
+  return PortOwnerSelection(session, id, axes);
+}
+PortCoverage PortIntersectCoverage(const PortCoverage &a, const PortCoverage &b) {
+  PortCoverage out;
+  for (const auto &x : a) for (const auto &y : b) {
+    const int32_t lo = std::max(x.first, y.first), hi = std::min(x.second, y.second);
+    if (lo <= hi) out.emplace_back(lo, hi);
+  }
+  PortNormalizeCoverage(out); return out;
+}
+// A native bitmap belongs to its path's declaration, never to its list owner.
+std::optional<PortCoverage> PortNativeDomain(const TraceSession &session,
+    const EndpointRecord &e, uint32_t source_id) {
+  const auto path_id = LookupSignalId(session, EndpointPath(session.db, e));
+  if (!path_id || *path_id != source_id || e.bit_map_approximate) return std::nullopt;
+  const auto row = PortOwnerCoordinates(session, source_id);
+  if (!row || (row->flags & kCoordinateUnverifiedOwnerMember)) return std::nullopt;
+  if (e.bit_map.empty()) return PortOwnerSelection(session, source_id, {});
+  const auto parsed = ParseEndpointAxes(e.bit_map);
+  if (!parsed || parsed->empty()) return std::nullopt;
+  std::vector<std::pair<int32_t, int32_t>> axes;
+  for (const auto &axis : *parsed) {
+    if (!axis) return std::nullopt;
+    axes.push_back(*axis);
+  }
+  if (e.bit_map_logical_axes) return PortOwnerSelection(session, source_id, axes);
+  // Flat bitmaps are physical packed offsets. A single packed declaration
+  // may be ascending or based away from zero; do not interpret them as indices.
+  const auto dims = session.graph->ReadDeclaredAxes();
+  if (row->axis_count != 1 || !(dims[row->axis_begin].flags & kAxisPacked) || axes.size() != 1)
+    return std::nullopt;
+  const auto whole = PortOwnerSelection(session, source_id, {});
+  if (!whole || whole->size() != 1) return std::nullopt;
+  const auto r = std::minmax(axes[0].first, axes[0].second);
+  PortCoverage native{{r.first, r.second}};
+  if (r.first < whole->front().first || r.second > whole->front().second) return std::nullopt;
+  return native;
+}
+std::optional<PortCoverage> SessionPortBridgeDomain(TraceSession &session, bool drivers,
+    uint32_t source_id, uint32_t target_id, const std::optional<PortCoverage> &source_domain) {
+  const auto &record = SessionSignalRecord(session, target_id);
+  const auto &opposite = drivers ? record.loads : record.drivers;
+  PortCoverage target;
+  bool saw_relation = false;
+  for (const auto &e : opposite) {
+    if (e.port_query_coverage.empty() || e.port_mapping_constant || e.port_mapping_unresolved ||
+        EndpointPath(session.db, e) != SessionSignalName(session, source_id)) continue;
+    saw_relation = true;
+    const auto native = PortNativeDomain(session, e, source_id);
+    if (!native) return std::nullopt;
+    if (!source_domain || PortCoverageOverlaps(*native, *source_domain))
+      target.insert(target.end(), e.port_query_coverage.begin(), e.port_query_coverage.end());
+    if (target.size() > kPortMapMaxPieces) return std::nullopt;
+  }
+  if (!saw_relation) return std::nullopt;
+  // Q1 is an owner-domain union, not a persisted source-to-owner bit pair.
+  // Keep that connected union when the native access spans several pieces.
+  PortNormalizeCoverage(target); return target;
+}
+std::optional<std::vector<EndpointRecord>> SessionConstrainPortEndpoint(
+    const TraceSession &session, const EndpointRecord &e, uint32_t owner_id,
+    const PortCoverage &domain) {
+  if (!e.port_query_coverage.empty()) {
+    if (!PortCoverageOverlaps(e.port_query_coverage, domain)) return std::vector<EndpointRecord>{};
+    return std::vector<EndpointRecord>{e};
+  }
+  const auto native = PortNativeDomain(session, e, owner_id);
+  if (!native) return std::nullopt;
+  const auto intersection = PortIntersectCoverage(*native, domain);
+  if (intersection.empty()) return std::vector<EndpointRecord>{};
+  if (intersection == *native) return std::vector<EndpointRecord>{e};
+  std::vector<EndpointRecord> output;
+  const auto row = PortOwnerCoordinates(session, owner_id);
+  if (!row) return std::nullopt;
+  if (!e.bit_map_logical_axes && row->axis_count == 1) {
+    for (const auto [low, high] : intersection) {
+      auto copy = e; copy.bit_map = FormatBitRange(high, low); copy.bit_map_merged = false;
+      output.push_back(std::move(copy));
+    }
+    return output;
+  }
+  const auto dims = session.graph->ReadDeclaredAxes();
+  std::vector<int64_t> strides(row->axis_count, 1);
+  int64_t total = 1;
+  for (size_t axis = row->axis_count; axis-- > 0;) {
+    const auto d = dims[row->axis_begin + axis];
+    if (!(d.flags & kAxisFixed)) return std::nullopt;
+    strides[axis] = total;
+    const int64_t count = std::abs(int64_t(d.left) - d.right) + 1;
+    if (count > std::numeric_limits<int32_t>::max() / total) return std::nullopt;
+    total *= count;
+  }
+  // Decompose each contiguous flattened interval into rectangular native
+  // selections. Middle rows remain ranges; never enumerate array elements.
+  std::vector<std::pair<int32_t, int32_t>> prefix;
+  bool failed = false;
+  std::function<void(size_t,int64_t,int64_t)> emit = [&](size_t axis, int64_t low, int64_t high) {
+    if (failed) return;
+    if (axis == row->axis_count) {
+      if (output.size() >= kPortMapMaxPieces) { failed = true; return; }
+      auto copy = e; copy.bit_map.clear(); copy.bit_map_logical_axes = row->axis_count > 1;
+      copy.bit_map_merged = false;
+      for (auto [left,right] : prefix) copy.bit_map += FormatBitRange(left,right);
+      output.push_back(std::move(copy)); return;
+    }
+    const auto d = dims[row->axis_begin + axis];
+    const int64_t stride = strides[axis], first = low / stride, last = high / stride;
+    auto index = [&](int64_t offset) { return int32_t(d.left >= d.right ? int64_t(d.right)+offset : int64_t(d.right)-offset); };
+    auto piece = [&](int64_t a,int64_t b,int64_t tail_low,int64_t tail_high) {
+      prefix.emplace_back(index(b),index(a)); emit(axis+1,tail_low,tail_high); prefix.pop_back();
+    };
+    if (first == last) piece(first,last,low%stride,high%stride);
+    else {
+      piece(first,first,low%stride,stride-1);
+      if (last > first+1) piece(first+1,last-1,0,stride-1);
+      piece(last,last,0,high%stride);
+    }
+  };
+  for (const auto [low,high] : intersection) {
+    if (low < 0 || high >= total) return std::nullopt;
+    emit(0,low,high);
+  }
+  if (failed) return std::nullopt;
+  return output;
 }
 
 const SignalRecord &SessionSignalRecord(TraceSession &session, uint32_t id) {
@@ -4473,7 +4623,7 @@ bool ParseDefinesPlus(std::string_view tok, std::vector<std::string> &out) {
 // Epoch10: follow child input/output ports through actual parent connections.
 // Epoch11: restrict new upward routes to ports without local opposite traces.
 // Epoch12: require a local expression on the exact port to certify its bridge.
-constexpr int kCompileSemanticsEpoch = 13;
+constexpr int kCompileSemanticsEpoch = 14;
 
 std::string ComputeCompileFingerprint(const std::vector<std::string> &passthrough_args) {
   std::vector<std::string> parts;

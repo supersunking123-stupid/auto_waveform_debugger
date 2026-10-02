@@ -224,7 +224,9 @@ def main():
         assert {e['bit_map'] for e in selected(cone, lines['root_merged'])} == {'[2]'}
         assert {e['bit_map'] for e in selected(cone, lines['deeper_merged'])} == {'[15:8]'}, cone
         port = trace(binary, db, 'merged_range_clip.port_output[2]', ('--cone-level', '3'))
-        assert {e['bit_map'] for e in selected(port, lines['leaf_merged'])} == {'[7:0]'}, port
+        # Crossing a mapped identity connection retains per-source native
+        # bit accesses and owning coverage; mapped entries are not range-merged.
+        assert {e['bit_map'] for e in selected(port, lines['leaf_merged'])} == {'[2]'}, port
         member = trace(binary, db, 'merged_range_clip.packet.hi[2]')
         assert {e['bit_map'] for e in selected(member, lines['member_merged'])} == {'[7:0]'}, member
         logical = trace(binary, db, 'merged_range_clip.m[1][0]', mode='loads')

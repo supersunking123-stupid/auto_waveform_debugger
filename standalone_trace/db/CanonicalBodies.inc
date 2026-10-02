@@ -612,12 +612,17 @@ class CanonicalTracer {
     const bool has_bridge = HasLocalPortBridge<DRIVERS>(index, sym);
     for (const TraceResult &entry : current_entries) {
       if (const auto *port = std::get_if<const slang::ast::PortSymbol *>(&entry)) {
-        if ((*port)->direction == (DRIVERS ? slang::ast::ArgumentDirection::In : slang::ast::ArgumentDirection::Out) &&
-            (following_parent || !has_bridge)) {
+        if ((*port)->direction == (DRIVERS ? slang::ast::ArgumentDirection::In : slang::ast::ArgumentDirection::Out)) {
           const auto escape = EscapeMapping(**port, *body, f);
           if (escape.expr) {
             const auto initial = projection ? *projection : PortIdentityProjection(sym, f);
             const auto map = GetCachedPortConnectionMap(*escape.expr, *escape.instance, cache_);
+            if (!following_parent && has_bridge && !map.empty() && std::all_of(map.begin(), map.end(),
+                [](const auto &p) { return p.kind == PortMapPiece::Exact; })) {
+              if (projection) marker(*projection, *port, false, false);
+              else out.push_back(Res{*port, f});
+              continue;
+            }
             if (initial.pieces.empty() || map.empty()) {
               if (initial.pieces.empty()) out.push_back(Res{*port, f});
               else marker(initial, *port, false, true);
@@ -628,7 +633,7 @@ class CanonicalTracer {
             for (auto &route : routes) {
               const auto &piece = route.pieces.front();
               if (piece.kind != PortMapPiece::Exact) {
-                marker(route, *port, piece.kind == PortMapPiece::Constant, piece.kind == PortMapPiece::Unsupported); continue;
+                marker(route, *port, piece.kind == PortMapPiece::Constant, piece.kind != PortMapPiece::Constant); continue;
               }
               auto branch_visited = visited;
               if (!branch_visited.insert({piece.source, escape.frame}).second) { marker(route, *port, false, true); continue; }
@@ -664,11 +669,10 @@ class CanonicalTracer {
         }
         const auto *connection = PortActualConnection(*child, *expr->context_port);
         const auto map = connection ? GetCachedPortConnectionMap(*connection, *child, cache_) : std::vector<PortMapPiece>{};
-        const auto initial = projection ? *projection : PortIdentityProjection(sym, f);
-        const bool identity = map.size() == 1 && map[0].kind == PortMapPiece::Exact && map[0].source == sym &&
-            map[0].owner_low == 0 && map[0].source_low == 0 && map[0].logical_axes.empty() &&
-            initial.pieces.size() == 1 && map[0].width == initial.pieces[0].width;
-        if ((projection || !identity) && !initial.pieces.empty()) {
+        if (!map.empty() && std::all_of(map.begin(), map.end(),
+            [](const auto &p) { return p.kind == PortMapPiece::Constant; })) continue;
+        const auto initial = projection ? *projection : PortInitialDownProjection(sym, map, f);
+        if (!initial.pieces.empty()) {
           auto downward = PortComposeDown(initial, map, csym);
           auto branch_visited = visited;
           const size_t before = out.size();
