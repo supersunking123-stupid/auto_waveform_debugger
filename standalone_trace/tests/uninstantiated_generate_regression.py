@@ -77,7 +77,7 @@ def main():
         assert Path(str(off)+'.meta').read_bytes() == Path(str(db)+'.meta').read_bytes()
         verified = compile_db(binary, source, root/'verify.db', {'RTL_TRACE_CANONICAL_VERIFY':'1'})
         assert 'mismatched_lists=0' in verified.stdout
-        assert 'SEMANTICS_EPOCH:15\n' in Path(str(db)+'.meta').read_text()
+        assert 'SEMANTICS_EPOCH:16\n' in Path(str(db)+'.meta').read_text()
         print('PASS: two copies of each parameter class redirect canonically; canonical on/off bytes and VERIFY lists match')
 
         if args.parent_bin:

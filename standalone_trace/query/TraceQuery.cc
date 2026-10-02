@@ -177,6 +177,17 @@ TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
           record_stop(sig, "stop_at", "matched-stop-at-regex", depth);
           return;
         }
+        if (domain) {
+          const auto whole=SessionPortOwnerSelection(session,sig_id,{});
+          if (whole && *whole==*domain) {
+            auto global_opts=opts;global_opts.root_signal=std::string(sig);global_opts.signal_select_axes.clear();
+            if (auto fast=TryRunGlobalNetFastPath(db,global_opts)) {
+              for (const auto &e : fast->endpoints)
+                if (endpoint_allowed(e) && seen_logic.insert(EndpointKey(db,e)).second) logic_endpoints.push_back(e);
+              return;
+            }
+          }
+        }
         const SignalRecord &record = SessionSignalRecord(session, sig_id);
         const std::vector<EndpointRecord> &edges =
             is_drivers_mode ? record.drivers : record.loads;
@@ -232,6 +243,37 @@ TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
           if (e.port_mapping_constant || e.port_mapping_unresolved) {
             record_stop(e_path, e.port_mapping_constant ? "constant_connection" : "unresolved_connection_mapping",
                         e.port_mapping_constant ? "selected-domain-has-no-signal-driver" : "selected-domain-mapping-is-unproven", depth);
+            continue;
+          }
+          if (!e.compact_port_routes.empty()) {
+            RouteDomain selected=domain;
+            if (!selected && root_id && sig_id==*root_id) selected=root_domain;
+            if (!selected) selected=SessionPortOwnerSelection(session,sig_id,{});
+            if (!selected) {
+              record_stop(e_path,"unresolved_connection_mapping","compact-port-owner-layout-is-unproven",depth);
+              continue;
+            }
+            std::vector<std::pair<uint32_t,OwnerDomain>> targets;
+            size_t pieces=0;bool capped=false;
+            for (const auto &r : e.compact_port_routes) for (const auto &[low,high] : *selected) {
+              const int32_t a=std::max(low,r.owner_low),b=std::min(high,r.owner_high);
+              if (a>b) continue;
+              if (++pieces>256) {capped=true;break;}
+              auto it=std::find_if(targets.begin(),targets.end(),[&](const auto &t){return t.first==r.target_signal_id;});
+              if(it==targets.end()){targets.emplace_back(r.target_signal_id,OwnerDomain{});it=std::prev(targets.end());}
+              it->second.emplace_back(int32_t(int64_t(r.target_low)+a-r.owner_low),
+                                      int32_t(int64_t(r.target_low)+b-r.owner_low));
+            }
+            if(capped){record_stop(e_path,"unresolved_connection_mapping","compact-port-route-cap",depth);continue;}
+            for (auto &[target,ranges] : targets) {
+              std::sort(ranges.begin(),ranges.end());size_t n=0;
+              for(const auto range:ranges){
+                if(n && int64_t(range.first)<=int64_t(ranges[n-1].second)+1)
+                  ranges[n-1].second=std::max(ranges[n-1].second,range.second);
+                else ranges[n++]=range;
+              }
+              ranges.resize(n);walk_signal(target,depth+1,cone_depth,ranges);
+            }
             continue;
           }
           if (e.kind == EndpointKind::kPort && !e.port_query_coverage.empty()) {

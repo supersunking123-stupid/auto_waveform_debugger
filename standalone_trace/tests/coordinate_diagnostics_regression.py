@@ -29,7 +29,7 @@ def trace(binary, db, signal, mode='loads', expected=0, text=False):
 
 def footer(data):
     h = struct.unpack_from('<16sII15Q', data)
-    assert h[1] == 6 and h[2] in (1, 3, 7), h[:3]
+    assert h[1] == 6 and h[2] in (1, 3, 7, 15), h[:3]
     pos = 144 + 4 * (h[3] + 1) + h[4]
     pos += sum(n * size for n, size in zip(h[5:], (32, 48, 4, 12, 4, 12, 4, 12, 4, 24, 4, 16, 4)))
     count = struct.unpack_from('<Q', data, pos)[0]
@@ -116,7 +116,7 @@ def main():
             assert multi['diagnostics'][-1]['code'] == 'unsupported_struct_member_axes'
             trace(binary, db, 'coordinate_diagnostics.member_packet.matrix', mode)
             trace(binary, db, 'coordinate_diagnostics.member_packet.vector[2]', mode)
-        assert struct.unpack_from('<I', data, 20)[0] == 7
+        assert struct.unpack_from('<I', data, 20)[0] == 15
         round2 = root / 'round2_features.db'
         round2_data = bytearray(data); struct.pack_into('<I', round2_data, 20, 1)
         round2.write_bytes(round2_data)

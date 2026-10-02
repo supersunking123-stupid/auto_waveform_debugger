@@ -31,6 +31,53 @@ std::optional<PortOwnerShape> PortFixedOwnerShape(const slang::ast::Type &root) 
   }
   return shape;
 }
+// Save the actual affine connection only on standalone compact Port records.
+// The target frame is separate from the child's public Port identity.
+std::optional<CompactPortTraceResult> PortCompactRoute(
+    const slang::ast::PortSymbol *port, const slang::ast::Symbol *owner,
+    const std::vector<PortMapPiece> &map, const CanonFrame *target_frame = nullptr,
+    const slang::flat_hash_map<const slang::ast::Symbol *,uint32_t> *known = nullptr) {
+  const auto *formal = owner->as_if<slang::ast::ValueSymbol>();
+  const int64_t width = formal ? PortPackedWidth(formal->getType()) : 0;
+  if (!width || map.empty() || map.size() > kPortMapMaxPieces) return std::nullopt;
+  CompactPortTraceResult result{port, {}, target_frame};
+  for (const auto &p : map) {
+    const auto *value = p.source ? p.source->as_if<slang::ast::ValueSymbol>() : nullptr;
+    const auto shape = value ? PortFixedOwnerShape(value->getType()) : std::nullopt;
+    if (p.kind != PortMapPiece::Exact || !shape || !known || !known->contains(p.source) ||
+        p.width <= 0 || p.owner_low < 0 ||
+        p.owner_low + p.width > width || p.source_low < 0 ||
+        p.source_low + p.width > shape->packed_width ||
+        p.logical_axes.size() != shape->unpacked.size()) return std::nullopt;
+    int64_t target = p.source_low, stride = shape->packed_width;
+    for (size_t i = shape->unpacked.size(); i-- > 0;) {
+      const auto [left, right] = shape->unpacked[i];
+      const auto [a,b] = p.logical_axes[i];
+      const int64_t ordinal = PortAxisOffset(left,right,a);
+      const int64_t count = std::abs(int64_t(left)-right)+1;
+      if (a != b || ordinal < 0 || ordinal >= count) return std::nullopt;
+      target += ordinal * stride; stride *= count;
+    }
+    if (target < 0 || target + p.width > shape->total_width) return std::nullopt;
+    result.routes.push_back({int32_t(p.owner_low), int32_t(p.owner_low+p.width-1),
+                             int32_t(target), p.source});
+  }
+  std::sort(result.routes.begin(),result.routes.end(),[](const auto &a,const auto &b) {
+    return a.owner_low < b.owner_low;
+  });
+  int64_t next = 0;
+  std::vector<CompactPortSourceRoute> normalized;
+  for (const auto &p : result.routes) {
+    if (p.owner_low != next) return std::nullopt;
+    next = int64_t(p.owner_high)+1;
+    if (!normalized.empty() && normalized.back().target == p.target &&
+        int64_t(normalized.back().target_low)-normalized.back().owner_low ==
+        int64_t(p.target_low)-p.owner_low) normalized.back().owner_high = p.owner_high;
+    else normalized.push_back(p);
+  }
+  if (next != width) return std::nullopt;
+  result.routes = std::move(normalized); return result;
+}
 std::optional<int32_t> PortEvalIndex(const slang::ast::Expression &expr,
                                      const slang::ast::Symbol &scope) {
   slang::ast::EvalContext context(scope);

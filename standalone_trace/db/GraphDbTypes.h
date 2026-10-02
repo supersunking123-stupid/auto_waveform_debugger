@@ -31,6 +31,14 @@ namespace rtl_trace {
 enum class EndpointKind { kPort, kExpr };
 enum class SourcePathMode : uint8_t { kLogical = 0, kPhysicalAbsolute = 1 };
 
+struct CompactPortRoute {
+  int32_t owner_low = 0, owner_high = 0, target_low = 0;
+  uint32_t target_path_id = std::numeric_limits<uint32_t>::max();
+  std::string target_path;
+  uint32_t target_signal_id = std::numeric_limits<uint32_t>::max(); // runtime validated cache
+  bool operator==(const CompactPortRoute &) const = default;
+};
+
 struct EndpointRecord {
   EndpointKind kind = EndpointKind::kExpr;
   std::string path;
@@ -49,6 +57,7 @@ struct EndpointRecord {
   bool bit_map_merged = false;
   // Coordinates of the owning signal, separate from the native source bitmap.
   std::vector<std::pair<int32_t, int32_t>> port_query_coverage;
+  std::vector<CompactPortRoute> compact_port_routes;
   bool port_mapping_constant = false;
   bool port_mapping_unresolved = false;
   std::vector<uint32_t> lhs_signal_ids;
@@ -115,12 +124,14 @@ struct GraphSignalRecord {
 constexpr uint8_t kEndpointMergedRange = 0x01;
 constexpr uint8_t kEndpointLogicalAxes = 0x02;
 constexpr uint8_t kEndpointPortQueryCoverage = 0x04;
+constexpr uint8_t kEndpointCompactPortRoute = 0x20;
 constexpr uint8_t kEndpointConstantConnection = 0x08;
 constexpr uint8_t kEndpointUnresolvedConnection = 0x10;
 constexpr uint32_t kCoordinatePackedOuter = 0x01;
 constexpr uint32_t kDbDeclaredAxes = 0x01;
 constexpr uint32_t kDbMemberDeclaredAxes = 0x02;
 constexpr uint32_t kDbPortQueryCoverage = 0x04;
+constexpr uint32_t kDbCompactPortRoutes = 0x08;
 constexpr uint32_t kCoordinatePortMappedOwner = 0x10;
 constexpr uint32_t kCoordinateUnverifiedOwnerMember = 0x20;
 constexpr uint32_t kCoordinateUnsupported = 0x02;

@@ -374,6 +374,16 @@ struct ExprTraceResult {
   std::vector<std::pair<int32_t, int32_t>> port_query_coverage;
 };
 
+struct CanonFrame;
+struct CompactPortSourceRoute {
+  int32_t owner_low = 0, owner_high = 0, target_low = 0;
+  const slang::ast::Symbol *target = nullptr;
+};
+struct CompactPortTraceResult {
+  const slang::ast::PortSymbol *port = nullptr;
+  std::vector<CompactPortSourceRoute> routes;
+  const CanonFrame *target_frame = nullptr;
+};
 struct MappedPortTraceResult {
   const slang::ast::PortSymbol *port = nullptr;
   std::vector<std::pair<int32_t, int32_t>> coverage;
@@ -381,7 +391,8 @@ struct MappedPortTraceResult {
   bool unresolved = false;
   const slang::ast::Symbol *owner_symbol = nullptr;
 };
-using TraceResult = std::variant<const slang::ast::PortSymbol *, ExprTraceResult, MappedPortTraceResult>;
+using TraceResult = std::variant<const slang::ast::PortSymbol *, ExprTraceResult, MappedPortTraceResult,
+                                 CompactPortTraceResult>;
 
 struct CanonFrame;
 constexpr size_t kPortMapMaxPieces = 256;
@@ -428,6 +439,7 @@ struct PerBodyTraceCache {
 };
 
 struct TraceCompileCache {
+  const slang::flat_hash_map<const slang::ast::Symbol *, uint32_t> *known_symbol_paths = nullptr;
   slang::flat_hash_map<const slang::ast::InstanceBodySymbol *, std::unique_ptr<PerBodyTraceCache>>
       body_caches;
   // Least recently used at the front; every PerBodyTraceCache remembers its own node so a touch is O(1)
@@ -1086,9 +1098,10 @@ std::vector<TraceResult> ComputeIndexedTraceResults(
           if (!following_parent && !map.empty() && std::all_of(map.begin(), map.end(),
               [](const auto &p) { return p.kind == PortMapPiece::Exact; }) &&
               HasLocalPortBridge<DRIVERS>(index, sym)) {
-            if (projection) out.push_back(PortMappingMarker(*projection, *port, false, false));
-            else out.push_back(*port);
-            continue;
+            if (projection) { out.push_back(PortMappingMarker(*projection, *port, false, false)); continue; }
+            if (auto route = PortCompactRoute(*port, sym, map, nullptr, cache.known_symbol_paths)) {
+              out.push_back(std::move(*route)); continue;
+            }
           }
           if (initial.pieces.empty() || map.empty()) {
             if (initial.pieces.empty()) out.push_back(*port);
@@ -1438,6 +1451,18 @@ std::string FormatBitRange(int32_t hi, int32_t lo) {
 
 // Feature4 stores sparse owner coverage without changing fixed v6 POD sizes.
 std::string EncodePortQueryBitmap(const EndpointRecord &e) {
+  if (!e.compact_port_routes.empty()) {
+    std::string out="R1;";
+    for (size_t i=0;i<e.compact_port_routes.size();++i) {
+      const auto &r=e.compact_port_routes[i];
+      if (r.target_path_id == std::numeric_limits<uint32_t>::max())
+        throw std::logic_error("unbound compact port target");
+      if (i) out+=';';
+      out+=std::to_string(r.owner_low)+':'+std::to_string(r.owner_high)+':'+
+           std::to_string(r.target_path_id)+':'+std::to_string(r.target_low);
+    }
+    return out+'|';
+  }
   if (e.port_query_coverage.empty()) return e.bit_map;
   std::string out = "Q1;";
   for (size_t i = 0; i < e.port_query_coverage.size(); ++i) {
@@ -1481,6 +1506,37 @@ bool DecodePortQueryBitmap(std::string_view text, PortCoverage &coverage, std::s
   if (bracket_depth != 0) return false;
   if (native) *native = std::string(payload);
   return !coverage.empty();
+}
+bool DecodeCompactPortBitmap(std::string_view text, std::vector<CompactPortRoute> &routes) {
+  routes.clear();
+  if (!text.starts_with("R1;")) return false;
+  const auto split=text.find('|');
+  if (split==std::string_view::npos || split+1!=text.size() || split<=3) return false;
+  auto rest=text.substr(3,split-3); int64_t next=0;
+  auto number=[](std::string_view t,uint32_t &v) {
+    if (t.empty() || (t.size()>1 && t.front()=='0') || t.front()<'0' || t.front()>'9') return false;
+    const auto r=std::from_chars(t.data(),t.data()+t.size(),v);
+    return r.ec==std::errc() && r.ptr==t.data()+t.size();
+  };
+  while (!rest.empty()) {
+    const auto end=rest.find(';'); auto piece=rest.substr(0,end);
+    uint32_t n[4];
+    for (size_t i=0;i<4;++i) {
+      const auto colon=piece.find(':');
+      if ((i<3 && colon==std::string_view::npos) || (i==3 && colon!=std::string_view::npos)) return false;
+      if (!number(piece.substr(0,colon),n[i])) return false;
+      if (i<3) piece.remove_prefix(colon+1);
+    }
+    if (n[0]>INT32_MAX || n[1]>INT32_MAX || n[3]>INT32_MAX || n[0]!=next || n[1]<n[0] ||
+        int64_t(n[3])+n[1]-n[0]>INT32_MAX || routes.size()>=kPortMapMaxPieces) return false;
+    if (!routes.empty() && routes.back().target_path_id==n[2] &&
+        int64_t(routes.back().target_low)-routes.back().owner_low==int64_t(n[3])-n[0]) return false;
+    CompactPortRoute r; r.owner_low=int32_t(n[0]);r.owner_high=int32_t(n[1]);
+    r.target_path_id=n[2];r.target_low=int32_t(n[3]);routes.push_back(std::move(r)); next=int64_t(n[1])+1;
+    if (end==std::string_view::npos) break;
+    rest.remove_prefix(end+1);if(rest.empty())return false;
+  }
+  return !routes.empty();
 }
 
 // ---------------------------------------------------------------------------
@@ -2123,6 +2179,25 @@ EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManag
           const auto loc = item->location;
           rec.file = GetStoredSourcePath(loc, sm, compile_ctx);
           rec.line = GetStoredSourceLine(loc, sm, compile_ctx);
+        } else if constexpr (std::is_same_v<T, CompactPortTraceResult>) {
+          rec.kind = EndpointKind::kPort;
+          rec.path = item.port->getHierarchicalPath();
+          rec.direction = DirectionToString(item.port->direction);
+          rec.file = GetStoredSourcePath(item.port->location, sm, compile_ctx);
+          rec.line = GetStoredSourceLine(item.port->location, sm, compile_ctx);
+          for (const auto &r : item.routes) {
+            CompactPortRoute route;
+            route.owner_low=r.owner_low; route.owner_high=r.owner_high; route.target_low=r.target_low;
+            if (symbol_path_ids) {
+              auto it = symbol_path_ids->find(r.target);
+              if (it != symbol_path_ids->end()) route.target_path_id=it->second;
+            }
+            if (route.target_path_id == std::numeric_limits<uint32_t>::max())
+              route.target_path = r.target->getHierarchicalPath();
+            rec.compact_port_routes.push_back(std::move(route));
+            rec.port_query_coverage.emplace_back(r.owner_low,r.owner_high);
+          }
+          PortNormalizeCoverage(rec.port_query_coverage);
         } else if constexpr (std::is_same_v<T, MappedPortTraceResult>) {
           rec.kind = EndpointKind::kPort;
           const auto *source = item.constant || item.unresolved || item.port == nullptr
@@ -2757,6 +2832,7 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
     ge.assignment_end = e.assignment_end;
     append_signal_refs(e.lhs_signal_ids, e.lhs_signals, ge.lhs_begin, ge.lhs_count);
     append_signal_refs(e.rhs_signal_ids, e.rhs_signals, ge.rhs_begin, ge.rhs_count);
+    if (!e.compact_port_routes.empty()) ge.lhs_begin = ge.rhs_begin = 0;
     ge.kind = (e.kind == EndpointKind::kPort) ? 1u : 0u;
     ge.bit_map_approximate = e.bit_map_approximate ? 1u : 0u;
     ge.reserved = (e.bit_map_logical_axes ? kEndpointLogicalAxes : 0u) |
@@ -2764,6 +2840,7 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
                   (!e.port_query_coverage.empty() ? kEndpointPortQueryCoverage : 0u) |
                   (e.port_mapping_constant ? kEndpointConstantConnection : 0u) |
                   (e.port_mapping_unresolved ? kEndpointUnresolvedConnection : 0u);
+    if (!e.compact_port_routes.empty()) ge.reserved |= kEndpointCompactPortRoute;
     ge.has_assignment_range = e.has_assignment_range ? 1u : 0u;
     graph.endpoints.push_back(ge);
   };
@@ -2822,6 +2899,7 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
   const bool use_canonical_bodies =
       canonical_env == nullptr || !(canonical_env[0] == '0' && canonical_env[1] == '\0');
   std::unique_ptr<CanonicalTracer> canonical_tracer;
+  trace_cache.known_symbol_paths = &symbol_path_ids;
   if (use_canonical_bodies) {
     canonical_tracer = std::make_unique<CanonicalTracer>(sm, trace_cache, compile_ctx, symbol_path_ids,
                                                          graph.strings, string_index);
@@ -3013,6 +3091,12 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
         for (const auto &e : entries) {
           if (e.port_query_coverage.empty()) continue;
           port_mapped_owners.insert(static_cast<uint32_t>(sig_id));
+          for (const auto &r : e.compact_port_routes) {
+            if (r.target_path_id>=graph.signals.size() ||
+                graph.signals[r.target_path_id].name_str_id!=r.target_path_id)
+              throw std::logic_error("compact route target is not a registered root signal");
+            port_mapped_owners.insert(r.target_path_id);
+          }
           // Names are preinterned in signal order. Validate that contract before
           // retaining a crossed source declaration; other interned strings are not IDs.
           uint32_t source = e.path_id;
@@ -3463,7 +3547,7 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
   }
 
   GraphDbFileHeader header;
-  header.reserved = kDbDeclaredAxes | kDbMemberDeclaredAxes | kDbPortQueryCoverage;
+  header.reserved = kDbDeclaredAxes | kDbMemberDeclaredAxes | kDbPortQueryCoverage | kDbCompactPortRoutes;
   std::memcpy(header.magic, kGraphDbMagic, sizeof(header.magic));
   header.string_count = graph.strings.size();
   header.string_blob_size = total_str_bytes;
@@ -3554,22 +3638,94 @@ bool ValidateGraphDb(const GraphDb &graph) {
     if ((axis.flags & ~0x03u) || ((axis.flags & kAxisPacked) && !(axis.flags & kAxisFixed)) ||
         (!(axis.flags & kAxisFixed) && (axis.left != 0 || axis.right != 0))) return false;
   }
+  std::optional<slang::flat_hash_map<uint32_t,uint32_t>> alternate_root_names;
+  slang::flat_hash_map<uint32_t,int64_t> route_target_widths;
+  auto route_width = [&](uint32_t id,bool integral) -> int64_t {
+    const auto rows=graph.ReadCoordinates();size_t lo=0,hi=rows.size();
+    while(lo<hi){const size_t mid=lo+(hi-lo)/2;if(rows[mid].signal_id<id)lo=mid+1;else hi=mid;}
+    if(lo==rows.size() || rows[lo].signal_id!=id)return 0;
+    const auto row=rows[lo];
+    if(!(row.flags & kCoordinatePortMappedOwner) || (row.flags & kCoordinateUnverifiedOwnerMember) || !row.axis_count)
+      return 0;
+    int64_t width=1;
+    for(size_t i=0;i<row.axis_count;++i){
+      const auto axis=graph.ReadDeclaredAxes()[row.axis_begin+i];
+      if(!(axis.flags & kAxisFixed) || (integral && !(axis.flags & kAxisPacked)))return 0;
+      const int64_t count=std::abs(int64_t(axis.left)-axis.right)+1;
+      if(count>INT32_MAX/width)return 0;width*=count;
+    }
+    return width;
+  };
+  auto route_target = [&](uint32_t sid) -> std::optional<uint32_t> {
+    // The compiler preinterns names, but SID is still a string ID. Check the
+    // hint explicitly; foreign string ordering uses one cached root-name index.
+    const auto signals=graph.ReadSignals();
+    if(sid<signals.size() && signals[sid].name_str_id==sid) {
+      if(signals[sid].parent_signal_id==std::numeric_limits<uint32_t>::max())return sid;
+      return std::nullopt;
+    }
+    if(!alternate_root_names){
+      alternate_root_names.emplace();
+      for(uint32_t i=0;i<signals.size();++i)
+        if(signals[i].parent_signal_id==std::numeric_limits<uint32_t>::max())
+          alternate_root_names->emplace(signals[i].name_str_id,i);
+    }
+    const auto it=alternate_root_names->find(sid);
+    return it==alternate_root_names->end() ? std::nullopt : std::optional<uint32_t>(it->second);
+  };
+  auto validate_route = [&](uint32_t owner,const GraphEndpointRecord &ge,bool drivers) {
+    if(!(graph.format_features & kDbCompactPortRoutes) ||
+        ge.reserved!=(kEndpointCompactPortRoute|kEndpointPortQueryCoverage) || ge.kind!=1 ||
+        ge.bit_map_approximate || ge.has_assignment_range || ge.assignment_start || ge.assignment_end ||
+        ge.lhs_begin || ge.lhs_count || ge.rhs_begin || ge.rhs_count ||
+        GraphString(graph,ge.direction_str_id)!=(drivers ? "input" : "output") ||
+        graph.ReadSignals()[owner].parent_signal_id!=std::numeric_limits<uint32_t>::max())return false;
+    std::vector<CompactPortRoute> routes;
+    if(!DecodeCompactPortBitmap(GraphString(graph,ge.bit_map_str_id),routes))return false;
+    const int64_t width=route_width(owner,true);
+    if(!width || int64_t(routes.back().owner_high)+1!=width)return false;
+    for(const auto &r:routes){
+      const auto target=route_target(r.target_path_id);if(!target)return false;
+      auto [it,inserted]=route_target_widths.try_emplace(*target,0);
+      if(inserted)it->second=route_width(*target,false);
+      if(!it->second || int64_t(r.target_low)+r.owner_high-r.owner_low>=it->second)return false;
+    }
+    return true;
+  };
+  uint32_t signal_id=0;
   for (const GraphSignalRecord &gs : graph.ReadSignals()) {
     if (!ValidateGraphRange(gs.driver_begin, gs.driver_count, graph.ReadEndpoints().size())) return false;
     if (!ValidateGraphRange(gs.load_begin, gs.load_count, graph.ReadEndpoints().size())) return false;
+    if(graph.format_features & kDbCompactPortRoutes) {
+      for(uint32_t i=0;i<gs.driver_count;++i){const auto ge=graph.ReadEndpoints()[gs.driver_begin+i];
+        if((ge.reserved & kEndpointCompactPortRoute) && !validate_route(signal_id,ge,true))return false;}
+      for(uint32_t i=0;i<gs.load_count;++i){const auto ge=graph.ReadEndpoints()[gs.load_begin+i];
+        if((ge.reserved & kEndpointCompactPortRoute) && !validate_route(signal_id,ge,false))return false;}
+    }
+    ++signal_id;
   }
 
   for (const GraphEndpointRecord &ge : graph.ReadEndpoints()) {
     if (!ValidateGraphRange(ge.lhs_begin, ge.lhs_count, graph.ReadSignalRefs().size())) return false;
     if (!ValidateGraphRange(ge.rhs_begin, ge.rhs_count, graph.ReadSignalRefs().size())) return false;
-    if (ge.reserved & ~uint8_t(0x1f)) return false;
+    if (ge.reserved & ~uint8_t(0x3f)) return false;
     const bool projected = ge.reserved & kEndpointPortQueryCoverage;
     const bool constant = ge.reserved & kEndpointConstantConnection;
     const bool unresolved = ge.reserved & kEndpointUnresolvedConnection;
+    const bool route = ge.reserved & kEndpointCompactPortRoute;
     if ((projected && !(graph.format_features & kDbPortQueryCoverage)) ||
         ((constant || unresolved) && !projected) || (constant && unresolved)) return false;
-    if (!projected && GraphString(graph, ge.bit_map_str_id).starts_with("Q1;")) return false;
-    if (projected) {
+    const auto bitmap=GraphString(graph,ge.bit_map_str_id);
+    if (!projected && (bitmap.starts_with("Q1;") || bitmap.starts_with("R1;"))) return false;
+    if (route) {
+      std::vector<CompactPortRoute> routes;
+      if (!(graph.format_features & kDbCompactPortRoutes) || !projected || constant || unresolved ||
+          ge.kind!=1 || ge.bit_map_approximate || ge.has_assignment_range || ge.assignment_start ||
+          ge.assignment_end || ge.lhs_count || ge.rhs_count || ge.lhs_begin || ge.rhs_begin ||
+          (ge.reserved & (kEndpointMergedRange|kEndpointLogicalAxes)) ||
+          !DecodeCompactPortBitmap(bitmap,routes)) return false;
+      for (const auto &r : routes) if (GraphString(graph,r.target_path_id).empty()) return false;
+    } else if (projected) {
       PortCoverage coverage;
       if (!DecodePortQueryBitmap(GraphString(graph, ge.bit_map_str_id), coverage)) return false;
       if ((constant || unresolved) && (ge.lhs_count || ge.rhs_count || ge.has_assignment_range || ge.kind != 1)) return false;
@@ -3679,7 +3835,7 @@ bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db,
                         " (this binary reads 1-6); recompile: " + db_path;
     return false;
   }
-  if (header.version == 6 && header.reserved != 1 && header.reserved != 3 && header.reserved != 7) {
+  if (header.version == 6 && header.reserved != 1 && header.reserved != 3 && header.reserved != 7 && header.reserved != 15) {
     if (error) *error = "unsupported v6 DB feature flags " + std::to_string(header.reserved);
     return false;
   }
@@ -4009,14 +4165,25 @@ PortCoverage PortIntersectCoverage(const PortCoverage &a, const PortCoverage &b)
   }
   PortNormalizeCoverage(out); return out;
 }
-// A native bitmap belongs to its path's declaration, never to its list owner.
+// Native member ranges emitted by ResolveTraceResult are root-relative. Trust
+// that frame only for a verified direct member of this owning root.
 std::optional<PortCoverage> PortNativeDomain(const TraceSession &session,
     const EndpointRecord &e, uint32_t source_id) {
   const auto path_id = LookupSignalId(session, EndpointPath(session.db, e));
-  if (!path_id || *path_id != source_id || e.bit_map_approximate) return std::nullopt;
+  if (!path_id || e.bit_map_approximate) return std::nullopt;
+  std::optional<PortCoverage> member;
+  if (*path_id != source_id) {
+    const auto field=session.graph->ReadSignals()[*path_id];
+    const auto coordinates=PortOwnerCoordinates(session,*path_id);
+    if (field.parent_signal_id!=source_id || !coordinates ||
+        (coordinates->flags & kCoordinateUnverifiedOwnerMember) || e.bit_map_logical_axes)
+      return std::nullopt;
+    member=PortOwnerSelection(session,*path_id,{});
+    if(!member || member->size()!=1)return std::nullopt;
+  }
   const auto row = PortOwnerCoordinates(session, source_id);
   if (!row || (row->flags & kCoordinateUnverifiedOwnerMember)) return std::nullopt;
-  if (e.bit_map.empty()) return PortOwnerSelection(session, source_id, {});
+  if (e.bit_map.empty()) return member ? member : PortOwnerSelection(session, source_id, {});
   const auto parsed = ParseEndpointAxes(e.bit_map);
   if (!parsed || parsed->empty()) return std::nullopt;
   std::vector<std::pair<int32_t, int32_t>> axes;
@@ -4035,6 +4202,7 @@ std::optional<PortCoverage> PortNativeDomain(const TraceSession &session,
   const auto r = std::minmax(axes[0].first, axes[0].second);
   PortCoverage native{{r.first, r.second}};
   if (r.first < whole->front().first || r.second > whole->front().second) return std::nullopt;
+  if(member && (r.first<member->front().first || r.second>member->front().second))return std::nullopt;
   return native;
 }
 std::optional<PortCoverage> SessionPortBridgeDomain(TraceSession &session, bool drivers,
@@ -4065,6 +4233,10 @@ std::optional<std::vector<EndpointRecord>> SessionConstrainPortEndpoint(
     if (!PortCoverageOverlaps(e.port_query_coverage, domain)) return std::vector<EndpointRecord>{};
     return std::vector<EndpointRecord>{e};
   }
+  // Whole-owner routes need no native source-frame clipping. In particular,
+  // global sink records name assigned targets rather than the clock owner.
+  const auto whole = PortOwnerSelection(session, owner_id, {});
+  if (whole && domain == *whole) return std::vector<EndpointRecord>{e};
   const auto native = PortNativeDomain(session, e, owner_id);
   if (!native) return std::nullopt;
   const auto intersection = PortIntersectCoverage(*native, domain);
@@ -4110,7 +4282,8 @@ std::optional<std::vector<EndpointRecord>> SessionConstrainPortEndpoint(
     auto piece = [&](int64_t a,int64_t b,int64_t tail_low,int64_t tail_high) {
       prefix.emplace_back(index(b),index(a)); emit(axis+1,tail_low,tail_high); prefix.pop_back();
     };
-    if (first == last) piece(first,last,low%stride,high%stride);
+    if (low%stride==0 && high%stride==stride-1) piece(first,last,0,stride-1);
+    else if (first == last) piece(first,last,low%stride,high%stride);
     else {
       piece(first,first,low%stride,stride-1);
       if (last > first+1) piece(first+1,last-1,0,stride-1);
@@ -4149,6 +4322,7 @@ const SignalRecord &SessionSignalRecord(TraceSession &session, uint32_t id) {
           unknown.path = std::string(SessionSignalName(session, id));
           unknown.path_id = std::numeric_limits<uint32_t>::max();
           unknown.port_mapping_constant = false; unknown.port_mapping_unresolved = true;
+          unknown.compact_port_routes.clear();
           unknown.lhs_signals.clear(); unknown.rhs_signals.clear();
           unknown.lhs_signal_ids.clear(); unknown.rhs_signal_ids.clear();
           output.push_back(std::move(unknown));
@@ -4161,7 +4335,7 @@ const SignalRecord &SessionSignalRecord(TraceSession &session, uint32_t id) {
   }
 
   SignalRecord rec;
-  auto materialize_endpoint = [&](const GraphEndpointRecord &ge) {
+  auto materialize_endpoint = [&](const GraphEndpointRecord &ge, bool drivers) {
     EndpointRecord e;
     e.kind = (ge.kind == 1u) ? EndpointKind::kPort : EndpointKind::kExpr;
     e.path = GraphString(graph, ge.path_str_id);
@@ -4171,7 +4345,30 @@ const SignalRecord &SessionSignalRecord(TraceSession &session, uint32_t id) {
     e.line = static_cast<int>(ge.line);
     e.direction = GraphString(graph, ge.direction_str_id);
     e.bit_map = GraphString(graph, ge.bit_map_str_id);
-    if (ge.reserved & kEndpointPortQueryCoverage) {
+    if (ge.reserved & kEndpointCompactPortRoute) {
+      if (!DecodeCompactPortBitmap(e.bit_map,e.compact_port_routes) ||
+          e.direction != (drivers ? "input" : "output"))
+        throw std::runtime_error("invalid compact port route direction or envelope");
+      const auto whole=PortOwnerSelection(session,id,{});
+      const auto owner_coordinates=PortOwnerCoordinates(session,id);
+      if (!owner_coordinates || !(owner_coordinates->flags & kCoordinatePortMappedOwner) ||
+          !whole || whole->size()!=1 || whole->front().first!=0 ||
+          whole->front().second!=e.compact_port_routes.back().owner_high)
+        throw std::runtime_error("invalid compact port owner layout or width");
+      for (auto &r : e.compact_port_routes) {
+        const auto target=LookupSignalId(session,GraphString(graph,r.target_path_id));
+        if (!target || graph.ReadSignals()[*target].parent_signal_id!=std::numeric_limits<uint32_t>::max())
+          throw std::runtime_error("invalid compact port root target");
+        const auto target_whole=PortOwnerSelection(session,*target,{});
+        const auto target_coordinates=PortOwnerCoordinates(session,*target);
+        if (!target_coordinates || !(target_coordinates->flags & kCoordinatePortMappedOwner) ||
+            !target_whole || target_whole->size()!=1 || target_whole->front().first!=0 ||
+            int64_t(r.target_low)+r.owner_high-r.owner_low>target_whole->front().second)
+          throw std::runtime_error("invalid compact port target layout or bounds");
+        r.target_signal_id=*target;
+      }
+      e.port_query_coverage=*whole;e.bit_map.clear();
+    } else if (ge.reserved & kEndpointPortQueryCoverage) {
       std::string native;
       if (!DecodePortQueryBitmap(e.bit_map, e.port_query_coverage, &native))
         throw std::runtime_error("invalid port query coverage envelope");
@@ -4195,10 +4392,10 @@ const SignalRecord &SessionSignalRecord(TraceSession &session, uint32_t id) {
   };
   rec.drivers.reserve(gs.driver_count);
   for (uint32_t i = 0; i < gs.driver_count; ++i)
-    rec.drivers.push_back(materialize_endpoint(graph.ReadEndpoints()[gs.driver_begin + i]));
+    rec.drivers.push_back(materialize_endpoint(graph.ReadEndpoints()[gs.driver_begin + i],true));
   rec.loads.reserve(gs.load_count);
   for (uint32_t i = 0; i < gs.load_count; ++i)
-    rec.loads.push_back(materialize_endpoint(graph.ReadEndpoints()[gs.load_begin + i]));
+    rec.loads.push_back(materialize_endpoint(graph.ReadEndpoints()[gs.load_begin + i],false));
   return session.materialized_signal_records.emplace(id, std::move(rec)).first->second;
 }
 
@@ -4638,7 +4835,7 @@ bool ParseDefinesPlus(std::string_view tok, std::vector<std::string> &out) {
 // Epoch13: project packed port connections with separate owner coverage.
 // Epoch14: fixed-owner prefixes, Boolean dependencies and constrained reverse routes.
 // Epoch15: compact port bridges require full usable local formal coverage.
-constexpr int kCompileSemanticsEpoch = 15;
+constexpr int kCompileSemanticsEpoch = 16;
 
 std::string ComputeCompileFingerprint(const std::vector<std::string> &passthrough_args) {
   std::vector<std::string> parts;

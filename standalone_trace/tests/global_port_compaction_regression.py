@@ -1,5 +1,6 @@
 """Used ports must keep shared clock/reset/data fanout compact."""
 import argparse
+import json
 import struct
 import tempfile
 from pathlib import Path
@@ -32,6 +33,12 @@ def main():
                 entries = decoded['lists'][owner+'.'+field][mode]
                 assert len(entries) == 1 and entries[0][7] == 1, (owner, field, entries)
         assert len(decoded['globals']) >= 3, decoded['globals'].keys()
+        direct = json.loads(run(binary, ['trace', '--db', db, '--signal', 'gnet_top.gclk',
+                                         '--mode', 'loads', '--format', 'json']).stdout)
+        alias = json.loads(run(binary, ['trace', '--db', db, '--signal', 'gnet_top.u_pass.clk_out',
+                                        '--mode', 'loads', '--format', 'json']).stdout)
+        assert len(direct['endpoints']) == 1100 and not alias['stops'], alias
+        assert alias['endpoints'] == direct['endpoints'], 'whole clock alias lost compact global sinks'
         print('PASS: active-port lists retain compact markers; 26,421 endpoints, 31,928 refs, DB below 4 MiB')
         off = root/'baseline.db'
         run(binary, ['compile', '--db', off, '--single-unit', source, '--top', 'gnet_top'],

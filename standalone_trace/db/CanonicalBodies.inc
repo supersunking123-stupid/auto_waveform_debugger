@@ -145,6 +145,9 @@ class CanonicalTracer {
       for (const Res &r : res) {
         rec.drivers.push_back(ResolveTraceResult(r.result, sm_, true, &cache_, ctx_, &ids_));
         Translate(rec.drivers.back(), r.result, r.frame);
+        if (std::any_of(rec.drivers.back().compact_port_routes.begin(),rec.drivers.back().compact_port_routes.end(),
+              [](const auto &route){return route.target_path_id==std::numeric_limits<uint32_t>::max();}))
+          return Baseline(sym,stats_.sig_map_fail);
       }
     }
     {
@@ -156,6 +159,9 @@ class CanonicalTracer {
       for (const Res &r : res) {
         rec.loads.push_back(ResolveTraceResult(r.result, sm_, false, &cache_, ctx_, &ids_));
         Translate(rec.loads.back(), r.result, r.frame);
+        if (std::any_of(rec.loads.back().compact_port_routes.begin(),rec.loads.back().compact_port_routes.end(),
+              [](const auto &route){return route.target_path_id==std::numeric_limits<uint32_t>::max();}))
+          return Baseline(sym,stats_.sig_map_fail);
       }
     }
     return rec;
@@ -619,9 +625,10 @@ class CanonicalTracer {
             if (!following_parent && !map.empty() && std::all_of(map.begin(), map.end(),
                 [](const auto &p) { return p.kind == PortMapPiece::Exact; }) &&
                 HasLocalPortBridge<DRIVERS>(index, sym)) {
-              if (projection) marker(*projection, *port, false, false);
-              else out.push_back(Res{*port, f});
-              continue;
+              if (projection) { marker(*projection, *port, false, false); continue; }
+              if (auto route = PortCompactRoute(*port, sym, map, escape.frame, &ids_)) {
+                out.push_back(Res{std::move(*route), f}); continue;
+              }
             }
             if (initial.pieces.empty() || map.empty()) {
               if (initial.pieces.empty()) out.push_back(Res{*port, f});
@@ -795,6 +802,16 @@ class CanonicalTracer {
   }
 
   void Translate(EndpointRecord &e, const TraceResult &r, const CanonFrame *f) {
+    if (const auto *compact = std::get_if<CompactPortTraceResult>(&r)) {
+      for (auto &route : e.compact_port_routes) {
+        const std::string_view name = route.target_path_id != std::numeric_limits<uint32_t>::max()
+            ? std::string_view(strings_[route.target_path_id]) : std::string_view(route.target_path);
+        const auto target = Xlate(name, compact->target_frame);
+        const auto it = string_index_.find(target);
+        if (it != string_index_.end()) { route.target_path_id=it->second; route.target_path.clear(); }
+        else { route.target_path_id=std::numeric_limits<uint32_t>::max(); route.target_path=target; }
+      }
+    }
     if (f == nullptr) return;
     std::vector<std::string> abs;
     bool abs_path = false;
