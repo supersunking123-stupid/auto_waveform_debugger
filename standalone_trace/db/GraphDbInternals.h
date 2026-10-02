@@ -64,7 +64,10 @@ EndpointRecord ClipRootMergedEndpointCopy(const EndpointRecord &e, const TraceOp
 std::optional<std::pair<int32_t, int32_t>> ParseExactBitRange(const EndpointRecord &e);
 bool RangesOverlap(const std::pair<int32_t, int32_t> &a, const std::pair<int32_t, int32_t> &b);
 bool EndpointMatchesSignalSelect(const EndpointRecord &e,
-                                  const std::optional<std::pair<int32_t, int32_t>> &select);
+                                 const std::optional<std::pair<int32_t, int32_t>> &select);
+bool EndpointMatchesParentStructBits(const TraceSession &session, const EndpointRecord &e,
+                                     uint32_t parent_id,
+                                     const std::pair<int32_t, int32_t> &select);
 std::string EndpointKey(const TraceDb &db, const EndpointRecord &e);
 
 // --- Global net ---

@@ -94,6 +94,23 @@ TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
   const auto root_id = LookupSignalId(session, opts.root_signal);
   const bool root_is_member = root_id && session.graph->signals[*root_id].parent_signal_id !=
                                              std::numeric_limits<uint32_t>::max();
+  auto root_matches = [&](const EndpointRecord &e) {
+    if (opts.signal_select_axes.size() != 1)
+      return EndpointMatchesSignalAxes(e, opts.signal_select_axes);
+    auto select = opts.signal_select_axes.front();
+    uint32_t parent_id = *root_id;
+    if (root_is_member) {
+      const auto &member = session.graph->signals[*root_id];
+      parent_id = member.parent_signal_id;
+      select.first = static_cast<int32_t>(int64_t(select.first) + member.member_bit_offset);
+      select.second = static_cast<int32_t>(int64_t(select.second) + member.member_bit_offset);
+    }
+    // Logical axes of root arrays have their own coordinate space. Struct
+    // members, including approximate sibling selectors, use parent bits.
+    if (!root_is_member && e.bit_map_logical_axes)
+      return EndpointMatchesSignalAxes(e, opts.signal_select_axes);
+    return EndpointMatchesParentStructBits(session, e, parent_id, select);
+  };
   std::vector<EndpointRecord> logic_endpoints;
   std::vector<EndpointRecord> unresolved_ports;
   std::unordered_set<std::string> seen_logic;
@@ -159,7 +176,7 @@ TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
 
         for (const EndpointRecord &e : *active_edges) {
           const std::string &e_path = EndpointPath(db, e);
-          if (sig == opts.root_signal && !EndpointMatchesSignalAxes(e, opts.signal_select_axes)) {
+          if (sig == opts.root_signal && !root_matches(e)) {
             record_stop(e_path, "bit_filter", "endpoint-does-not-overlap-selected-bits", depth);
             continue;
           }
@@ -492,12 +509,32 @@ int RunTraceWithSession(TraceSession &session, const TraceOptions &parsed_opts) 
   }
   if (session.graph->signals[id].parent_signal_id != std::numeric_limits<uint32_t>::max())
     opts.coordinate_encoding = "parent_struct_bits";
+  const auto selector = [](int32_t left, int32_t right) {
+    return "[" + std::to_string(left) + (left == right ? "" : ":" + std::to_string(right)) + "]";
+  };
+  auto flat_rewrite = [&]() -> std::string {
+    if (opts.signal_select_axes.size() != 1 || opts.declared_axes.empty()) return "";
+    const auto selected = opts.signal_select_axes.front();
+    if (selected.first != selected.second || selected.first < 0) return "";
+    int64_t bit = selected.first;
+    std::vector<int32_t> indexes(opts.declared_axes.size());
+    // Bit zero is the rightmost element of every packed axis.
+    for (size_t axis = opts.declared_axes.size(); axis-- > 0;) {
+      const auto &declared = opts.declared_axes[axis];
+      if (!(declared.flags & kAxisFixed) || !(declared.flags & kAxisPacked)) return "";
+      const int64_t width = std::abs(int64_t(declared.left) - declared.right) + 1;
+      indexes[axis] = static_cast<int32_t>(int64_t(declared.right) +
+          (declared.left >= declared.right ? bit % width : -(bit % width)));
+      bit /= width;
+    }
+    if (bit != 0) return "";
+    std::string query = opts.root_signal;
+    for (int32_t index : indexes) query += selector(index, index);
+    return " Flattened bit " + std::to_string(selected.first) + " → " + query + ".";
+  };
   if (!opts.signal_select_axes.empty()) {
     const bool member = session.graph->signals[id].parent_signal_id != std::numeric_limits<uint32_t>::max();
-    if (member && !session.db.member_declared_axes_verified)
-      return diagnostic("unverified_struct_member_axes",
-                        "This DB lacks verified struct-member declaration axes. Selected member coordinates may be flattened bits or packed array axes; recompile the DB or query the whole member signal: " + opts.root_signal, true);
-    if (session.db.format_version < 6) {
+    if (session.db.format_version < 6 || (member && !session.db.member_declared_axes_verified)) {
       // An old DB does not retain declarations. Even an endpoint-free packed
       // array must not silently be presented as a proven scalar vector.
       diagnostic("legacy_dimensions_unverified",
@@ -529,36 +566,17 @@ int RunTraceWithSession(TraceSession &session, const TraceOptions &parsed_opts) 
              std::max(selected.first, selected.second) > std::max(declared.left, declared.right)))
           return diagnostic("axis_out_of_bounds", "Axis " + std::to_string(axis) + " selection is outside declared [" +
                             std::to_string(declared.left) + ":" + std::to_string(declared.right) +
-                            "]. Flattened waveform bit indices are not declared array coordinates.", true);
+                            "]. Flattened waveform bit indices are not declared array coordinates." + flat_rewrite(), true);
       }
       if (opts.signal_select_axes.size() == 1 && (coordinate->flags & kCoordinatePackedOuter)) {
         const auto selected = opts.signal_select_axes.front();
-        const auto selector = [](int32_t left, int32_t right) {
-          return "[" + std::to_string(left) + (left == right ? "" : ":" + std::to_string(right)) + "]";
-        };
         std::string row_query = opts.root_signal + selector(selected.first, selected.second);
         for (size_t axis = 1; axis < opts.declared_axes.size(); ++axis)
           row_query += selector(opts.declared_axes[axis].left, opts.declared_axes[axis].right);
-        std::string examples = " Declared row " + std::to_string(selected.first) + " → " + row_query + ".";
-        // A waveform's flattened bit zero is the rightmost element of every
-        // packed axis. Decode a mixed-radix offset without assuming [N:0].
-        int64_t bit = selected.first;
-        std::vector<int32_t> indexes(opts.declared_axes.size());
-        bool fixed = bit >= 0;
-        for (size_t axis = opts.declared_axes.size(); axis-- > 0;) {
-          const auto &declared = opts.declared_axes[axis];
-          if (!(declared.flags & kAxisFixed) || !(declared.flags & kAxisPacked)) { fixed = false; break; }
-          const int64_t width = std::abs(int64_t(declared.left) - declared.right) + 1;
-          const int64_t offset = bit % width;
-          indexes[axis] = static_cast<int32_t>(int64_t(declared.right) +
-              (declared.left >= declared.right ? offset : -offset));
-          bit /= width;
-        }
-        if (fixed && bit == 0 && selected.first == selected.second) {
-          std::string flat_query = opts.root_signal;
-          for (int32_t index : indexes) flat_query += selector(index, index);
-          examples += " Flattened bit " + std::to_string(selected.first) + " → " + flat_query + ".";
-        }
+        std::string examples = selected.first == selected.second
+            ? " Declared row " + std::to_string(selected.first)
+            : " Declared row range " + selector(selected.first, selected.second);
+        examples += " → " + row_query + "." + flat_rewrite();
         return diagnostic("ambiguous_single_axis",
                           "A single-axis query on a packed multidimensional signal can mean a flattened waveform bit or a declared outer axis. Supply multiple declared axes or query the whole signal; implicit flattened-bit interpretation is unsupported." + examples +
                           (member ? " Struct-member multi-axis selects remain unsupported; query the whole member signal." : ""), true);
@@ -566,6 +584,16 @@ int RunTraceWithSession(TraceSession &session, const TraceOptions &parsed_opts) 
     } else if (opts.signal_select_axes.size() > 1 &&
                session.graph->signals[id].parent_signal_id == std::numeric_limits<uint32_t>::max()) {
       return diagnostic("unsupported_coordinate_type", "Signal has no supported multidimensional declaration; multidimensional selects remain unsupported.", true);
+    }
+    if (member && opts.signal_select_axes.size() == 1 && !has_coordinates) {
+      const auto &field = session.graph->signals[id];
+      const auto &selected = opts.signal_select_axes.front();
+      const int64_t low = std::min(selected.first, selected.second);
+      const int64_t high = std::max(selected.first, selected.second);
+      if (low < 0 || high >= field.member_bit_width)
+        return diagnostic("axis_out_of_bounds", "Member bit selection is outside the member's stored width.", true);
+      if (high + field.member_bit_offset > std::numeric_limits<int32_t>::max())
+        return diagnostic("unsupported_coordinate_type", "Member selection exceeds the supported parent bit coordinates.", true);
     }
   }
   if (opts.signal_select_axes.size() > 1) {

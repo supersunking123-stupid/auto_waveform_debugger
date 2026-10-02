@@ -102,6 +102,10 @@ def main():
             message = ambiguous['diagnostics'][-1]['message']
             assert 'Declared row 2 → coordinate_diagnostics.p[2][1:0]' in message, message
             assert 'Flattened bit 2 → coordinate_diagnostics.p[1][0]' in message, message
+            flat = json.loads(trace(binary, db, 'coordinate_diagnostics.p[5]', mode, expected=1).stdout)
+            assert 'Flattened bit 5 → coordinate_diagnostics.p[2][1]' in flat['diagnostics'][-1]['message'], flat
+            rows = json.loads(trace(binary, db, 'coordinate_diagnostics.p[3:2]', mode, expected=1).stdout)
+            assert 'Declared row range [3:2] → coordinate_diagnostics.p[3:2][1:0]' in rows['diagnostics'][-1]['message'], rows
             aggregate = json.loads(trace(binary, db, 'coordinate_diagnostics.aggregates[1]', mode, expected=1).stdout)
             assert 'packed struct or packed union array' in aggregate['diagnostics'][-1]['message']
             assert 'whole signal still works' in aggregate['diagnostics'][-1]['message']
@@ -117,7 +121,10 @@ def main():
         round2_data = bytearray(data); struct.pack_into('<I', round2_data, 20, 1)
         round2.write_bytes(round2_data)
         selected_member = json.loads(trace(binary, round2, 'coordinate_diagnostics.member_packet.matrix[2]', expected=1).stdout)
-        assert selected_member['diagnostics'][-1]['code'] == 'unverified_struct_member_axes'
+        assert selected_member['diagnostics'][-1]['code'] == 'legacy_multidimensional_select'
+        for mode in ('drivers', 'loads'):
+            scalar = json.loads(trace(binary, round2, 'coordinate_diagnostics.member_packet.vector[2]', mode).stdout)
+            assert scalar['diagnostics'][0]['code'] == 'legacy_dimensions_unverified', scalar
         trace(binary, round2, 'coordinate_diagnostics.member_packet.matrix')
         print('PASS: rewritten declared/flat queries, specific aggregate type, member ambiguity and fresh scalar-member selection')
 
@@ -137,6 +144,10 @@ def main():
             fresh = trace(binary, db, 'coordinate_diagnostics.vector_only[5]', mode)
             assert original_fields(json.loads(scalar.stdout)) == original_fields(json.loads(fresh.stdout))
             assert json.loads(scalar.stdout)['diagnostics'][0]['code'] == 'legacy_dimensions_unverified'
+            member = trace(binary, legacy, 'coordinate_diagnostics.member_packet.vector[2]', mode)
+            fresh_member = trace(binary, db, 'coordinate_diagnostics.member_packet.vector[2]', mode)
+            assert original_fields(json.loads(member.stdout)) == original_fields(json.loads(fresh_member.stdout))
+            assert json.loads(member.stdout)['diagnostics'][0]['code'] == 'legacy_dimensions_unverified'
         print('PASS: legacy single-axis guards inspect both lists, endpoint-free warning and unchanged scalar results')
 
         malformed = []

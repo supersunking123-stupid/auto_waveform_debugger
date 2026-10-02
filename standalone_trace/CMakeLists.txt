@@ -114,3 +114,12 @@ add_test(
           --source-dir ${CMAKE_CURRENT_SOURCE_DIR}
           ${RTL_TRACE_PARENT_ARGS}
 )
+
+add_test(
+  NAME member_loads_regression
+  COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/member_loads_regression.py
+          --rtl-trace $<TARGET_FILE:rtl_trace>
+          --source-dir ${CMAKE_CURRENT_SOURCE_DIR}
+          ${RTL_TRACE_PARENT_ARGS}
+)

@@ -3615,6 +3615,30 @@ const std::string &SessionSignalName(const TraceSession &session, uint32_t id) {
   return *session.signal_names_by_id[id];
 }
 
+bool EndpointMatchesParentStructBits(const TraceSession &session, const EndpointRecord &e,
+                                     uint32_t parent_id,
+                                     const std::pair<int32_t, int32_t> &select) {
+  // Approximate selectors do not erase a known member's declaration bounds.
+  // Restrict only members of this parent; projected endpoints can name another
+  // signal whose coordinates are unrelated to the queried struct.
+  const auto endpoint_id = LookupSignalId(session, EndpointPath(session.db, e));
+  if (e.kind != EndpointKind::kPort && endpoint_id) {
+    const auto &field = session.graph->signals[*endpoint_id];
+    uint32_t ancestor = field.parent_signal_id;
+    while (ancestor != std::numeric_limits<uint32_t>::max()) {
+      if (ancestor == parent_id && field.member_bit_width != 0) {
+        const int64_t low = field.member_bit_offset;
+        const int64_t high = low + field.member_bit_width - 1;
+        if (std::max(select.first, select.second) < low ||
+            std::min(select.first, select.second) > high) return false;
+        break;
+      }
+      ancestor = session.graph->signals[ancestor].parent_signal_id;
+    }
+  }
+  return EndpointMatchesSignalSelect(e, select);
+}
+
 const SignalRecord &SessionSignalRecord(TraceSession &session, uint32_t id) {
   if (id >= session.graph->signals.size()) throw std::out_of_range("invalid signal id");
   auto cached = session.materialized_signal_records.find(id);
@@ -3630,9 +3654,9 @@ const SignalRecord &SessionSignalRecord(TraceSession &session, uint32_t id) {
     auto sel = std::make_pair(hi, lo);
     SignalRecord rec;
     for (const EndpointRecord &e : parent.drivers)
-      if (EndpointMatchesSignalSelect(e, sel)) rec.drivers.push_back(e);
+      if (EndpointMatchesParentStructBits(session, e, gs.parent_signal_id, sel)) rec.drivers.push_back(e);
     for (const EndpointRecord &e : parent.loads)
-      if (EndpointMatchesSignalSelect(e, sel)) rec.loads.push_back(e);
+      if (EndpointMatchesParentStructBits(session, e, gs.parent_signal_id, sel)) rec.loads.push_back(e);
     return session.materialized_signal_records.emplace(id, std::move(rec)).first->second;
   }
 
