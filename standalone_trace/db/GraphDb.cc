@@ -1038,14 +1038,26 @@ bool HasLocalPortBridge(const BodyTraceIndex &index, const slang::ast::Symbol *s
   const auto &opposite = DRIVERS ? index.loads : index.drivers;
   const auto it = opposite.find(sym);
   if (it == opposite.end()) return false;
-  // An expression on this exact port stays local during Compute and supplies
-  // a reverse bridge. Connections forwarded to children and member paths do
-  // not certify a bridge on the port itself.
-  return std::any_of(it->second.begin(), it->second.end(), [sym](const TraceResult &entry) {
+  const auto identity = PortIdentityProjection(sym);
+  if (identity.pieces.size() != 1 || identity.pieces[0].kind != PortMapPiece::Exact)
+    return false;
+  const auto whole = PortProjectionCoverage(identity);
+  if (whole.size() != 1) return false;
+  PortCoverage covered;
+  for (const auto &entry : it->second) {
     const auto *expr = std::get_if<ExprTraceResult>(&entry);
-    return expr != nullptr && expr->symbol == sym && !expr->context_from_instance_port &&
-           expr->member_path.empty();
-  });
+    if (!expr || expr->symbol != sym || expr->context_from_instance_port ||
+        !expr->member_path.empty()) continue;
+    // The compact record is reused for arbitrary queries. A raw dynamic read
+    // or one static bit cannot certify a reverse bridge for the entire port.
+    const auto exact = PortLocalCoverage(identity, *expr);
+    if (!exact) continue;
+    covered.insert(covered.end(), exact->begin(), exact->end());
+    PortNormalizeCoverage(covered);
+    if (covered == whole) return true;
+    if (covered.size() > kPortMapMaxPieces) return false;
+  }
+  return false;
 }
 
 template <bool DRIVERS>
@@ -1063,7 +1075,6 @@ std::vector<TraceResult> ComputeIndexedTraceResults(
   if (it == entries.end()) return {};
   std::vector<TraceResult> out;
   const auto current_entries = it->second;
-  const bool has_bridge = HasLocalPortBridge<DRIVERS>(index, sym);
   for (const TraceResult &entry : current_entries) {
     if (const auto *port = std::get_if<const slang::ast::PortSymbol *>(&entry)) {
       if ((*port)->direction == (DRIVERS ? slang::ast::ArgumentDirection::In : slang::ast::ArgumentDirection::Out)) {
@@ -1072,8 +1083,9 @@ std::vector<TraceResult> ComputeIndexedTraceResults(
         if (connection) {
           const auto initial = projection ? *projection : PortIdentityProjection(sym);
           const auto map = GetCachedPortConnectionMap(*connection, *instance, cache);
-          if (!following_parent && has_bridge && !map.empty() && std::all_of(map.begin(), map.end(),
-              [](const auto &p) { return p.kind == PortMapPiece::Exact; })) {
+          if (!following_parent && !map.empty() && std::all_of(map.begin(), map.end(),
+              [](const auto &p) { return p.kind == PortMapPiece::Exact; }) &&
+              HasLocalPortBridge<DRIVERS>(index, sym)) {
             if (projection) out.push_back(PortMappingMarker(*projection, *port, false, false));
             else out.push_back(*port);
             continue;
@@ -4623,7 +4635,10 @@ bool ParseDefinesPlus(std::string_view tok, std::vector<std::string> &out) {
 // Epoch10: follow child input/output ports through actual parent connections.
 // Epoch11: restrict new upward routes to ports without local opposite traces.
 // Epoch12: require a local expression on the exact port to certify its bridge.
-constexpr int kCompileSemanticsEpoch = 14;
+// Epoch13: project packed port connections with separate owner coverage.
+// Epoch14: fixed-owner prefixes, Boolean dependencies and constrained reverse routes.
+// Epoch15: compact port bridges require full usable local formal coverage.
+constexpr int kCompileSemanticsEpoch = 15;
 
 std::string ComputeCompileFingerprint(const std::vector<std::string> &passthrough_args) {
   std::vector<std::string> parts;

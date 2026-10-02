@@ -61,8 +61,8 @@ def main():
         verified = run(binary, ['compile', '--db', root/'verify.db', '--single-unit', source,
                                '--top', 'forwarded_port_top'], {'RTL_TRACE_CANONICAL_VERIFY': '1'})
         assert 'mismatched_lists=0' in verified.stdout, verified.stdout
-        assert 'SEMANTICS_EPOCH:14\n' in Path(str(db)+'.meta').read_text()
-        print('PASS: forwarded routes across distinct canonical parent connections; canonical on/off bytes, VERIFY and epoch14 match')
+        assert 'SEMANTICS_EPOCH:15\n' in Path(str(db)+'.meta').read_text()
+        print('PASS: forwarded routes across distinct canonical parent connections; canonical on/off bytes, VERIFY and epoch15 match')
 
 
 if __name__ == '__main__':

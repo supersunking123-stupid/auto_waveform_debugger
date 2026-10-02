@@ -609,7 +609,6 @@ class CanonicalTracer {
     const auto it = entries.find(sym);
     if (it == entries.end()) return;
     const auto current_entries = it->second; // recursive body-cache eviction cannot invalidate this list
-    const bool has_bridge = HasLocalPortBridge<DRIVERS>(index, sym);
     for (const TraceResult &entry : current_entries) {
       if (const auto *port = std::get_if<const slang::ast::PortSymbol *>(&entry)) {
         if ((*port)->direction == (DRIVERS ? slang::ast::ArgumentDirection::In : slang::ast::ArgumentDirection::Out)) {
@@ -617,8 +616,9 @@ class CanonicalTracer {
           if (escape.expr) {
             const auto initial = projection ? *projection : PortIdentityProjection(sym, f);
             const auto map = GetCachedPortConnectionMap(*escape.expr, *escape.instance, cache_);
-            if (!following_parent && has_bridge && !map.empty() && std::all_of(map.begin(), map.end(),
-                [](const auto &p) { return p.kind == PortMapPiece::Exact; })) {
+            if (!following_parent && !map.empty() && std::all_of(map.begin(), map.end(),
+                [](const auto &p) { return p.kind == PortMapPiece::Exact; }) &&
+                HasLocalPortBridge<DRIVERS>(index, sym)) {
               if (projection) marker(*projection, *port, false, false);
               else out.push_back(Res{*port, f});
               continue;

@@ -5,7 +5,7 @@ import struct
 import subprocess
 import tempfile
 from pathlib import Path
-from endpoint_dedup_regression import run
+from endpoint_dedup_regression import run, read_db
 from graph_db_mapping_regression import layout
 
 
@@ -27,9 +27,9 @@ def main():
     with tempfile.TemporaryDirectory(prefix='rtl_port_mapping_') as directory:
         root = Path(directory)
         count = 0
-        for name in (*queries, 'mapping_cases', 'fixed_owner_cases'):
+        for name in (*queries, 'mapping_cases', 'fixed_owner_cases', 'full_local_bridge_cases'):
             source = fixtures/(name+'.sv')
-            top = name if name in ('mapping_cases','fixed_owner_cases') else 'top'
+            top = name if name in ('mapping_cases','fixed_owner_cases','full_local_bridge_cases') else 'top'
             labels = {line.split('// CHECK ',1)[1]: i for i,line in
                       enumerate(source.read_text().splitlines(),1) if '// CHECK ' in line}
             checks = queries.get(name, [])
@@ -67,6 +67,19 @@ def main():
                           ('loads','en',['boolean_use']), ('loads','sel',['boolean_use']),
                           ('drivers','boolean_u.en',[])]
                 checks = [(mode,'fixed_owner_cases.'+target,want) for mode,target,want in checks]
+            if name == 'full_local_bridge_cases':
+                checks = []
+                for owner in ('dyn_u','mixed_u','static_u','complete_u'):
+                    for suffix in ('','[3]','[2:1]'):
+                        checks.append(('drivers',owner+'.d'+suffix,['chosen_reset','chosen_data']))
+                for suffix in ('','[3]'):
+                    checks.append(('drivers','other_u.d'+suffix,['other_data']))
+                for suffix in ('','[7]','[6:5]'):
+                    checks.append(('drivers','nonzero_u.d'+suffix,['chosen_reset','chosen_data']))
+                for owner,label in [('dyn_out','consumer0'),('mixed_out','consumer1')]:
+                    for suffix in ('','[3]','[2:1]'):
+                        checks.append(('loads',owner+'.q'+suffix,[label]))
+                checks = [(mode,'full_local_bridge_cases.'+target,want) for mode,target,want in checks]
             dbs=[]
             for canonical in ('0','1'):
                 db = root/(name+canonical+'.db'); dbs.append(db)
@@ -74,7 +87,7 @@ def main():
                              {'RTL_TRACE_CANONICAL_BODIES':canonical,'RTL_TRACE_CANONICAL_VERIFY':'1'})
                 if canonical == '1':
                     assert 'mismatched_lists=0' in compiled.stdout
-                assert 'SEMANTICS_EPOCH:14\n' in Path(str(db)+'.meta').read_text()
+                assert 'SEMANTICS_EPOCH:15\n' in Path(str(db)+'.meta').read_text()
                 for mode,target,want in checks:
                     body=json.loads(run(binary,['trace','--db',db,'--signal',target,
                                                 '--mode',mode,'--format','json']).stdout)
@@ -86,10 +99,18 @@ def main():
                     assert all(not e['bit_map'].startswith('Q1;') for e in endpoints), body
                     if 'constant_u.d[7]' in target:
                         assert any(s['reason']=='constant_connection' for s in body['stops']), body
-                    if 'mixed_u.d' in target or 'signed_u.d[7]' in target or 'boolean_u.en' in target:
+                    if target.startswith('mapping_cases.mixed_u.d') or 'mapping_cases.signed_u.d[7]' in target or 'boolean_u.en' in target:
                         assert any(s['reason']=='unresolved_connection_mapping' for s in body['stops']), body
                     count += 1
             assert dbs[0].read_bytes()==dbs[1].read_bytes(), name
+            if name=='full_local_bridge_cases':
+                stored=read_db(dbs[0])['lists']
+                for owner in ('static_u','complete_u'):
+                    rows=stored['full_local_bridge_cases.'+owner+'.d'][0]
+                    assert len(rows)==1 and rows[0][7]==1,(owner,rows)
+                for owner in ('dyn_u','mixed_u'):
+                    rows=stored['full_local_bridge_cases.'+owner+'.d'][0]
+                    assert len(rows)==2 and all(row[7]==0 for row in rows),(owner,rows)
             if name=='ff_fwd_nogen':
                 malformed_envelopes(binary,dbs[0],root)
             if name=='mapping_cases':
@@ -126,7 +147,7 @@ endmodule
             assert not body['endpoints'] and any(s['reason']=='unresolved_connection_mapping'
                                                 for s in body['stops']),body
             count+=1
-        print(f'PASS: {count} exact/constant/unsupported/array queries; canonical bytes, VERIFY, epoch14 and strict envelopes')
+        print(f'PASS: {count} exact/constant/unsupported/array queries; canonical bytes, VERIFY, epoch15 and strict envelopes')
 
 
 def malformed_envelopes(binary,db,root):
