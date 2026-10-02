@@ -473,7 +473,11 @@ int RunCompile(int argc, char *argv[]) {
   LogMem("MemBeforeSaveGraphDb");
   if (!SaveGraphDb(db_path, signals, signal_paths, sm, hier_db, &buckets, written_signal_count, compile_ctx,
                    low_mem, &logger, new_fingerprint, publication)) {
-    if (publication.Error().empty()) publication.Fail("write staged DB", publication.TemporaryPath());
+    if (publication.Error().empty()) {
+      // Stream and graph-validation failures do not necessarily set errno.
+      errno = EIO;
+      publication.Fail("write staged DB", publication.TemporaryPath());
+    }
     std::cerr << "Failed to write DB: " << publication.Error() << "\n";
     return 1;
   }

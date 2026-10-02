@@ -3396,7 +3396,7 @@ bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db,
       header.string_count == std::numeric_limits<uint64_t>::max()) return false;
   if (header.version < 1 || header.version > 6) {
     if (error) *error = "unsupported DB version " + std::to_string(header.version) +
-                        " (this binary reads 1–6); recompile: " + db_path;
+                        " (this binary reads 1-6); recompile: " + db_path;
     return false;
   }
   if (header.version == 6 && header.reserved != 1 && header.reserved != 3) return false;

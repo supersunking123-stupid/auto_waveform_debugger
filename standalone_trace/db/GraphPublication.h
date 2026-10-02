@@ -17,6 +17,7 @@
 #include <string>
 #include <string_view>
 #include <fcntl.h>
+#include <pthread.h>
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/socket.h>
@@ -37,9 +38,8 @@ class ScopedFileLock {
     if (fd_ < 0) fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
     return Lock(LOCK_EX);
   }
-  bool AcquireShared(const std::string &path, bool optional = false) {
+  bool AcquireShared(const std::string &path) {
     fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
-    if (fd_ < 0 && optional && errno == ENOENT) return true;
     return Lock(LOCK_SH);
   }
   int Descriptor() const { return fd_; }
@@ -222,13 +222,14 @@ class AtomicGraphOutput {
     ::sigemptyset(&blocked);
     const int ignored[] = {SIGINT, SIGTERM, SIGHUP, SIGQUIT};
     for (int sig : ignored) ::sigaddset(&blocked, sig);
-    if (::sigprocmask(SIG_BLOCK, &blocked, &prior) != 0) { ::close(pipefd[0]); ::close(pipefd[1]); return false; }
+    const int mask_error = ::pthread_sigmask(SIG_BLOCK, &blocked, &prior);
+    if (mask_error != 0) { ::close(pipefd[0]); ::close(pipefd[1]); errno = mask_error; return false; }
     struct sigaction action{}; action.sa_handler = SIG_IGN; ::sigemptyset(&action.sa_mask);
     guardian_ = std::getenv("RTL_TRACE_TEST_GUARDIAN_FORK_FAILURE") ? -1 : ::fork();
-    if (guardian_ < 0) { ::sigprocmask(SIG_SETMASK, &prior, nullptr); ::close(pipefd[0]); ::close(pipefd[1]); return false; }
+    if (guardian_ < 0) { ::pthread_sigmask(SIG_SETMASK, &prior, nullptr); ::close(pipefd[0]); ::close(pipefd[1]); return false; }
     if (guardian_ == 0) {
       for (int sig : ignored) if (::sigaction(sig, &action, nullptr) != 0) ::_exit(1);
-      if (::sigprocmask(SIG_SETMASK, &prior, nullptr) != 0) ::_exit(1);
+      if (::pthread_sigmask(SIG_SETMASK, &prior, nullptr) != 0) ::_exit(1);
       ::close(pipefd[1]);
       // Async-signal-safe child: retain only read pipe and exclusive lock.
       bool closed = true;
@@ -249,7 +250,7 @@ class AtomicGraphOutput {
       }
       ::close(pipefd[0]); ::close(lockfd); ::_exit(0);
     }
-    ::sigprocmask(SIG_SETMASK, &prior, nullptr);
+    ::pthread_sigmask(SIG_SETMASK, &prior, nullptr);
     ::close(pipefd[0]); guardian_pipe_ = pipefd[1]; return true;
   }
   bool FinishGuardian(bool disarm) {
