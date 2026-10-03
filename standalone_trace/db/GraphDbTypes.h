@@ -55,6 +55,10 @@ struct EndpointRecord {
   bool bit_map_approximate = false;
   bool bit_map_logical_axes = false;
   bool bit_map_merged = false;
+  // Compile-only: this legacy fallback had an exact native bitmap before its
+  // public approximation mark. Restore the baseline's numeric range merging;
+  // this field is neither serialized nor part of reader/query identity.
+  bool legacy_fallback_native_merge = false;
   // Coordinates of the owning signal, separate from the native source bitmap.
   std::vector<std::pair<int32_t, int32_t>> port_query_coverage;
   std::vector<CompactPortRoute> compact_port_routes;

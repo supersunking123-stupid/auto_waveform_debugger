@@ -1688,6 +1688,9 @@ struct EndpointMergeKey {
            a.path == b.path && a.file == b.file && a.direction == b.direction &&
            a.assignment_text == b.assignment_text && a.bit_map_logical_axes == b.bit_map_logical_axes &&
            a.bit_map_merged == b.bit_map_merged &&
+           a.legacy_fallback_native_merge == b.legacy_fallback_native_merge &&
+           a.bit_map_approximate == b.bit_map_approximate &&
+           a.port_query_coverage == b.port_query_coverage &&
            a.lhs_signal_ids == b.lhs_signal_ids &&
            a.rhs_signal_ids == b.rhs_signal_ids && a.lhs_signals == b.lhs_signals &&
            a.rhs_signals == b.rhs_signals;
@@ -1703,6 +1706,11 @@ struct EndpointMergeKeyHash {
     h = mix(h, static_cast<size_t>(e.line));
     h = mix(h, e.assignment_start);
     h = mix(h, std::hash<std::string_view>()(e.assignment_text));
+    h = mix(h, e.legacy_fallback_native_merge);
+    for (const auto &[low, high] : e.port_query_coverage) {
+      h = mix(h, static_cast<uint32_t>(low));
+      h = mix(h, static_cast<uint32_t>(high));
+    }
     return h;
   }
 };
@@ -1726,7 +1734,12 @@ void MergeEndpointBitRangesInPlace(std::vector<EndpointRecord> &endpoints, Endpo
   items.clear();
   for (size_t i = 0; i < endpoints.size(); ++i) {
     const EndpointRecord &e = endpoints[i];
-    if (e.bit_map.empty() || e.bit_map_approximate || !e.port_query_coverage.empty()) continue;
+    // A failed connection hop keeps the baseline's complete source record.
+    // Numeric accesses that were exact before marking the hop approximate
+    // must merge as they did in that baseline. Keep each failed owner domain
+    // separate; symbolic/unknown original native bitmaps never gain eligibility.
+    if (e.bit_map.empty() || (!e.legacy_fallback_native_merge &&
+        (e.bit_map_approximate || !e.port_query_coverage.empty()))) continue;
     const auto parsed = ParseExactBitMapText(e.bit_map);
     if (!parsed.has_value()) continue;
     EndpointMergeScratch::Item item;
@@ -2424,6 +2437,7 @@ EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManag
               rec.bit_map_approximate = bit_desc.second;
             }
           }
+          rec.legacy_fallback_native_merge = item.mapping_approximate && !rec.bit_map_approximate;
           rec.bit_map_approximate |= item.mapping_approximate;
           if (item.assignment != nullptr) {
             if (auto off = GetSourceOffsetRange(item.assignment->sourceRange, sm); off.has_value()) {
@@ -4388,6 +4402,29 @@ std::optional<PortCoverage> SessionPortBridgeDomain(TraceSession &session, bool 
   // Q1 is an owner-domain union, not a persisted source-to-owner bit pair.
   // Keep that connected union when the native access spans several pieces.
   PortNormalizeCoverage(target); return target;
+}
+std::vector<EndpointRecord> SessionLegacyHopEndpointView(
+    const TraceSession &session, const std::vector<EndpointRecord> &endpoints) {
+  auto output = endpoints;
+  for (auto &e : output) {
+    if (e.kind != EndpointKind::kExpr || e.bit_map_approximate ||
+        e.port_mapping_constant || e.port_mapping_unresolved ||
+        !ParseExactBitMapText(e.bit_map)) continue;
+    auto source = LookupSignalId(session, EndpointPath(session.db, e));
+    if (!source) continue;
+    const auto signals = session.graph->ReadSignals();
+    while (signals[*source].parent_signal_id != std::numeric_limits<uint32_t>::max())
+      source = signals[*source].parent_signal_id;
+    if (!PortNativeDomain(session, e, *source)) continue;
+    // This entire temporary view belongs to one inherited failed hop. A has
+    // no precise owner projection on that hop, but its original source native
+    // records still merge. Preserve cached Q1 records for exact queries.
+    e.port_query_coverage.clear();
+    e.legacy_fallback_native_merge = true;
+  }
+  EndpointMergeScratch scratch;
+  MergeEndpointBitRangesInPlace(output, scratch);
+  return output;
 }
 std::optional<std::vector<EndpointRecord>> SessionConstrainPortEndpoint(
     const TraceSession &session, const EndpointRecord &e, uint32_t owner_id,

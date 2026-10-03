@@ -39,14 +39,21 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--rtl-trace', required=True, type=Path)
     parser.add_argument('--source-dir', required=True, type=Path)
+    parser.add_argument('--baseline-bin', type=Path,
+                        help='Frozen current main binary for literal generated-fallback endpoint parity')
     args = parser.parse_args()
     binary = args.rtl_trace.resolve()
     fixtures = args.source_dir.resolve() / 'tests/fixtures/round6_ports'
     count = 0
     with tempfile.TemporaryDirectory(prefix='rtl_round6_ports_') as temporary:
         root = Path(temporary)
-        for name in ('portexpr', 'owide', 'dyn', 'gv4', 'unpk2', 'scalar_mirror', 'scalar_layers', 'fallback_contract', 'fallback_frames', 'multiple_fallbacks'):
+        for name in ('portexpr', 'owide', 'dyn', 'gv4', 'unpk2', 'scalar_mirror', 'scalar_layers', 'fallback_contract', 'fallback_frames', 'multiple_fallbacks', 'generated_fallback'):
             top = 'top' if name == 'unpk2' else name
+            baseline_db = None
+            if name == 'generated_fallback' and args.baseline_bin:
+                baseline_db = root / 'generated_fallback_baseline.db'
+                run(args.baseline_bin.resolve(), ['compile', '--db', baseline_db, '--single-unit',
+                    fixtures/(name+'.sv'), '--top', top], {'RTL_TRACE_CANONICAL_BODIES': '0'})
             dbs = []
             for canonical in ('0', '1'):
                 db = root / (name + canonical + '.db'); dbs.append(db)
@@ -158,8 +165,51 @@ def main():
                                 assert not any(s['reason']=='unresolved_connection_mapping' for s in body['stops']),body
                                 assert all(not e['bit_map_approximate'] and e['path'] in ('multiple_fallbacks.z',f'multiple_fallbacks.{owner}.d') for e in body['endpoints']),body
                             count+=1
+                if name == 'generated_fallback':
+                    for lane in range(8):
+                        for suffix in ('', '[0]'):
+                            target=f'generated_fallback.wrapper.lanes[{lane}].u.d{suffix}'
+                            body=query(binary,db,'drivers',target)
+                            source=[e for e in body['endpoints'] if e['path']=='generated_fallback.producer.data']
+                            assert len(source)==1 and source[0]['line']==4 and source[0]['bit_map']=='[7:0]',body
+                            assert source[0]['bit_map_encoding']=='flat_bits' and source[0]['bit_map_approximate'],body
+                            assert any(s['reason']=='unresolved_connection_mapping' and
+                                       'data[lane]&enable[lane]' in s['detail'] and '.sv:12' in s['detail']
+                                       for s in body['stops']),body
+                            if baseline_db:
+                                previous=query(args.baseline_bin.resolve(),baseline_db,'drivers',target)
+                                assert previous['endpoints'],previous
+                                for endpoint in previous['endpoints']:
+                                    assert dict(endpoint,bit_map_approximate=True) in body['endpoints'],(target,previous,body)
+                            count+=1
+                    # The supported neighboring connection must keep its exact
+                    # selected native bit, without another failed hop's domain.
+                    body=query(binary,db,'drivers','generated_fallback.exact_neighbor.d')
+                    assert len(body['endpoints'])==1 and body['endpoints'][0]['path']=='generated_fallback.producer.data',body
+                    assert body['endpoints'][0]['bit_map']=='[2]' and not body['endpoints'][0]['bit_map_approximate'],body
+                    assert not any(s['reason']=='unresolved_connection_mapping' for s in body['stops']),body
+                    count+=1
+                    commands = '\n'.join([
+                        'trace --mode drivers --signal generated_fallback.wrapper.data --format json',
+                        'trace --mode drivers --signal generated_fallback.wrapper.lanes[2].u.d --format json',
+                        'trace --mode drivers --signal generated_fallback.exact_neighbor.d --format json',
+                        'trace --mode drivers --signal generated_fallback.wrapper.data --format json',
+                        'quit', ''])
+                    served = subprocess.run([str(binary),'serve','--db',str(db)],input=commands,
+                                            capture_output=True,text=True,timeout=45)
+                    assert served.returncode == 0, served.stderr
+                    responses=[]
+                    for block in served.stdout.split('<<END>>'):
+                        if block.strip().startswith('{'):
+                            responses.append(json.loads(block))
+                    assert len(responses)==4 and responses[0]==responses[3],served.stdout
+                    assert [e['bit_map'] for e in responses[0]['endpoints']]==[f'[{i}]' for i in range(8)],responses[0]
+                    assert all(not e['bit_map_approximate'] for e in responses[0]['endpoints']),responses[0]
+                    assert responses[2]==body, responses[2]
             assert dbs[0].read_bytes() == dbs[1].read_bytes(), name
         print(f'PASS: {count} round6 queries, exact and approximate source contracts; canonical identity, VERIFY, cache1, epoch17')
+        if args.baseline_bin:
+            print('PASS: frozen-main generated-fallback endpoint dictionaries retained with only approximate=true')
 
 
 if __name__ == '__main__':

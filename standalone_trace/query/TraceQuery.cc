@@ -243,6 +243,11 @@ TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
           }
           active_edges = &constrained_edges;
         }
+        std::vector<EndpointRecord> legacy_hop_edges;
+        if (approximate && !domain) {
+          legacy_hop_edges = SessionLegacyHopEndpointView(session, *active_edges);
+          active_edges = &legacy_hop_edges;
+        }
         bool edge_approximate = approximate;
         std::string actual_connection = failure_connection;
         auto descend = [&](uint32_t id, size_t d, size_t cone, const RouteDomain &selected) {
