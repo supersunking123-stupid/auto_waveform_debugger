@@ -64,6 +64,7 @@ std::optional<std::vector<std::pair<int32_t, int32_t>>> SessionPortOwnerSelectio
 std::optional<std::vector<std::pair<int32_t, int32_t>>> SessionPortBridgeDomain(
     TraceSession &session, bool drivers, uint32_t source_id, uint32_t target_id,
     const std::optional<std::vector<std::pair<int32_t, int32_t>>> &source_domain);
+void SessionRestoreLegacyScalarUnpackedNative(const TraceSession &session, EndpointRecord &endpoint);
 std::optional<std::vector<EndpointRecord>> SessionConstrainPortEndpoint(
     const TraceSession &session, const EndpointRecord &endpoint, uint32_t owner_id,
     const std::vector<std::pair<int32_t, int32_t>> &domain);

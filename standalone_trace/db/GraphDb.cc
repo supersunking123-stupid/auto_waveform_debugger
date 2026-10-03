@@ -15,6 +15,7 @@
 
 // Slang AST headers needed for compile-time trace building
 #include "slang/ast/ASTVisitor.h"
+#include "slang/syntax/AllSyntax.h"
 #include "slang/ast/Compilation.h"
 #include "slang/ast/EvalContext.h"
 #include "slang/ast/Expression.h"
@@ -372,6 +373,7 @@ struct ExprTraceResult {
   uint64_t member_bit_offset = 0;  // bit offset within parent struct
   uint64_t member_bit_width = 0;   // bit width of the accessed member
   std::vector<std::pair<int32_t, int32_t>> port_query_coverage;
+  bool mapping_approximate = false;
 };
 
 struct CanonFrame;
@@ -383,6 +385,7 @@ struct CompactPortTraceResult {
   const slang::ast::PortSymbol *port = nullptr;
   std::vector<CompactPortSourceRoute> routes;
   const CanonFrame *target_frame = nullptr;
+  const slang::ast::Expression *connection = nullptr;
 };
 struct MappedPortTraceResult {
   const slang::ast::PortSymbol *port = nullptr;
@@ -390,6 +393,8 @@ struct MappedPortTraceResult {
   bool constant = false;
   bool unresolved = false;
   const slang::ast::Symbol *owner_symbol = nullptr;
+  const slang::ast::Expression *connection = nullptr;
+  bool approximate = false;
 };
 using TraceResult = std::variant<const slang::ast::PortSymbol *, ExprTraceResult, MappedPortTraceResult,
                                  CompactPortTraceResult>;
@@ -410,6 +415,7 @@ struct PortMapPiece {
 struct PortProjection {
   const slang::ast::Symbol *owner = nullptr;
   const CanonFrame *owner_frame = nullptr;
+  const slang::ast::Expression *connection = nullptr;
   std::vector<PortMapPiece> pieces;
 };
 struct PortStaticRef {
@@ -431,7 +437,10 @@ struct PerBodyTraceCache {
   slang::flat_hash_map<const slang::ast::AssignmentExpression *, SymbolRefList>
       assignment_rhs_signals;
   slang::flat_hash_map<const slang::ast::Statement *, SymbolRefList> statement_lhs_signals;
-  BodyTraceIndex body_trace_index;
+  std::shared_ptr<BodyTraceIndex> body_trace_index = std::make_shared<BodyTraceIndex>();
+  slang::flat_hash_map<const slang::ast::Expression *, PortStaticRef> static_refs;
+  slang::flat_hash_map<const slang::ast::Symbol *, uint8_t> bridge_certificates;
+  slang::flat_hash_map<const slang::ast::Symbol *, uint8_t> native_certificates;
   // Bounded by the same per-body LRU as indexes; no all-design connection map.
   slang::flat_hash_map<const slang::ast::Expression *, std::vector<PortMapPiece>> port_maps;
   bool body_trace_index_ready = false;
@@ -625,8 +634,27 @@ class BodyTraceIndexBuilder : public slang::ast::ASTVisitor<BodyTraceIndexBuilde
         (DRIVERS ? slang::ast::ArgumentDirection::Out : slang::ast::ArgumentDirection::In)) {
       return;
     }
-    if (port.internalSymbol == nullptr || !IsTraceable(port.internalSymbol)) return;
-    Entries()[port.internalSymbol].push_back(&port);
+    if (const auto *expression = port.getInternalExpr()) {
+      // Selectors choose a data leaf; their index operands are not port leaves.
+      class Leaves : public slang::ast::ASTVisitor<Leaves, slang::ast::VisitFlags::AllGood> {
+       public:
+        SymbolRefList symbols;
+        void handle(const slang::ast::NamedValueExpression &e) { if (IsTraceable(&e.symbol)) symbols.push_back(&e.symbol); }
+        void handle(const slang::ast::ElementSelectExpression &e) { e.value().visit(*this); }
+        void handle(const slang::ast::RangeSelectExpression &e) { e.value().visit(*this); }
+        void handle(const slang::ast::MemberAccessExpression &e) { e.value().visit(*this); }
+      } leaves;
+      expression->visit(leaves);
+      std::unordered_set<const slang::ast::Symbol *> seen;
+      for (const auto *symbol : leaves.symbols)
+        if (seen.insert(symbol).second) Entries()[symbol].push_back(&port);
+    } else if (IsTraceable(port.internalSymbol)) Entries()[port.internalSymbol].push_back(&port);
+  }
+
+  void handle(const slang::ast::MultiPortSymbol &port) {
+    // Slang expands the external concat connection into component PortSymbols.
+    // These component symbols are not members of the body traversal.
+    for (const auto *component : port.ports) handle(*component);
   }
 
   void handle(const slang::ast::AssignmentExpression &assignment) {
@@ -927,7 +955,7 @@ void ClearTraceCompileCache(TraceCompileCache &cache) {
   cache.lru_order.clear();
 }
 
-const BodyTraceIndex &GetOrBuildBodyTraceIndex(const slang::ast::InstanceBodySymbol &body,
+std::shared_ptr<const BodyTraceIndex> GetOrBuildBodyTraceIndex(const slang::ast::InstanceBodySymbol &body,
                                                TraceCompileCache &cache) {
   PerBodyTraceCache &body_cache = GetOrCreateBodyTraceCache(body, cache);
   if (body_cache.body_trace_index_ready) return body_cache.body_trace_index;
@@ -937,10 +965,10 @@ const BodyTraceIndex &GetOrBuildBodyTraceIndex(const slang::ast::InstanceBodySym
     if (!g_build_prof.bodies_seen.insert(&body).second) ++g_build_prof.bodies_rebuilt;
   }
   const long canon_rss0 = g_canon_stats.on ? CanonStatsRssKB() : 0;
-  BodyTraceIndexBuilder</*DRIVERS*/ true> driver_builder(body_cache.body_trace_index, body_cache,
+  BodyTraceIndexBuilder</*DRIVERS*/ true> driver_builder(*body_cache.body_trace_index, body_cache,
                                                          body);
   body.visit(driver_builder);
-  BodyTraceIndexBuilder</*DRIVERS*/ false> load_builder(body_cache.body_trace_index, body_cache,
+  BodyTraceIndexBuilder</*DRIVERS*/ false> load_builder(*body_cache.body_trace_index, body_cache,
                                                         body);
   body.visit(load_builder);
   body_cache.body_trace_index_ready = true;
@@ -1029,15 +1057,12 @@ std::vector<TraceResult> CollectPortConnectionResults(
   BuildProfTimer timer(&BuildLoopProfile::port_follow_s);
   const long canon_rss0 = g_canon_stats.on ? CanonStatsRssKB() : 0;
   std::vector<TraceResult> out;
-  for (const slang::ast::PortConnection *conn : inst->getPortConnections()) {
-    const auto *conn_port = conn->port.template as_if<slang::ast::PortSymbol>();
-    if (conn_port != &port) continue;
-    const slang::ast::Expression *expr = conn->getExpression();
-    if (expr == nullptr) continue;
-    PortConnectionResultCollector collector(out, visited);
-    collector.SetActiveInstancePort(inst, conn_port);
-    expr->visit(collector);
-    break;
+  if (const auto *connection = inst->getPortConnection(port)) {
+    if (const auto *expression = connection->getExpression()) {
+      PortConnectionResultCollector collector(out, visited);
+      collector.SetActiveInstancePort(inst, &port);
+      expression->visit(collector);
+    }
   }
   if (g_canon_stats.on) CanonStatsOnEscape(*inst, CanonStatsRssKB() - canon_rss0);
   return out;
@@ -1046,7 +1071,13 @@ std::vector<TraceResult> CollectPortConnectionResults(
 #include "db/PortConnectionMapping.inc"
 
 template <bool DRIVERS>
-bool HasLocalPortBridge(const BodyTraceIndex &index, const slang::ast::Symbol *sym) {
+bool HasLocalPortBridge(const BodyTraceIndex &index, const slang::ast::Symbol *sym, TraceCompileCache &cache) {
+  const auto *owner_body = GetContainingInstance(sym);
+  auto &certificates = GetOrCreateBodyTraceCache(*owner_body, cache).bridge_certificates;
+  const uint8_t known = DRIVERS ? 1 : 4, value = DRIVERS ? 2 : 8;
+  const auto found = certificates.find(sym);
+  if (found != certificates.end() && (found->second & known)) return (found->second & value) != 0;
+  const bool result = [&]() {
   const auto &opposite = DRIVERS ? index.loads : index.drivers;
   const auto it = opposite.find(sym);
   if (it == opposite.end()) return false;
@@ -1062,7 +1093,7 @@ bool HasLocalPortBridge(const BodyTraceIndex &index, const slang::ast::Symbol *s
         !expr->member_path.empty()) continue;
     // The compact record is reused for arbitrary queries. A raw dynamic read
     // or one static bit cannot certify a reverse bridge for the entire port.
-    const auto exact = PortLocalCoverage(identity, *expr);
+    const auto exact = PortLocalCoverage(identity, *expr, cache);
     if (!exact) continue;
     covered.insert(covered.end(), exact->begin(), exact->end());
     PortNormalizeCoverage(covered);
@@ -1070,6 +1101,90 @@ bool HasLocalPortBridge(const BodyTraceIndex &index, const slang::ast::Symbol *s
     if (covered.size() > kPortMapMaxPieces) return false;
   }
   return false;
+  }();
+  certificates[sym] |= known | (result ? value : 0);
+  return result;
+}
+
+// Cache invariant native-access certification. Canonical callers pass mapped
+// representative symbols, so this never binds an actual skipped target body.
+size_t NumericArrayAxisCount(const slang::ast::Type &root_type);
+const slang::ast::Type *SelectorValueType(const slang::ast::Expression &expression);
+template <bool DRIVERS>
+bool PortTargetsHaveProvedNativeAccesses(const std::vector<PortMapPiece> &map, TraceCompileCache &cache) {
+  for (const auto &piece : map) {
+    const auto *body = piece.source ? GetContainingInstance(piece.source) : nullptr;
+    if (!body) return false;
+    const auto retained = GetOrBuildBodyTraceIndex(*body, cache);
+    auto &body_cache = GetOrCreateBodyTraceCache(*body, cache);
+    const uint8_t known = DRIVERS ? 1 : 4, value = DRIVERS ? 2 : 8;
+    auto found = body_cache.native_certificates.find(piece.source);
+    if (found != body_cache.native_certificates.end() && (found->second & known)) {
+      if (!(found->second & value)) return false;
+      continue;
+    }
+    const auto &entries = DRIVERS ? retained->drivers : retained->loads;
+    const auto it = entries.find(piece.source);
+    bool proved = true;
+    if (it != entries.end()) for (const auto &entry : it->second) {
+      const auto *expr = std::get_if<ExprTraceResult>(&entry);
+      if (!expr) continue;
+      if (!expr->member_path.empty() && expr->member_path.find('.', 1) != std::string::npos) { proved = false; break; }
+      if (!expr->member_path.empty() && !expr->selectors.empty()) {
+        const auto *type = SelectorValueType(*expr->selectors.back());
+        if (type && NumericArrayAxisCount(*type) >= 2) { proved = false; break; }
+      }
+      const auto *access = expr->selectors.empty() ? expr->expr : expr->selectors.front();
+      if (!access) { proved = false; break; }
+      // Whole fixed arrays have a proved whole-owner native domain.
+      if (expr->selectors.empty() && access->kind == slang::ast::ExpressionKind::NamedValue &&
+          expr->symbol == piece.source) continue;
+      auto ref = body_cache.static_refs.find(access);
+      if (ref == body_cache.static_refs.end()) ref = body_cache.static_refs.emplace(access, PortResolveReference(*access)).first;
+      if (!ref->second.valid || !ref->second.type->isIntegral()) { proved = false; break; }
+    }
+    body_cache.native_certificates[piece.source] |= known | (proved ? value : 0);
+    if (!proved) return false;
+  }
+  return true;
+}
+
+// Mapping-disabled legacy hop used only after a proof fails. It uses the same
+// active body index and visited-symbol discipline as the historical tracer.
+template <bool DRIVERS>
+std::vector<TraceResult> ComputeLegacyTraceResults(const slang::ast::Symbol *sym,
+    TraceCompileCache &cache, std::unordered_set<const slang::ast::Symbol *> &visited,
+    size_t depth = 0) {
+  const auto *body = GetContainingInstance(sym);
+  if (!body || depth >= kPortMapMaxDepth) return {};
+  const auto retained = GetOrBuildBodyTraceIndex(*body, cache);
+  const auto &entries = DRIVERS ? retained->drivers : retained->loads;
+  const auto it = entries.find(sym);
+  if (it == entries.end()) return {};
+  std::vector<TraceResult> out;
+  for (const auto &entry : it->second) {
+    if (const auto *port = std::get_if<const slang::ast::PortSymbol *>(&entry)) {
+      bool followed = false;
+      if ((*port)->direction == (DRIVERS ? slang::ast::ArgumentDirection::In : slang::ast::ArgumentDirection::Out)) {
+        auto parent = CollectPortConnectionResults(**port, sym, visited);
+        followed = !parent.empty();
+        out.insert(out.end(), std::make_move_iterator(parent.begin()), std::make_move_iterator(parent.end()));
+      }
+      if (!followed) out.push_back(*port);
+    } else if (const auto *expr = std::get_if<ExprTraceResult>(&entry)) {
+      bool followed = false;
+      if (expr->context_from_instance_port && expr->context_port && expr->member_path.empty()) {
+        for (const auto &piece : PortInternalMap(*expr->context_port, cache)) {
+          if (!piece.source || !visited.insert(piece.source).second) continue;
+          auto nested = ComputeLegacyTraceResults<DRIVERS>(piece.source, cache, visited, depth + 1);
+          followed |= !nested.empty();
+          out.insert(out.end(), std::make_move_iterator(nested.begin()), std::make_move_iterator(nested.end()));
+        }
+      }
+      if (!followed) out.push_back(*expr);
+    }
+  }
+  return out;
 }
 
 template <bool DRIVERS>
@@ -1078,53 +1193,66 @@ std::vector<TraceResult> ComputeIndexedTraceResults(
     std::unordered_set<const slang::ast::Symbol *> &visited,
     bool following_parent = false, const PortProjection *projection = nullptr, size_t map_depth = 0) {
   const auto *body = GetContainingInstance(sym);
-  if (body == nullptr) return {};
-  if (projection && map_depth >= kPortMapMaxDepth)
-    return {PortMappingMarker(*projection, nullptr, false, true)};
-  const BodyTraceIndex &index = GetOrBuildBodyTraceIndex(*body, cache);
+  if (!body) return {};
+  const auto retained_index = GetOrBuildBodyTraceIndex(*body, cache);
+  const auto &index = *retained_index;
   const auto &entries = DRIVERS ? index.drivers : index.loads;
   const auto it = entries.find(sym);
   if (it == entries.end()) return {};
   std::vector<TraceResult> out;
-  const auto current_entries = it->second;
-  for (const TraceResult &entry : current_entries) {
+  std::unordered_set<std::string> fallback_routes;
+  auto fallback = [&](const PortProjection &p, const slang::ast::PortSymbol *port) {
+    out.push_back(PortMappingMarker(p, port, false, true));
+    if (!fallback_routes.insert(PortFallbackKey(p)).second) return;
+    std::unordered_set<const slang::ast::Symbol *> legacy_visited{sym};
+    auto legacy = ComputeLegacyTraceResults<DRIVERS>(sym, cache, legacy_visited);
+    if (auto boundary = PortApproximateBoundary(p)) out.push_back(std::move(*boundary));
+    for (auto &result : legacy) if (PortKeepLegacyResult(p, result, cache)) {
+      MarkApproximateTrace(result, PortProjectionCoverage(p)); out.push_back(std::move(result));
+    }
+  };
+  if (projection && map_depth >= kPortMapMaxDepth) { fallback(*projection, nullptr); return out; }
+  for (const auto &entry : it->second) {
     if (const auto *port = std::get_if<const slang::ast::PortSymbol *>(&entry)) {
       if ((*port)->direction == (DRIVERS ? slang::ast::ArgumentDirection::In : slang::ast::ArgumentDirection::Out)) {
         const auto *instance = GetContainingInstanceSymbol(sym);
         const auto *connection = instance ? PortActualConnection(*instance, **port) : nullptr;
         if (connection) {
-          const auto initial = projection ? *projection : PortIdentityProjection(sym);
-          const auto map = GetCachedPortConnectionMap(*connection, *instance, cache);
-          if (!following_parent && !map.empty() && std::all_of(map.begin(), map.end(),
-              [](const auto &p) { return p.kind == PortMapPiece::Exact; }) &&
-              HasLocalPortBridge<DRIVERS>(index, sym)) {
-            if (projection) { out.push_back(PortMappingMarker(*projection, *port, false, false)); continue; }
+          auto initial = projection ? *projection : PortIdentityProjection(sym);
+          initial.connection = connection;
+          const auto internal = PortInternalMap(**port, cache);
+          const auto conversion = PortInspectOutput(*instance, **port);
+          const auto map = PortBoundConnectionMap(*instance, **port, *connection, cache);
+          if (initial.pieces.empty() || internal.empty() || map.empty() || conversion.signed_widening || conversion.unsupported ||
+              std::any_of(internal.begin(), internal.end(), [](const auto &p) { return p.kind != PortMapPiece::Exact; })) {
+            fallback(initial, *port); continue;
+          }
+          // Internal root -> external formal -> actual parent. A disjoint
+          // internal selection is proved disconnected and stays empty.
+          auto formal = PortComposeDown(initial, internal, *port);
+          if (formal.pieces.empty()) continue;
+          if (!following_parent && PortInternalIsIdentity(**port) &&
+              std::all_of(map.begin(), map.end(), [](const auto &p) { return p.kind == PortMapPiece::Exact; }) &&
+              HasLocalPortBridge<DRIVERS>(index, sym, cache) && PortTargetsHaveProvedNativeAccesses<DRIVERS>(map, cache)) {
+            if (projection) { out.push_back(PortMappingMarker(initial, *port, false, false)); continue; }
             if (auto route = PortCompactRoute(*port, sym, map, nullptr, cache.known_symbol_paths)) {
-              out.push_back(std::move(*route)); continue;
+              route->connection = connection; out.push_back(std::move(*route)); continue;
             }
           }
-          if (initial.pieces.empty() || map.empty()) {
-            if (initial.pieces.empty()) out.push_back(*port);
-            else out.push_back(PortMappingMarker(initial, *port, false, true));
-            continue;
-          }
-          auto routes = PortComposeUp(initial, map);
-          if (routes.empty() || routes.size() > kPortMapMaxPieces) {
-            out.push_back(PortMappingMarker(initial, *port, false, true)); continue;
-          }
+          auto routes = PortComposeUp(formal, map);
+          if (routes.size() > kPortMapMaxPieces) { fallback(initial, *port); continue; }
           for (auto &route : routes) {
             const auto &piece = route.pieces.front();
             if (piece.kind != PortMapPiece::Exact) {
-              out.push_back(PortMappingMarker(route, *port, piece.kind == PortMapPiece::Constant,
-                                             piece.kind != PortMapPiece::Constant)); continue;
+              if (piece.kind == PortMapPiece::Constant) out.push_back(PortMappingMarker(route, *port, true, false));
+              else fallback(route, *port);
+              continue;
             }
             auto branch_visited = visited;
-            if (!branch_visited.insert(piece.source).second) {
-              out.push_back(PortMappingMarker(route, *port, false, true)); continue;
-            }
-            auto nested = ComputeIndexedTraceResults<DRIVERS>(piece.source, cache, branch_visited,
-                                                              true, &route, map_depth + 1);
-            if (nested.empty()) out.push_back(PortMappingMarker(route, *port, false, true));
+            if (!branch_visited.insert(piece.source).second) { fallback(route, *port); continue; }
+            auto nested = ComputeIndexedTraceResults<DRIVERS>(piece.source, cache, branch_visited, true, &route, map_depth + 1);
+            // An exact parent with no indexed endpoint is an ordinary boundary.
+            if (nested.empty()) out.push_back(PortMappingMarker(route, *port, false, false));
             else out.insert(out.end(), std::make_move_iterator(nested.begin()), std::make_move_iterator(nested.end()));
           }
           continue;
@@ -1135,49 +1263,44 @@ std::vector<TraceResult> ComputeIndexedTraceResults(
       continue;
     }
     const auto *expr = std::get_if<ExprTraceResult>(&entry);
-    if (expr == nullptr) continue;
+    if (!expr) continue;
     std::optional<PortCoverage> coverage;
     if (projection) {
-      coverage = PortLocalCoverage(*projection, *expr);
-      if (!coverage) { out.push_back(PortMappingMarker(*projection, nullptr, false, true)); continue; }
+      coverage = PortLocalCoverage(*projection, *expr, cache);
+      if (!coverage) { fallback(*projection, nullptr); continue; }
       if (coverage->empty()) continue;
     }
     bool followed = false;
-    if (expr->context_from_instance_port && expr->context_port && expr->context_port->internalSymbol &&
-        expr->context_instance) {
-      const auto *internal = expr->context_port->internalSymbol;
-      const auto *connection = PortActualConnection(*expr->context_instance, *expr->context_port);
-      const auto map = connection ? GetCachedPortConnectionMap(*connection, *expr->context_instance, cache) : std::vector<PortMapPiece>{};
-      // The raw AST collector can retain refs in a folded connection expression.
-      // A proved constant has no downward signal dependency.
-      if (!map.empty() && std::all_of(map.begin(), map.end(),
-          [](const auto &p) { return p.kind == PortMapPiece::Constant; })) continue;
-      const auto initial = projection ? *projection : PortInitialDownProjection(sym, map);
-      if (!initial.pieces.empty()) {
-        auto downward = PortComposeDown(initial, map, internal);
-        auto branch_visited = visited;
-        if (!downward.pieces.empty() && downward.pieces.size() <= kPortMapMaxPieces &&
-            branch_visited.insert(internal).second) {
-          auto nested = ComputeIndexedTraceResults<DRIVERS>(internal, cache, branch_visited,
-                                                            false, &downward, map_depth + 1);
-          if (!nested.empty()) { out.insert(out.end(), std::make_move_iterator(nested.begin()), std::make_move_iterator(nested.end())); followed = true; }
+    if (expr->context_from_instance_port && expr->context_port && expr->context_instance) {
+      const auto *port = expr->context_port;
+      const auto *child = expr->context_instance;
+      const auto *connection = PortActualConnection(*child, *port);
+      const auto map = connection ? PortBoundConnectionMap(*child, *port, *connection, cache) : std::vector<PortMapPiece>{};
+      if (!map.empty() && std::all_of(map.begin(), map.end(), [](const auto &p) { return p.kind == PortMapPiece::Constant; })) continue;
+      auto initial = projection ? *projection : PortInitialDownProjection(sym, map);
+      initial.connection = connection;
+      const auto internal = PortInternalMap(*port, cache);
+      const auto conversion = PortInspectOutput(*child, *port);
+      if (initial.pieces.empty() || internal.empty() || map.empty() || PortHasUnprovedDependency(map, sym) || conversion.signed_widening || conversion.unsupported ||
+          std::any_of(internal.begin(), internal.end(), [](const auto &p) { return p.kind != PortMapPiece::Exact; })) {
+        fallback(initial, port); followed = true;
+      } else {
+        auto formal = PortComposeDown(initial, map, port);
+        auto routes = PortComposeUp(formal, internal);
+        if (routes.size() > kPortMapMaxPieces) { fallback(initial, port); followed = true; }
+        else for (auto &route : routes) {
+          const auto *internal_sym = route.pieces.front().source;
+          auto branch_visited = visited;
+          if (!internal_sym || !branch_visited.insert(internal_sym).second) { fallback(initial, port); followed = true; continue; }
+          auto nested = ComputeIndexedTraceResults<DRIVERS>(internal_sym, cache, branch_visited, false, &route, map_depth + 1);
+          followed |= !nested.empty();
+          out.insert(out.end(), std::make_move_iterator(nested.begin()), std::make_move_iterator(nested.end()));
         }
-        if (!followed) {
-          auto marker = PortMappingMarker(initial, nullptr, false, true);
-          if (auto local = PortLocalCoverage(initial, *expr); local && !local->empty()) marker.coverage = *local;
-          out.push_back(std::move(marker)); followed = true;
-        }
-      } else if (expr->member_path.empty() && visited.insert(internal).second) {
-        CanonStatsReasonScope canon_reason(CanonicalStats::kDownward);
-        auto nested = ComputeIndexedTraceResults<DRIVERS>(internal, cache, visited);
-        if (!nested.empty()) { out.insert(out.end(), std::make_move_iterator(nested.begin()), std::make_move_iterator(nested.end())); followed = true; }
+        // No formal overlap is proved disconnected (including zero extension).
+        if (formal.pieces.empty()) followed = true;
       }
     }
-    if (!followed) {
-      auto result = *expr;
-      if (coverage) result.port_query_coverage = *coverage;
-      out.push_back(std::move(result));
-    }
+    if (!followed) { auto result = *expr; if (coverage) result.port_query_coverage = *coverage; out.push_back(std::move(result)); }
   }
   return out;
 }
@@ -2211,6 +2334,20 @@ EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManag
           rec.port_query_coverage = item.coverage;
           rec.port_mapping_constant = item.constant;
           rec.port_mapping_unresolved = item.unresolved;
+          rec.bit_map_approximate = item.approximate;
+          if (item.connection && (item.constant || item.unresolved)) {
+            rec.assignment_text = GetSourceText(item.connection->sourceRange, sm);
+            if (rec.assignment_text.empty() && item.connection->syntax) rec.assignment_text = item.connection->syntax->toString();
+            if (rec.assignment_text.empty()) if (const auto *symbol = item.connection->getSymbolReference())
+              rec.assignment_text = std::string(symbol->name);
+            auto source_range = item.connection->sourceRange;
+            if (item.connection->syntax) source_range = item.connection->syntax->sourceRange();
+            if (const auto range = GetSourceOffsetRange(source_range, sm); range && range->second > range->first) {
+              rec.has_assignment_range = true; rec.assignment_start = range->first; rec.assignment_end = range->second;
+            }
+            rec.file = GetStoredSourcePath(item.connection->sourceRange.start(), sm, compile_ctx);
+            rec.line = GetStoredSourceLine(item.connection->sourceRange.start(), sm, compile_ctx);
+          }
         } else {
           rec.kind = EndpointKind::kExpr;
           rec.port_query_coverage = item.port_query_coverage;
@@ -2279,7 +2416,7 @@ EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManag
               // Ordinary multidimensional arrays carry logical declared-axis coordinates.
               const auto *value_symbol = item.symbol->template as_if<slang::ast::ValueSymbol>();
               rec.bit_map_logical_axes = !item.selectors.empty() && value_symbol != nullptr &&
-                  NumericArrayAxisCount(value_symbol->getType()) >= 2;
+                  ((!item.mapping_approximate && value_symbol->getType().isUnpackedArray()) || NumericArrayAxisCount(value_symbol->getType()) >= 2);
               auto bit_desc = rec.bit_map_logical_axes
                   ? DescribeLogicalAxisSelectors(item.selectors, sm, *item.symbol)
                   : DescribeBitSelectors(item.selectors, sm, *item.symbol);
@@ -2287,6 +2424,7 @@ EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManag
               rec.bit_map_approximate = bit_desc.second;
             }
           }
+          rec.bit_map_approximate |= item.mapping_approximate;
           if (item.assignment != nullptr) {
             if (auto off = GetSourceOffsetRange(item.assignment->sourceRange, sm); off.has_value()) {
               rec.has_assignment_range = true;
@@ -2972,8 +3110,8 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
     for (const auto &kv : trace_cache.body_caches) {
       const PerBodyTraceCache &bc = *kv.second;
       if (bc.body_trace_index_ready) ++body_index_ready;
-      for (const auto &d : bc.body_trace_index.drivers) trace_results += d.second.size();
-      for (const auto &l : bc.body_trace_index.loads) trace_results += l.second.size();
+      for (const auto &d : bc.body_trace_index->drivers) trace_results += d.second.size();
+      for (const auto &l : bc.body_trace_index->loads) trace_results += l.second.size();
     }
     std::cout << "[Memory] progress " << tag << " signals_done=" << mem_progress_done
               << " rss=" << GetCurrentRSSKB() / 1024 << "MB peak_rss=" << GetMaxRSSMB() << "MB"
@@ -3728,7 +3866,10 @@ bool ValidateGraphDb(const GraphDb &graph) {
     } else if (projected) {
       PortCoverage coverage;
       if (!DecodePortQueryBitmap(GraphString(graph, ge.bit_map_str_id), coverage)) return false;
-      if ((constant || unresolved) && (ge.lhs_count || ge.rhs_count || ge.has_assignment_range || ge.kind != 1)) return false;
+      if ((constant || unresolved) && (ge.lhs_count || ge.rhs_count || ge.kind != 1)) return false;
+      if ((constant || unresolved) && ge.has_assignment_range &&
+          (ge.assignment_end <= ge.assignment_start || !ge.line || GraphString(graph, ge.file_str_id).empty())) return false;
+      if ((constant || unresolved) && !ge.has_assignment_range && (ge.assignment_start || ge.assignment_end)) return false;
     }
   }
 
@@ -3835,7 +3976,7 @@ bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db,
                         " (this binary reads 1-6); recompile: " + db_path;
     return false;
   }
-  if (header.version == 6 && header.reserved != 1 && header.reserved != 3 && header.reserved != 7 && header.reserved != 15) {
+  if (header.version == 6 && header.reserved != 1 && header.reserved != 3 && header.reserved != 15) {
     if (error) *error = "unsupported v6 DB feature flags " + std::to_string(header.reserved);
     return false;
   }
@@ -4079,6 +4220,28 @@ std::optional<GraphSignalCoordinates> PortOwnerCoordinates(const TraceSession &s
   if (lo < rows.size() && rows[lo].signal_id == id) return rows[lo];
   return std::nullopt;
 }
+void SessionRestoreLegacyScalarUnpackedNative(const TraceSession &session, EndpointRecord &e) {
+  if (!e.bit_map_approximate || !e.bit_map_logical_axes || e.kind == EndpointKind::kPort) return;
+  const auto id = LookupSignalId(session, EndpointPath(session.db, e));
+  if (!id || session.graph->ReadSignals()[*id].parent_signal_id != std::numeric_limits<uint32_t>::max()) return;
+  const auto row = PortOwnerCoordinates(session, *id);
+  if (!row || row->axis_count != 1 || (row->flags & (kCoordinateUnsupported | kCoordinateUnverifiedOwnerMember))) return;
+  const auto axis = session.graph->ReadDeclaredAxes()[row->axis_begin];
+  if (!(axis.flags & kAxisFixed) || (axis.flags & kAxisPacked)) return;
+  const auto range = ParseExactBitMapText(e.bit_map);
+  if (!range) return;
+  const int64_t width = std::abs(int64_t(axis.left) - axis.right) + 1;
+  // evalSelector uses unpacked storage order from the declaration's left
+  // bound. This differs from the packed ordinal used by port owner maps.
+  auto legacy_offset = [&](int32_t index) {
+    return axis.left >= axis.right ? int64_t(axis.left) - index : int64_t(index) - axis.left;
+  };
+  const int64_t a = legacy_offset(range->first);
+  const int64_t b = legacy_offset(range->second);
+  if (a < 0 || b < 0 || a >= width || b >= width || width > INT32_MAX) return;
+  e.bit_map = FormatBitRange(int32_t(std::max(a,b)), int32_t(std::min(a,b)));
+  e.bit_map_logical_axes = false;
+}
 bool PortCoverageOverlaps(const PortCoverage &coverage, const PortCoverage &selected) {
   for (const auto &a : coverage) for (const auto &b : selected)
     if (RangesOverlap(a, b)) return true;
@@ -4245,14 +4408,14 @@ std::optional<std::vector<EndpointRecord>> SessionConstrainPortEndpoint(
   std::vector<EndpointRecord> output;
   const auto row = PortOwnerCoordinates(session, owner_id);
   if (!row) return std::nullopt;
-  if (!e.bit_map_logical_axes && row->axis_count == 1) {
+  const auto dims = session.graph->ReadDeclaredAxes();
+  if (!e.bit_map_logical_axes && row->axis_count == 1 && (dims[row->axis_begin].flags & kAxisPacked)) {
     for (const auto [low, high] : intersection) {
       auto copy = e; copy.bit_map = FormatBitRange(high, low); copy.bit_map_merged = false;
       output.push_back(std::move(copy));
     }
     return output;
   }
-  const auto dims = session.graph->ReadDeclaredAxes();
   std::vector<int64_t> strides(row->axis_count, 1);
   int64_t total = 1;
   for (size_t axis = row->axis_count; axis-- > 0;) {
@@ -4271,7 +4434,7 @@ std::optional<std::vector<EndpointRecord>> SessionConstrainPortEndpoint(
     if (failed) return;
     if (axis == row->axis_count) {
       if (output.size() >= kPortMapMaxPieces) { failed = true; return; }
-      auto copy = e; copy.bit_map.clear(); copy.bit_map_logical_axes = row->axis_count > 1;
+      auto copy = e; copy.bit_map.clear(); copy.bit_map_logical_axes = row->axis_count > 1 || !(dims[row->axis_begin].flags & kAxisPacked);
       copy.bit_map_merged = false;
       for (auto [left,right] : prefix) copy.bit_map += FormatBitRange(left,right);
       output.push_back(std::move(copy)); return;
@@ -4854,7 +5017,7 @@ bool ParseDefinesPlus(std::string_view tok, std::vector<std::string> &out) {
 // Epoch13: project packed port connections with separate owner coverage.
 // Epoch14: fixed-owner prefixes, Boolean dependencies and constrained reverse routes.
 // Epoch15: compact port bridges require full usable local formal coverage.
-constexpr int kCompileSemanticsEpoch = 16;
+constexpr int kCompileSemanticsEpoch = 17;
 
 std::string ComputeCompileFingerprint(const std::vector<std::string> &passthrough_args) {
   std::vector<std::string> parts;

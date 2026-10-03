@@ -29,7 +29,7 @@ def trace(binary, db, signal, mode='loads', expected=0, text=False):
 
 def footer(data):
     h = struct.unpack_from('<16sII15Q', data)
-    assert h[1] == 6 and h[2] in (1, 3, 7, 15), h[:3]
+    assert h[1] == 6 and h[2] in (1, 3, 15), h[:3]
     pos = 144 + 4 * (h[3] + 1) + h[4]
     pos += sum(n * size for n, size in zip(h[5:], (32, 48, 4, 12, 4, 12, 4, 12, 4, 24, 4, 16, 4)))
     count = struct.unpack_from('<Q', data, pos)[0]

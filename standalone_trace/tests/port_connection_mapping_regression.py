@@ -124,13 +124,20 @@ def main():
                              {'RTL_TRACE_CANONICAL_BODIES':canonical,'RTL_TRACE_CANONICAL_VERIFY':'1'})
                 if canonical == '1':
                     assert 'mismatched_lists=0' in compiled.stdout
-                assert 'SEMANTICS_EPOCH:16\n' in Path(str(db)+'.meta').read_text()
+                assert 'SEMANTICS_EPOCH:17\n' in Path(str(db)+'.meta').read_text()
                 for mode,target,want in checks:
                     body=json.loads(run(binary,['trace','--db',db,'--signal',target,
                                                 '--mode',mode,'--format','json']).stdout)
                     endpoints=body['endpoints']
                     if labels:
-                        assert sorted(e['line'] for e in endpoints)==sorted(labels[w] for w in want), body
+                        fallback_case = name=='mapping_cases' and (target.startswith('mapping_cases.mixed_u.d') or target=='mapping_cases.signed_u.d[7]') or name=='fixed_owner_cases' and target=='fixed_owner_cases.boolean_u.en'
+                        if fallback_case:
+                            assert endpoints and any(e['bit_map_approximate'] for e in endpoints),body
+                            assert any(e['kind']=='port' and e['bit_map_approximate'] for e in endpoints),body
+                            if target=='mapping_cases.mixed_u.d[7]':
+                                assert not any(e['path']=='mapping_cases.x' for e in endpoints),body
+                        else:
+                            assert sorted(e['line'] for e in endpoints)==sorted(labels[w] for w in want), body
                     else:
                         assert sorted(e['assignment'] for e in endpoints)==sorted(want), body
                     assert all(not e['bit_map'].startswith(('Q1;','R1;')) for e in endpoints), body
@@ -199,12 +206,12 @@ endmodule
                 {'RTL_TRACE_CANONICAL_BODIES':canonical,'RTL_TRACE_CANONICAL_VERIFY':'1'})
             body=json.loads(run(binary,['trace','--db',db,'--signal','formal_top.u.d[0]',
                                         '--mode','drivers','--format','json']).stdout)
-            assert not body['endpoints'] and any(s['reason']=='unresolved_connection_mapping'
-                                                for s in body['stops']),body
+            assert body['endpoints'] and all(e['bit_map_approximate'] for e in body['endpoints']),body
+            assert any(s['reason']=='unresolved_connection_mapping' for s in body['stops']),body
             count+=1
         from query_reference_identity_regression import check as check_query_refs
         count += check_query_refs(binary, fixtures, root)
-        print(f'PASS: {count} exact/constant/unsupported/array/context queries; canonical bytes, VERIFY, epoch16 and strict envelopes')
+        print(f'PASS: {count} exact/constant/unsupported/array/context queries; canonical bytes, VERIFY, epoch17 and strict envelopes')
 
 
 def malformed_envelopes(binary,db,root):

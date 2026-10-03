@@ -187,6 +187,32 @@ PortCoverage PortProjectionCoverage(const PortProjection &projection) {
     out.emplace_back(int32_t(p.owner_low), int32_t(p.owner_low + p.width - 1));
   PortNormalizeCoverage(out); return out;
 }
+bool PortHasUnprovedDependency(const std::vector<PortMapPiece> &map,
+                              const slang::ast::Symbol *symbol) {
+  for (const auto &piece : map) if (piece.kind == PortMapPiece::Unsupported) {
+    if (!piece.expr) return true;
+    bool referenced = false;
+    piece.expr->visitSymbolReferences([&](const auto &, const auto &source) {
+      referenced |= &source == symbol;
+    });
+    if (referenced) return true;
+  }
+  return false;
+}
+// Deduplicate repeated failures of the same transient route, not different
+// failed chunks. Native possible-source bounds and owner coverage both matter.
+std::string PortFallbackKey(const PortProjection &projection) {
+  std::string key;
+  for (const auto &p : projection.pieces) {
+    key += ";" + std::to_string(p.kind) + ":" + std::to_string(p.owner_low) +
+           ":" + std::to_string(p.source_low) + ":" + std::to_string(p.width) +
+           ":" + std::to_string(reinterpret_cast<uintptr_t>(p.source)) +
+           ":" + std::to_string(reinterpret_cast<uintptr_t>(p.expr));
+    for (const auto &axis : p.logical_axes)
+      key += "[" + std::to_string(axis.first) + ":" + std::to_string(axis.second) + "]";
+  }
+  return key;
+}
 std::vector<PortMapPiece> PortBuildExpressionMap(const slang::ast::Expression &expr,
                                                  const slang::ast::Symbol &scope,
                                                  size_t depth = 0) {
@@ -258,19 +284,23 @@ std::vector<PortMapPiece> PortBuildExpressionMap(const slang::ast::Expression &e
   const auto reference = PortResolveReference(expr);
   if (!reference.valid || !reference.type->isIntegral() ||
       reference.low + width > std::numeric_limits<int32_t>::max()) return marker(PortMapPiece::Unsupported);
+  if (const auto *value = reference.symbol->as_if<slang::ast::ValueSymbol>()) {
+    const auto *type = &value->getType();
+    const bool packed_array = type->isPackedArray();
+    while (type->isArray()) type = type->getArrayElementType();
+    if (packed_array && (type->getCanonicalType().kind == slang::ast::SymbolKind::PackedStructType || type->isPackedUnion())) return marker(PortMapPiece::Unsupported);
+  }
   return {{PortMapPiece::Exact, reference.symbol, &expr, 0, reference.low, width,
            reference.logical_axes}};
 }
 const slang::ast::Expression *PortActualConnection(const slang::ast::InstanceSymbol &instance,
                                                    const slang::ast::PortSymbol &port) {
-  for (const auto *connection : instance.getPortConnections()) {
-    if (connection->port.as_if<slang::ast::PortSymbol>() != &port) continue;
-    const auto *expr = connection->getExpression();
-    if (expr) if (const auto *assignment = expr->as_if<slang::ast::AssignmentExpression>())
-      return &assignment->left();
-    return expr;
-  }
-  return nullptr;
+  const auto *connection = instance.getPortConnection(port);
+  if (!connection) return nullptr;
+  const auto *expr = connection->getExpression();
+  if (expr) if (const auto *assignment = expr->as_if<slang::ast::AssignmentExpression>())
+    return &assignment->left();
+  return expr;
 }
 const std::vector<PortMapPiece> &GetCachedPortConnectionMap(const slang::ast::Expression &expression,
     const slang::ast::InstanceSymbol &instance, TraceCompileCache &cache) {
@@ -330,7 +360,7 @@ std::vector<PortProjection> PortComposeUp(const PortProjection &current,
   for (const auto &a : current.pieces) for (const auto &b : connection) {
     if (routes.size() > kPortMapMaxPieces) return routes;
     if (a.kind != PortMapPiece::Exact) {
-      PortProjection route; route.owner = current.owner; route.owner_frame = current.owner_frame;
+      PortProjection route; route.owner = current.owner; route.owner_frame = current.owner_frame; route.connection = current.connection;
       auto piece = a; piece.kind = PortMapPiece::Unsupported;
       route.pieces.push_back(std::move(piece)); routes.push_back(std::move(route));
       continue;
@@ -339,7 +369,7 @@ std::vector<PortProjection> PortComposeUp(const PortProjection &current,
     const int64_t low = std::max(a.source_low, b.owner_low);
     const int64_t high = std::min(a.source_low + a.width, b.owner_low + b.width);
     if (low >= high) continue;
-    PortProjection route; route.owner = current.owner; route.owner_frame = current.owner_frame;
+    PortProjection route; route.owner = current.owner; route.owner_frame = current.owner_frame; route.connection = current.connection;
     auto p = b; p.owner_low = a.owner_low + low - a.source_low;
     p.source_low += low - b.owner_low; p.width = high - low;
     route.pieces.push_back(std::move(p)); routes.push_back(std::move(route));
@@ -350,7 +380,7 @@ std::vector<PortProjection> PortComposeUp(const PortProjection &current,
 PortProjection PortComposeDown(const PortProjection &current,
                                const std::vector<PortMapPiece> &connection,
                                const slang::ast::Symbol *child) {
-  PortProjection out; out.owner = current.owner; out.owner_frame = current.owner_frame;
+  PortProjection out; out.owner = current.owner; out.owner_frame = current.owner_frame; out.connection = current.connection;
   for (const auto &a : current.pieces) for (const auto &b : connection) {
     if (a.kind != PortMapPiece::Exact ||
         (b.kind != PortMapPiece::Exact && b.kind != PortMapPiece::Dependency) ||
@@ -365,10 +395,17 @@ PortProjection PortComposeDown(const PortProjection &current,
   return out;
 }
 std::optional<PortCoverage> PortLocalCoverage(const PortProjection &projection,
-                                             const ExprTraceResult &entry) {
+                                             const ExprTraceResult &entry, TraceCompileCache &cache) {
   const auto *expr = entry.selectors.empty() ? entry.expr : entry.selectors.front();
   if (expr == nullptr) return std::nullopt;
-  const auto reference = PortResolveReference(*expr);
+  const auto *body = entry.trace_body ? entry.trace_body : GetContainingInstance(entry.symbol);
+  PortStaticRef reference;
+  if (body) {
+    auto &memo = GetOrCreateBodyTraceCache(*body, cache).static_refs;
+    auto it = memo.find(expr);
+    if (it == memo.end()) it = memo.emplace(expr, PortResolveReference(*expr)).first;
+    reference = it->second;
+  } else reference = PortResolveReference(*expr);
   if (!reference.valid || !reference.type->isIntegral()) return std::nullopt;
   const int64_t width = PortPackedWidth(*reference.type);
   if (width <= 0) return std::nullopt;
@@ -385,5 +422,115 @@ std::optional<PortCoverage> PortLocalCoverage(const PortProjection &projection,
 MappedPortTraceResult PortMappingMarker(const PortProjection &projection,
                                          const slang::ast::PortSymbol *port,
                                          bool constant, bool unresolved) {
-  return {port, PortProjectionCoverage(projection), constant, unresolved, projection.owner};
+  auto coverage = PortProjectionCoverage(projection);
+  if (coverage.empty() && (constant || unresolved)) coverage.emplace_back(0, 0);
+  return {port, std::move(coverage), constant, unresolved, projection.owner, projection.connection};
+}
+
+// The bound output assignment retains the formal-side conversion. Widened
+// signed outputs use the conservative hop; unsigned upper bits are constants.
+struct PortOutputConversion {
+  int64_t formal = 0, actual = 0;
+  bool signed_widening = false, zero_widening = false, unsupported = false;
+};
+PortOutputConversion PortInspectOutput(const slang::ast::InstanceSymbol &instance,
+                                      const slang::ast::PortSymbol &port) {
+  PortOutputConversion result;
+  if (port.direction != slang::ast::ArgumentDirection::Out) return result;
+  const auto *connection = instance.getPortConnection(port);
+  const auto *expression = connection ? connection->getExpression() : nullptr;
+  const auto *assignment = expression ? expression->as_if<slang::ast::AssignmentExpression>() : nullptr;
+  if (!assignment) { result.unsupported = true; return result; }
+  const auto *formal = &assignment->right();
+  if (const auto *conversion = formal->as_if<slang::ast::ConversionExpression>()) formal = &conversion->operand();
+  if (formal->kind != slang::ast::ExpressionKind::EmptyArgument) { result.unsupported = true; return result; }
+  result.formal = PortPackedWidth(*formal->type);
+  result.actual = PortPackedWidth(*assignment->left().type);
+  if (!result.formal || !result.actual) { result.unsupported = true; return result; }
+  result.signed_widening = result.actual > result.formal && formal->type->isSigned();
+  result.zero_widening = result.actual > result.formal && !formal->type->isSigned();
+  return result;
+}
+std::vector<PortMapPiece> PortBoundConnectionMap(const slang::ast::InstanceSymbol &instance,
+                                               const slang::ast::PortSymbol &port,
+                                               const slang::ast::Expression &actual,
+                                               TraceCompileCache &cache) {
+  auto map = GetCachedPortConnectionMap(actual, instance, cache);
+  const auto conversion = PortInspectOutput(instance, port);
+  if (conversion.formal && !conversion.unsupported) {
+    // Only low formal bits flow through an output narrowing or zero extension.
+    std::vector<PortMapPiece> clipped;
+    for (auto piece : map) {
+      const int64_t end = std::min(piece.owner_low + piece.width, conversion.formal);
+      if (piece.owner_low < end) { piece.width = end - piece.owner_low; clipped.push_back(std::move(piece)); }
+    }
+    return clipped;
+  }
+  return map;
+}
+std::vector<PortMapPiece> PortInternalMap(const slang::ast::PortSymbol &port,
+                                        TraceCompileCache &cache) {
+  if (const auto *expression = port.getInternalExpr()) {
+    const auto *body = GetContainingInstance(&port);
+    if (!body) return {};
+    auto &maps = GetOrCreateBodyTraceCache(*body, cache).port_maps;
+    auto it = maps.find(expression);
+    if (it == maps.end()) it = maps.emplace(expression, PortBuildExpressionMap(*expression, port)).first;
+    return it->second;
+  }
+  const auto *value = port.internalSymbol ? port.internalSymbol->as_if<slang::ast::ValueSymbol>() : nullptr;
+  const auto width = value ? PortPackedWidth(value->getType()) : 0;
+  return width ? std::vector<PortMapPiece>{{PortMapPiece::Exact, port.internalSymbol, nullptr, 0, 0, width, {}}}
+               : std::vector<PortMapPiece>{};
+}
+bool PortInternalIsIdentity(const slang::ast::PortSymbol &port) { return port.getInternalExpr() == nullptr && port.internalSymbol != nullptr; }
+void MarkApproximateTrace(TraceResult &result, const PortCoverage &coverage = {}) {
+  if (auto *expression = std::get_if<ExprTraceResult>(&result)) {
+    expression->mapping_approximate = true; expression->port_query_coverage = coverage;
+  } else if (auto *port = std::get_if<const slang::ast::PortSymbol *>(&result)) {
+    result = MappedPortTraceResult{*port, coverage, false, false, *port, nullptr, true};
+  }
+}
+
+const slang::ast::PortSymbol *PortImagePort(const slang::ast::PortSymbol &port,
+    const slang::ast::InstanceBodySymbol &representative, const slang::ast::InstanceBodySymbol &image) {
+  const auto rep = representative.getPortList(), actual = image.getPortList();
+  for (size_t i = 0; i < rep.size() && i < actual.size(); ++i) {
+    if (rep[i] == &port) return actual[i]->as_if<slang::ast::PortSymbol>();
+    const auto *group = rep[i]->as_if<slang::ast::MultiPortSymbol>();
+    const auto *image_group = actual[i]->as_if<slang::ast::MultiPortSymbol>();
+    if (!group || !image_group || group->ports.size() != image_group->ports.size()) continue;
+    for (size_t j = 0; j < group->ports.size(); ++j) if (group->ports[j] == &port) return image_group->ports[j];
+  }
+  return nullptr;
+}
+
+std::optional<MappedPortTraceResult> PortApproximateBoundary(const PortProjection &projection) {
+  const auto *value = projection.owner ? projection.owner->as_if<slang::ast::ValueSymbol>() : nullptr;
+  if (!value) return std::nullopt;
+  if (const auto *back = value->getFirstPortBackref())
+    return MappedPortTraceResult{back->port, PortProjectionCoverage(projection), false, false, value, nullptr, true};
+  return std::nullopt;
+}
+// A legacy local access that is statically outside the known actual slice is
+// already disproved. Keep unknown accesses and actual legacy child routes.
+bool PortKeepLegacyResult(const PortProjection &projection, const TraceResult &result,
+                          TraceCompileCache &cache) {
+  const auto *expression = std::get_if<ExprTraceResult>(&result);
+  if (!expression) return true;
+  // An unsupported concat chunk still has an exact bound AST dependency
+  // union. Do not pull in a statically disconnected neighboring chunk.
+  std::unordered_set<const slang::ast::Symbol *> possible_sources;
+  bool bounded_expression = false;
+  for (const auto &piece : projection.pieces) if (piece.kind == PortMapPiece::Unsupported && piece.expr) {
+    bounded_expression = true;
+    piece.expr->visitSymbolReferences([&](const auto &, const auto &symbol) {
+      if (IsTraceable(&symbol)) possible_sources.insert(&symbol);
+    });
+  }
+  if (bounded_expression && !possible_sources.contains(expression->symbol)) return false;
+  if (std::none_of(projection.pieces.begin(), projection.pieces.end(),
+                  [&](const auto &p) { return p.source == expression->symbol; })) return true;
+  const auto possible = PortLocalCoverage(projection, *expression, cache);
+  return !possible || !possible->empty();
 }
