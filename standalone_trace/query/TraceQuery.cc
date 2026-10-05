@@ -50,25 +50,12 @@ std::vector<EndpointRecord> FindFallbackDriverEndpoints(TraceSession &session, u
 }
 
 std::optional<TraceRunResult> TryRunGlobalNetFastPath(const TraceDb &db, const TraceOptions &opts) {
+  // Compact global sinks include registers that depend on a clock or reset.
+  // The reverse map is not a driver map. Compaction preserves driver lists,
+  // so use those lists to retain the actual assignments, including clock and
+  // reset registers whose names happen to match the global-net heuristic.
+  if (opts.mode == "drivers") return std::nullopt;
   TraceRunResult result;
-  if (opts.mode == "drivers") {
-    if (!LooksLikeClockOrResetName(opts.root_signal)) return std::nullopt;
-    const auto it = db.global_sink_to_source.find(opts.root_signal);
-    if (it == db.global_sink_to_source.end()) return std::nullopt;
-    EndpointRecord e;
-    e.kind = EndpointKind::kExpr;
-    e.path = it->second;
-    const auto git = db.global_nets.find(it->second);
-    if (git != db.global_nets.end()) {
-      e.assignment_text = "global-" + git->second.category + "-source";
-    } else {
-      e.assignment_text = "global-net-source";
-    }
-    result.endpoints.push_back(std::move(e));
-    result.visited_count = 1;
-    return result;
-  }
-
   const auto it = db.global_nets.find(opts.root_signal);
   if (it == db.global_nets.end()) return std::nullopt;
   result.endpoints.reserve(it->second.sinks.size());

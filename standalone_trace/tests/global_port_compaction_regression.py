@@ -49,6 +49,36 @@ def main():
         assert 'mismatched_lists=0' in verified.stdout, verified.stdout
         print('PASS: high-fanout global fixture canonical on/off bytes and VERIFY match')
 
+        driver_source = args.source_dir.resolve() / 'tests/fixtures/global_driver_compaction.sv'
+        driver_db = root/'drivers.db'
+        run(binary, ['compile', '--db', driver_db, '--single-unit', driver_source,
+                     '--top', 'global_driver_top'])
+        driver_records = read_db(driver_db)
+        fields = ('first_vf_offset', 'tx_eq_rx_preset_hint', 'pclk', 'aclk',
+                  'rst_n', 'rstn', 'resetn', 'core_rst_n_int')
+        source_lines = driver_source.read_text().splitlines()
+        for source_name in ('global_driver_top.clk', 'global_driver_top.core_rst_n'):
+            assert source_name in driver_records['globals'], driver_records['globals'].keys()
+            sinks = driver_records['globals'][source_name][1]
+            assert len(sinks) >= 1024, (source_name, len(sinks))
+            for field in fields:
+                assert 'global_driver_top.g[0].u.'+field in sinks, (source_name, field)
+        for index in (0, 1099):
+            for field in fields:
+                signal = f'global_driver_top.g[{index}].u.{field}'
+                answer = json.loads(run(binary, ['trace', '--db', driver_db, '--signal', signal,
+                                                 '--mode', 'drivers', '--cone-level', '1',
+                                                 '--format', 'json']).stdout)
+                expected = {(line, text.strip().rstrip(';')) for line, text in enumerate(source_lines, 1)
+                            if text.strip().startswith(field+' <=')}
+                actual = {(e['line'], e['assignment']) for e in answer['endpoints']}
+                assert actual == expected and len(answer['endpoints']) == 2, (signal, answer)
+                assert not answer['diagnostics'], (signal, answer)
+                assert all(s['reason'] == 'cone_limit' for s in answer['stops']), (signal, answer)
+                assert all(e['path'] == signal and not e['bit_map_approximate']
+                           for e in answer['endpoints']), (signal, answer)
+        print('PASS: 16 compact-global register driver queries retain exactly 32 assignment endpoints')
+
 
 if __name__ == '__main__':
     main()
