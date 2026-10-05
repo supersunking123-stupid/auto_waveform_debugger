@@ -64,6 +64,32 @@ def main():
         assert 'SEMANTICS_EPOCH:18\n' in Path(str(db)+'.meta').read_text()
         print('PASS: forwarded routes across distinct canonical parent connections; canonical on/off bytes, VERIFY and epoch18 match')
 
+        source = args.source_dir.resolve() / 'tests/fixtures/canonical_bodies/dangling_concat_loads.sv'
+        for canonical in ('0', '1'):
+            db = root / ('dangling' + canonical + '.db')
+            compiled = run(binary, ['compile', '--db', db, '--single-unit', source,
+                                   '--top', 'dangling_concat_loads'],
+                           {'RTL_TRACE_CANONICAL_BODIES': canonical,
+                            'RTL_TRACE_CANONICAL_VERIFY': '1'})
+            if canonical == '1':
+                assert 'mismatched_lists=0' in compiled.stdout, compiled.stdout
+            expected = {
+                '': [('expr', 'used', 8), ('port', 'dangling', 4), ('port', 'dangling_chk', 5)],
+                '[0]': [('expr', 'used', 8)],
+                '[1]': [('port', 'dangling', 4)],
+                '[2]': [('port', 'dangling_chk', 5)],
+            }
+            for suffix, entries in expected.items():
+                body = json.loads(run(binary, ['trace', '--db', db, '--mode', 'loads',
+                    '--signal', 'dangling_concat_loads.stage.m_data' + suffix,
+                    '--cone-level', '1', '--format', 'json']).stdout)
+                assert not body['diagnostics'], body
+                actual = sorted((e['kind'], e['path'].removeprefix('dangling_concat_loads.'),
+                                 e['line']) for e in body['endpoints'])
+                assert actual == sorted(entries), body
+                assert all(not e['bit_map_approximate'] for e in body['endpoints']), body
+        print('PASS: 8 exact concatenation load queries retain terminal ports beside logic and omit crossed ports')
+
 
 if __name__ == '__main__':
     main()

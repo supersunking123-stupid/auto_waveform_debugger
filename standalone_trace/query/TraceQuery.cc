@@ -421,9 +421,12 @@ TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
   result.visited_count = visited_signals.size();
   result.endpoints = logic_endpoints.empty() ? unresolved_ports : logic_endpoints;
   if (!logic_endpoints.empty()) for (const auto &port : unresolved_ports)
-    if (port.bit_map_approximate && (!fallback_port_sources_known ||
+    // Exact load ports are terminal sinks, even when another concatenation
+    // chunk reaches logic. Ports crossed during traversal were not collected.
+    if ((!is_drivers_mode && !port.bit_map_approximate) ||
+        (port.bit_map_approximate && (!fallback_port_sources_known ||
         fallback_root_ports.contains(EndpointPath(db,port)) ||
-        fallback_port_sources.contains(EndpointPath(db,port)))) result.endpoints.push_back(port);
+        fallback_port_sources.contains(EndpointPath(db,port))))) result.endpoints.push_back(port);
   std::sort(result.endpoints.begin(), result.endpoints.end(),
             [&](const EndpointRecord &a, const EndpointRecord &b) {
               auto score = [&](const EndpointRecord &e) -> int {
