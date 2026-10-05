@@ -36,7 +36,7 @@ def main():
   def query(b,db,s):return json.loads(run(b,['trace','--db',db,'--mode','drivers','--signal',s,'--format','json']).stdout)
   union_count=check_packed_union(binary,a.source_dir,tmp,query);count+=union_count
   if a.baseline_bin:
-   db=tmp/'A.db';run(a.baseline_bin.resolve(),['compile','--db',db,'--single-unit',source,'--top','struct_boundary_repro']);baseline=query(a.baseline_bin.resolve(),db,root)['endpoints']
+   db=tmp/'A.db';run(a.baseline_bin.resolve(),['compile','--db',db,'--single-unit',source,'--top','struct_boundary_repro']);baseline=[e for e in query(a.baseline_bin.resolve(),db,root)['endpoints'] if e['kind']=='port' and e['path']==root and not e['bit_map_approximate']]
   for canon in ('0','1'):
    for cache in ('0','1'):
     db=tmp/f'{canon}{cache}.db';env={'RTL_TRACE_CANONICAL_BODIES':canon,'RTL_TRACE_BODY_CACHE':cache,'RTL_TRACE_CANONICAL_VERIFY':'1'}
