@@ -285,30 +285,54 @@ a regression test with the exact expected answer.
    Whole load results now retain unexpanded exact terminal ports. Crossed ports
    keep their existing handling. A small concatenation fixture checks exact whole
    and bit answers.
-6. **A nested select chain carries a selector into the next step.** It produces
-   an extra endpoint, for example `[..][N-1:0]][2:0]` at
-   `tl_tx_credit_reserve_req_to_ack.vp:80`. Low impact; deferred with P2.
+### Round 2 (planned 2026-10-05, on main f74f499)
 
-### P2: imprecise answers (deferred until P1 is merged)
+Rechecked on main with small repros in `/tmp/bugfix_repros/` (`misc.sv`,
+`dyn.sv`, `st.sv`, `nest.sv`).
 
-These return a superset or a port-only fallback where an exact answer is possible.
+**Fix (missing or noisy answers):**
 
-7. Inout ports: `drivers io.b` returns only the port (`misc.sv`, `leafio`).
-8. Unpacked-array port connections (`.d(arr[1:2])`, `.d('{arr[3], arr[0]})`)
-   fall back to the port (`misc.sv`, `ua`/`ub`).
-9. A member of a packed-array element (`.d(pa[0].b)`) falls back (`dyn.sv`, `u4`).
-10. Replication, streaming, cast and multi-bit `?:` connections return the whole
-    source as a superset (`sel2.sv`).
-11. Expression connections are handled inconsistently. `&`/`|` masks also list
-    deeper drivers as approximate, while `.enable_in(!pop_empty)` stops at the
-    expression.
-12. Through a concatenation connection (`core_clk_i[g1]` at
-    `cpcs_msg_blk_top.vp:5461`), the endpoint has an empty `bit_map` and does
-    not name the lane bit.
-13. Through a parent part-select, the `bit_map` shows the whole LHS slice, for
-    example `[4:0]` for bit `[2]`.
-14. The child port declaration is listed beside an exact mapped writer. Show it
-    only on the fallback path.
+6. **Inout port drivers miss the parent side.** `drivers misc.u_io.b` returns
+   only the child `b = en ? o : 'z` (line 2). It should also return the parent
+   `io = !en ? i0 : 'z` (line 10). `drivers misc.io` is already correct.
+7. **A member of a packed-array element gives only the port.** For
+   `.d(pa[0].b)`, `drivers dyn.u4.d` returns the port with no source. It should
+   return `pa[0].b = i1` (line 20). An approximate `pa` superset is acceptable.
+   `loads dyn.pa` also misses `u4`.
+8. **Load queries list sites twice, and add other bits.** `loads misc.i0[1]`
+   returns most sites twice, once exact and once approximate. It also adds
+   `arr[0] = i0[0]` (line 12) and `u_and.d` as approximate, although they read
+   only `i0[0]`. Each site should appear once. An approximate fallback should not
+   re-add a site that the exact pass already answered or filtered out.
+9. **Union member paths are not queryable.** `st.un.p.l` and `st.un.w` give
+   "Signal not found", while packed-struct member paths work. Expected: the
+   same answers as the matching bit slice of `st.un`.
+
+**Confirm on Lumion first (Claude, one compile).** These no longer reproduce in
+small cases. Drop each one that does not reproduce on Lumion.
+- Expression connections are inconsistent: `.enable_in(!pop_empty)` stopped at
+  the expression. In small cases, `!a` and `a & b` now both give the source.
+- A concatenation connection has an empty `bit_map`: `core_clk_i[g1]` at
+  `cpcs_msg_blk_top.vp:5461`. In small cases, `u_cat.d[3]` now gives `w[5]`.
+- The child port declaration is listed beside an exact writer.
+- The nested select-chain leak at `tl_tx_credit_reserve_req_to_ack.vp:80`
+  (16 records). `nest.sv` is correct.
+
+Fixed already: a parent part-select now gives the exact bit (`u_ps.d` gives
+`ps[2]`), and casts map exactly.
+
+**Leave as is (correct approximate supersets, flagged `~`).** These are safe
+answers for an agent. The exact mapping would need new per-construct logic for
+rare constructs.
+- Unpacked-array port connections (`.d(arr[1:2])`, `.d('{arr[3], arr[0]})`)
+  give the whole `arr`.
+- Replication, streaming and multi-bit `?:` connections give the whole source.
+- A dynamic index (`x[idx] <= v`) gives the whole write.
+
+Acceptance, as in round 1: existing CTest, `run_all_tests`, the 8 Python
+modules, a regression with the exact answer per bug, one Lumion VERIFY, and the
+72-query corpus with each difference explained in a line. No new verification
+tooling.
 
 ### Not planned
 
