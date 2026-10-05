@@ -259,16 +259,17 @@ a regression test with the exact expected answer.
 
 ### P1: wrong or missing answers
 
-1. **Bit queries on a vector with a nonzero LSB return nothing.** For
-   `logic [5:2] q`, both `loads q[2]` and `loads q[5]` give 0 endpoints;
-   `logic [1:1] p` gives the same for `p[1]`. The whole-signal query reports
-   `bits [0]`. This existed before item 5. Common on Lumion, for example
+1. **Load bit queries on a vector with a nonzero LSB miss or mismatch.** Load
+   records store the select as an offset from bit 0 (`q[3:2]` on `logic [5:2] q`
+   is stored as `[1:0]`), but queries use declared indices. So `loads q[2]`
+   returns nothing and the out-of-range `loads q[1]` matches; `logic [1:1] p`
+   gives nothing for `p[1]`. Drivers are correct. This existed before item 5. Common on Lumion, for example
    `p_stage_wctrl_par_o[W-1:1]` at `axi_slave_w.vp:187/345`. Repro: `lsb.sv`.
 2. **An out-of-range bit on a 1-D vector returns loads silently.** `loads v[9]`
    on `logic [7:0] v` returns `y = v` with no diagnostic. Struct members already
    give `axis_out_of_bounds`; plain vectors should too. Repro: `v.sv`.
 3. **Register drivers can collapse to a global clock or reset source.**
-   Reported, not yet confirmed: `drivers link_sm_mod.tx_eq_rx_preset_hint`
+   Reported, not yet confirmed (confirm first; drop it if it does not reproduce): `drivers link_sm_mod.tx_eq_rx_preset_hint`
    (`link_sm.vp:1093`, written in a large state-machine `always` block) returns
    only `core_rst_n_int`; `reg_top_i.first_vf_offset` returns only
    `reg_clk_cntl`. Confirm on Lumion first, then reduce to a small repro.
@@ -277,12 +278,15 @@ a regression test with the exact expected answer.
    nothing and give no stop. Before item 6 the port query at least returned the
    port endpoint. Repro: `st.sv` (`u_un`, `u_un2`, `un`).
 5. **Whole-concatenation port loads drop dangling 1-bit port endpoints.** The
-   bit query returns them. Example: `sel0_hls_stage_r.m_data`.
+   bit query returns them. Example: `sel0_hls_stage_r.m_data`. Reported; confirm
+   first.
 6. **A nested select chain carries a selector into the next step.** It produces
    an extra endpoint, for example `[..][N-1:0]][2:0]` at
-   `tl_tx_credit_reserve_req_to_ack.vp:80`. Low impact.
+   `tl_tx_credit_reserve_req_to_ack.vp:80`. Low impact; deferred with P2.
 
-### P2: imprecise answers (a superset or a port-only fallback where an exact answer is possible)
+### P2: imprecise answers (deferred until P1 is merged)
+
+These return a superset or a port-only fallback where an exact answer is possible.
 
 7. Inout ports: `drivers io.b` returns only the port (`misc.sv`, `leafio`).
 8. Unpacked-array port connections (`.d(arr[1:2])`, `.d('{arr[3], arr[0]})`)
@@ -307,9 +311,10 @@ a regression test with the exact expected answer.
 - Compile-cost tuning (the item-6 port-mapping overhead, about +5 s) is
   deferred, because performance is good enough now.
 
-Acceptance for every fix: existing CTest, `run_all_tests`, the Python tests, a
-new regression per bug, one Lumion VERIFY compile, and the 72-query corpus with
-each difference explained in a line. No new verification tooling.
+Scope of the first round: P1 #1-#5 only. Acceptance: existing CTest,
+`run_all_tests`, the Python tests, a new regression per bug, one Lumion VERIFY
+compile, and the 72-query corpus with each difference explained in a line. No
+new verification tooling.
 
 ## Done / dropped
 
