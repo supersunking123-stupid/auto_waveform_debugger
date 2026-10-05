@@ -5,7 +5,7 @@ Current numbers and how to reproduce them: `COMPILE_BENCHMARK.md` and `BENCHMARK
 Any change to the compile path must produce a DB that is `cmp`-identical to the previous one
 (or come with an explicit, documented DB change).
 
-Items 5 visible and A are merged into main. Item 6 remains on its review branch.
+Items 5 (visible and A) and 6 are merged into main.
 
 ## 2. Endpoint merge — done, option A (see "Done / dropped")
 
@@ -187,8 +187,7 @@ default against `=0`).
 
 ## 5. Item-5 experiments — merged into main
 
-Items `item5-visible` and `item5-e3a` are merged into main. Item 6 remains
-on its review branch.
+Items `item5-visible`, `item5-e3a` and item 6 are merged into main.
 
 - **E1 retained:** all 27 test scripts use the project Python runtime.
 - **E2 discarded on Lumion:** eight tracing threads cost +6.4 s wall and
