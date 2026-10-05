@@ -1076,6 +1076,46 @@ def main():
         expected_selected = "[2]"
         if a2_loads != [(16, expected_selected), (20, expected_selected)]:
             raise AssertionError(f"endpoint merge (a[2] loads): got {a2_loads}")
+        # Packed unions use the same physical member slices as packed structs.
+        union_source = tmpdir / 'packed_union_members.sv'
+        union_source.write_text('''typedef struct packed { logic [1:0] x; logic [1:0] y; } in_t;
+typedef struct packed { in_t i; logic [3:0] c; } out_t;
+typedef union packed { logic [7:0] w; struct packed {logic [3:0] h; logic [3:0] l;} p; } un_t;
+module st(input logic [3:0] i0,i1,i2,i3);
+  out_t s;
+  assign s.i.x = i0[1:0];
+  assign s.i.y = i1[1:0];
+  assign s.c = i2;
+  un_t un;
+
+
+  assign un.p.h = i3;
+  assign un.p.l = i0;
+endmodule
+''')
+        union_db = tmpdir / 'packed_union_members.db'
+        run_cmd([str(rtl_trace), 'compile', '--db', str(union_db), '--single-unit',
+                 str(union_source), '--top', 'st'])
+        for signal, expected in (
+            ('st.un.p.l', [13]), ('st.un.p.h', [12]),
+            ('st.un.w', [12, 13]), ('st.un.w[5]', [12]),
+            ('st.s.c', [8]), ('st.s.c[2]', [8]), ('st.s.i', [6, 7]),
+        ):
+            payload = run_trace_json(rtl_trace, union_db, 'drivers', signal)
+            endpoints = payload['endpoints']
+            assert sorted(e['line'] for e in endpoints) == expected, (signal, payload)
+            assert all(e['kind'] == 'expr' and not e['bit_map_approximate'] for e in endpoints), (signal, payload)
+        union_off = tmpdir / 'packed_union_members_off.db'
+        run_cmd([str(rtl_trace), 'compile', '--db', str(union_off), '--single-unit',
+                 str(union_source), '--top', 'st'], env={'RTL_TRACE_CANONICAL_BODIES': '0'})
+        assert union_off.read_bytes() == union_db.read_bytes()
+        union_verify = run_cmd([str(rtl_trace), 'compile', '--db', str(tmpdir / 'packed_union_verify.db'),
+            '--single-unit', str(union_source), '--top', 'st'], env={'RTL_TRACE_CANONICAL_VERIFY': '1'})
+        assert 'mismatched_lists=0' in union_verify.stdout, union_verify.stdout
+        union_summary = next(line for line in union_verify.stdout.splitlines()
+                             if line.startswith('[Canon] verify '))
+        assert int(union_summary.split('signals=', 1)[1].split()[0]) > 0, union_summary
+
         # ===== BEGIN find_fastpath tests (parallel top-k find / literal prefilter / suggestions) =====
         run_find_fastpath_tests(rtl_trace, db, tmpdir)
         # ===== END find_fastpath tests =====

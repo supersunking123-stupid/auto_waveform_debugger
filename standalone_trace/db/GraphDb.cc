@@ -2758,12 +2758,21 @@ void CollectTraceableSymbols(const slang::ast::RootSymbol &root,
 
 // --- Struct member decomposition (Level 2) ---
 
+const slang::ast::Scope *PackedMemberScope(const slang::ast::Type &type) {
+  const auto &canonical = type.getCanonicalType();
+  if (const auto *structure = canonical.as_if<slang::ast::PackedStructType>()) return structure;
+  if (const auto *union_type = canonical.as_if<slang::ast::PackedUnionType>();
+      union_type && !union_type->isTagged && !union_type->isSoft) return union_type;
+  return nullptr;
+}
+
 void DecomposePackedStructFields(std::vector<SignalCompileItem> &signals,
                                   std::vector<std::string> &paths,
                                   uint32_t parent_idx,
                                   int max_depth,
                                   int current_depth,
-                                  uint64_t cumulative_offset) {
+                                  uint64_t cumulative_offset,
+                                  const slang::ast::Type *union_member_type = nullptr) {
   // Copy what we need from the parent instead of holding a reference into
   // `signals`: the push_back below can reallocate the vector, which would leave
   // a `const SignalCompileItem&` dangling for the next loop iteration.
@@ -2775,13 +2784,10 @@ void DecomposePackedStructFields(std::vector<SignalCompileItem> &signals,
   const auto *vs = parent_sym->as_if<slang::ast::ValueSymbol>();
   if (vs == nullptr) return;
 
-  const slang::ast::Type &canonical = vs->getType().getCanonicalType();
-  if (canonical.kind != slang::ast::SymbolKind::PackedStructType) return;
-
-  const auto *pst = canonical.as_if<slang::ast::PackedStructType>();
-  if (pst == nullptr) return;
-  const slang::ast::Scope &scope = *pst;
-  for (const auto &field : scope.membersOfType<slang::ast::FieldSymbol>()) {
+  const auto &canonical = (union_member_type ? *union_member_type : vs->getType()).getCanonicalType();
+  const auto *scope = PackedMemberScope(canonical);
+  if (!scope) return;
+  for (const auto &field : scope->membersOfType<slang::ast::FieldSymbol>()) {
     const uint64_t field_offset = cumulative_offset + field.bitOffset;
     const slang::ast::Type &field_type = field.getType().getCanonicalType();
     const uint64_t field_width = field_type.getBitWidth();
@@ -2798,10 +2804,12 @@ void DecomposePackedStructFields(std::vector<SignalCompileItem> &signals,
     signals.push_back(item);
     paths.push_back(parent_path + "." + std::string(field.name));
 
-    // Recurse into nested packed structs
-    if (current_depth < max_depth &&
-        field_type.kind == slang::ast::SymbolKind::PackedStructType) {
-      DecomposePackedStructFields(signals, paths, child_idx, max_depth, current_depth + 1, field_offset);
+    if (current_depth < max_depth && PackedMemberScope(field_type)) {
+      // Union alternatives can contain structs. Walk their actual member
+      // types while keeping the existing struct decomposition rows stable.
+      const bool union_path = union_member_type || canonical.isPackedUnion() || field_type.isPackedUnion();
+      DecomposePackedStructFields(signals, paths, child_idx, max_depth, current_depth + 1, field_offset,
+                                  union_path ? &field_type : nullptr);
     }
   }
 }
@@ -2818,7 +2826,7 @@ void DecomposeStructMembers(std::vector<SignalCompileItem> &signals, std::vector
     if (vs == nullptr) continue;
 
     const slang::ast::Type &canonical = vs->getType().getCanonicalType();
-    if (canonical.kind != slang::ast::SymbolKind::PackedStructType) continue;
+    if (!PackedMemberScope(canonical)) continue;
 
     DecomposePackedStructFields(signals, paths, static_cast<uint32_t>(i), max_depth, 1, 0);
   }
@@ -3227,7 +3235,7 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
       const auto parent_type = member_types.find(parent);
       const auto *type = parent_type != member_types.end() ? parent_type->second :
                          value ? &value->getType() : nullptr;
-      const auto *packed = type ? type->getCanonicalType().as_if<slang::ast::PackedStructType>() : nullptr;
+      const auto *packed = type ? PackedMemberScope(*type) : nullptr;
       if (packed) {
         const std::string_view field_name = std::string_view(signal_paths[i]).substr(signal_paths[parent].size() + 1);
         const auto *field = packed->find(field_name);
@@ -3599,7 +3607,7 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
         suffix.remove_prefix(1);
         const size_t end = suffix.find('.');
         const auto name = suffix.substr(0, end);
-        const auto *structure = type->getCanonicalType().as_if<slang::ast::PackedStructType>();
+        const auto *structure = PackedMemberScope(*type);
         const auto *field = structure ? structure->find(name) : nullptr;
         const auto *member = field ? field->as_if<slang::ast::FieldSymbol>() : nullptr;
         if (!member) { verified = false; break; }
