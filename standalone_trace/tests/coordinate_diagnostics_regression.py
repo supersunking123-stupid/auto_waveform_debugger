@@ -29,7 +29,7 @@ def trace(binary, db, signal, mode='loads', expected=0, text=False):
 
 def footer(data):
     h = struct.unpack_from('<16sII15Q', data)
-    assert h[1] == 6 and h[2] in (1, 3, 15), h[:3]
+    assert h[1] == 6 and h[2] in (1, 3, 15, 31), h[:3]
     pos = 144 + 4 * (h[3] + 1) + h[4]
     pos += sum(n * size for n, size in zip(h[5:], (32, 48, 4, 12, 4, 12, 4, 12, 4, 24, 4, 16, 4)))
     count = struct.unpack_from('<Q', data, pos)[0]
@@ -116,9 +116,23 @@ def main():
             assert multi['diagnostics'][-1]['code'] == 'unsupported_struct_member_axes'
             trace(binary, db, 'coordinate_diagnostics.member_packet.matrix', mode)
             trace(binary, db, 'coordinate_diagnostics.member_packet.vector[2]', mode)
-        assert struct.unpack_from('<I', data, 20)[0] == 15
+        assert struct.unpack_from('<I', data, 20)[0] == 31
         round2 = root / 'round2_features.db'
-        round2_data = bytearray(data); struct.pack_into('<I', round2_data, 20, 1)
+        # Historical feature1 DBs stored only multidimensional declarations.
+        # Rebuild that sparse footer instead of relabeling new vector rows.
+        round2_data = bytearray(data[:start])
+        old_rows, old_axes = [], bytearray()
+        for index in range(rows_count):
+            signal_id, axis_begin, axis_count, flags = struct.unpack_from('<4I', data, rows_start + index * 16)
+            if axis_count < 2:
+                continue
+            old_rows.append(struct.pack('<4I', signal_id, len(old_axes) // 12, axis_count, flags))
+            old_axes.extend(data[axes_count_pos + 8 + axis_begin * 12:axes_count_pos + 8 + (axis_begin + axis_count) * 12])
+        round2_data.extend(struct.pack('<Q', len(old_rows)))
+        round2_data.extend(b''.join(old_rows))
+        round2_data.extend(struct.pack('<Q', len(old_axes) // 12))
+        round2_data.extend(old_axes)
+        struct.pack_into('<I', round2_data, 20, 1)
         round2.write_bytes(round2_data)
         selected_member = json.loads(trace(binary, round2, 'coordinate_diagnostics.member_packet.matrix[2]', expected=1).stdout)
         assert selected_member['diagnostics'][-1]['code'] == 'legacy_multidimensional_select'
@@ -159,6 +173,8 @@ def main():
                                          ('axis_flags', axes_count_pos+8+8, '<I', 4)]:
             changed = bytearray(data); struct.pack_into(fmt, changed, offset, value); malformed.append((name, changed))
         malformed += [('truncated', data[:-1]), ('trailing', data+b'x')]
+        unflagged_vectors = bytearray(data); struct.pack_into('<I', unflagged_vectors, 20, 15)
+        malformed.append(('unflagged_vectors', unflagged_vectors))
         for name, changed in malformed:
             bad = root / (name+'.db'); bad.write_bytes(changed)
             failed = run(binary, ['find', '--db', bad, '--query', 'p'], expected=1)

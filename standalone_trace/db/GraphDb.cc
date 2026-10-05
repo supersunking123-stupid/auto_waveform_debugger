@@ -2052,7 +2052,8 @@ size_t NumericArrayAxisCount(const slang::ast::Type &root_type) {
 }
 
 // Declaration metadata is independent of observed accesses and global compaction.
-void AppendDeclaredCoordinates(GraphDb &graph, uint32_t id, const slang::ast::Type &root, bool force = false) {
+void AppendDeclaredCoordinates(GraphDb &graph, uint32_t id, const slang::ast::Type &root,
+                               bool force = false, bool retain_vector = false) {
   std::vector<GraphDeclaredAxis> axes;
   const auto *type = &root;
   uint32_t flags = root.isPackedArray() ? kCoordinatePackedOuter : 0u;
@@ -2081,9 +2082,12 @@ void AppendDeclaredCoordinates(GraphDb &graph, uint32_t id, const slang::ast::Ty
       }
     } else flags |= kCoordinateUnsupported;
   }
-  if (axes.size() < 2 && !force) return;
+  const bool vector = retain_vector && axes.size() == 1 &&
+                      (axes.front().flags & kAxisPacked) &&
+                      !(flags & kCoordinateTerminalAggregate);
+  if (axes.size() < 2 && !force && !vector) return;
   if (axes.empty() && force) axes.push_back({0, 0, kAxisFixed | kAxisPacked});
-  if (force && (axes.front().flags & kAxisPacked)) flags |= kCoordinatePackedOuter;
+  if ((force || vector) && (axes.front().flags & kAxisPacked)) flags |= kCoordinatePackedOuter;
   graph.coordinates.push_back({id, static_cast<uint32_t>(graph.declared_axes.size()),
                                static_cast<uint32_t>(axes.size()), flags});
   graph.declared_axes.insert(graph.declared_axes.end(), axes.begin(), axes.end());
@@ -2558,10 +2562,18 @@ EndpointRecord ResolveTraceResult(const TraceResult &r, const slang::SourceManag
                   rec.bit_map_approximate = true;  // exact multidimensional struct filtering is unsupported
               }
             } else {
-              // Ordinary multidimensional arrays carry logical declared-axis coordinates.
+              // Native array selects use declaration indices. Port-map records
+              // retain physical offsets for their stored coverage relations.
               const auto *value_symbol = item.symbol->template as_if<slang::ast::ValueSymbol>();
+              bool shifted_vector = false;
+              if (value_symbol && value_symbol->getType().isPackedArray() &&
+                  NumericArrayAxisCount(value_symbol->getType()) == 1 &&
+                  !item.mapping_approximate && item.port_query_coverage.empty()) {
+                const auto range = value_symbol->getType().getFixedRange();
+                shifted_vector = range.right != 0 || range.left < range.right;
+              }
               rec.bit_map_logical_axes = !item.selectors.empty() && value_symbol != nullptr &&
-                  ((!item.mapping_approximate && value_symbol->getType().isUnpackedArray()) || NumericArrayAxisCount(value_symbol->getType()) >= 2);
+                  (shifted_vector || (!item.mapping_approximate && value_symbol->getType().isUnpackedArray()) || NumericArrayAxisCount(value_symbol->getType()) >= 2);
               auto bit_desc = rec.bit_map_logical_axes
                   ? DescribeLogicalAxisSelectors(item.selectors, sm, *item.symbol)
                   : DescribeBitSelectors(item.selectors, sm, *item.symbol);
@@ -3149,7 +3161,7 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
     graph.signals[i].member_bit_width = static_cast<uint32_t>(signals[i].member_bit_width);
     if (signals[i].parent_signal_idx == std::numeric_limits<uint32_t>::max() && signals[i].sym) {
       if (const auto *value = signals[i].sym->as_if<slang::ast::ValueSymbol>())
-        AppendDeclaredCoordinates(graph, static_cast<uint32_t>(i), value->getType());
+        AppendDeclaredCoordinates(graph, static_cast<uint32_t>(i), value->getType(), false, true);
     } else if (signals[i].sym) {
       // Retain declarations for multidimensional members without changing their
       // existing absolute parent-bit endpoints. The sparse compile-only map
@@ -3510,8 +3522,8 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
   if (profile_save_graph) t_cache_clear_s += elapsed_seconds(t_cache_clear_start, Clock::now());
   dedup_scratch.Release();
   const auto t_build_end = Clock::now();
-  // One-axis declaration metadata is sparse: only mapped owners and their
-  // member rows are added. Existing multidimensional rows retain their axes.
+  // Add mapped-owner flags to existing vector and multidimensional rows.
+  // Mapped scalars and members still need their sparse declaration rows.
   const size_t old_coordinate_count = graph.coordinates.size();
   for (uint32_t id = 0; id < signals.size(); ++id) {
     uint32_t root_id = id;
@@ -3831,7 +3843,8 @@ bool SaveGraphDb(const std::string &db_path, std::vector<SignalCompileItem> &sig
   }
 
   GraphDbFileHeader header;
-  header.reserved = kDbDeclaredAxes | kDbMemberDeclaredAxes | kDbPortQueryCoverage | kDbCompactPortRoutes;
+  header.reserved = kDbDeclaredAxes | kDbMemberDeclaredAxes | kDbPortQueryCoverage |
+                    kDbCompactPortRoutes | kDbVectorDeclaredAxes;
   std::memcpy(header.magic, kGraphDbMagic, sizeof(header.magic));
   header.string_count = graph.strings.size();
   header.string_blob_size = total_str_bytes;
@@ -3904,7 +3917,8 @@ bool ValidateGraphDb(const GraphDb &graph) {
   bool first_coordinate = true;
   for (const auto &row : graph.ReadCoordinates()) {
     if (row.signal_id >= graph.ReadSignals().size() || (!first_coordinate && row.signal_id <= previous_signal) ||
-        row.axis_count < ((row.flags & kCoordinatePortMappedOwner) ? 1u : 2u) ||
+        row.axis_count < (((row.flags & kCoordinatePortMappedOwner) ||
+                          (graph.format_features & kDbVectorDeclaredAxes)) ? 1u : 2u) ||
         row.axis_begin != next_axis || (row.flags & ~0x3fu) ||
         ((row.flags & kCoordinatePortMappedOwner) && !(graph.format_features & kDbPortQueryCoverage)) ||
         ((row.flags & kCoordinateUnverifiedOwnerMember) && !(row.flags & kCoordinatePortMappedOwner)) ||
@@ -3915,6 +3929,9 @@ bool ValidateGraphDb(const GraphDb &graph) {
     previous_signal = row.signal_id;
     const auto &outer = graph.ReadDeclaredAxes()[row.axis_begin];
     if (bool(row.flags & kCoordinatePackedOuter) != bool(outer.flags & kAxisPacked)) return false;
+    if (row.axis_count == 1 && !(row.flags & kCoordinatePortMappedOwner) &&
+        (!(outer.flags & kAxisPacked) ||
+         graph.ReadSignals()[row.signal_id].parent_signal_id != std::numeric_limits<uint32_t>::max())) return false;
     next_axis += row.axis_count;
   }
   if (next_axis != graph.ReadDeclaredAxes().size()) return false;
@@ -4122,7 +4139,8 @@ bool LoadGraphDb(const std::string &db_path, GraphDb &graph, TraceDb &compat_db,
                         " (this binary reads 1-6); recompile: " + db_path;
     return false;
   }
-  if (header.version == 6 && header.reserved != 1 && header.reserved != 3 && header.reserved != 15) {
+  if (header.version == 6 && header.reserved != 1 && header.reserved != 3 &&
+      header.reserved != 15 && header.reserved != 31) {
     if (error) *error = "unsupported v6 DB feature flags " + std::to_string(header.reserved);
     return false;
   }
@@ -4603,7 +4621,8 @@ std::optional<std::vector<EndpointRecord>> SessionConstrainPortEndpoint(
     if (failed) return;
     if (axis == row->axis_count) {
       if (output.size() >= kPortMapMaxPieces) { failed = true; return; }
-      auto copy = e; copy.bit_map.clear(); copy.bit_map_logical_axes = row->axis_count > 1 || !(dims[row->axis_begin].flags & kAxisPacked);
+      auto copy = e; copy.bit_map.clear(); copy.bit_map_logical_axes = e.bit_map_logical_axes ||
+          row->axis_count > 1 || !(dims[row->axis_begin].flags & kAxisPacked);
       copy.bit_map_merged = false;
       for (auto [left,right] : prefix) copy.bit_map += FormatBitRange(left,right);
       output.push_back(std::move(copy)); return;

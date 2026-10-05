@@ -24,6 +24,79 @@ def trace(binary, db, name, mode, expected=0):
                                   'member_loads.' + name, '--format', 'json'], expected).stdout)
 
 
+def check_vector_loads(binary, source_dir, root):
+    source = source_dir / 'tests/fixtures/vector_loads.sv'
+    checks = 0
+    for top in ('vector_lsb', 'vector_bounds', 'vector_axes', 'vector_builtin', 'vector_port', 'vector_clip'):
+        db = root / (top + '.db')
+        run(binary, ['compile', '--db', db, '--single-unit', source, '--top', top])
+
+        def query(name, mode='loads', error=False):
+            nonlocal checks
+            checks += 1
+            body = json.loads(run(binary, ['trace', '--db', db, '--mode', mode,
+                              '--signal', top + '.' + name, '--format', 'json'], int(error)).stdout)
+            if error:
+                assert not body['endpoints'] and body['diagnostics'][-1]['code'] == 'axis_out_of_bounds', body
+            else:
+                assert not body['diagnostics'], body
+            return body['endpoints']
+
+        def exact(name, expected):
+            endpoints = query(name)
+            assert [(e['line'], e['bit_map'], e['assignment']) for e in endpoints] == expected, (name, endpoints)
+            assert all(not e['bit_map_approximate'] for e in endpoints), endpoints
+
+        if top == 'vector_lsb':
+            for name in ('p[1]', 'p'):
+                exact(name, [(3, '[1]', 'y = p[1]')])
+            for name in ('q[2]', 'q[3]', 'q'):
+                exact(name, [(4, '[3:2]', 'z = q[3:2]')])
+            exact('q[5]', [])
+            for mode in ('drivers', 'loads'):
+                query('q[1]', mode, error=True)
+        elif top == 'vector_bounds':
+            exact('v[3]', [(10, '', 'y = v'), (11, '[3]', 'z = v[3]')])
+            for mode in ('drivers', 'loads'):
+                query('v[9]', mode, error=True)
+        elif top == 'vector_axes':
+            for name in ('ascending[3]', 'ascending[4]', 'ascending'):
+                exact(name, [(19, '[3:4]', 'ascending_y = ascending[3:4]')])
+            for name in ('negative[-3]', 'negative[-4]', 'negative'):
+                exact(name, [(20, '[-3:-4]', 'negative_y = negative[-3:-4]')])
+            for name in ('ascending[2]', 'ascending[5]', 'negative[-2]', 'negative[-5]'):
+                exact(name, [])
+            for mode in ('drivers', 'loads'):
+                query('ascending[1]', mode, error=True)
+                query('negative[-6]', mode, error=True)
+        elif top == 'vector_builtin':
+            for name, width in (('int_value', 32), ('integer_value', 32),
+                                ('byte_value', 8), ('enum_value', 8)):
+                endpoints = query(name + '[3]')
+                assert len(endpoints) == 1 and endpoints[0]['bit_map'] == '[3]' and \
+                    endpoints[0]['assignment'].endswith(name + '[3]'), endpoints
+                for mode in ('drivers', 'loads'):
+                    query(name + '[' + str(width) + ']', mode, error=True)
+        elif top == 'vector_port':
+            for bit in (2, 3):
+                endpoints = query('q[' + str(bit) + ']')
+                native = [e for e in endpoints if e['kind'] == 'expr']
+                assert len(native) == 1 and native[0]['path'] == 'vector_port.u.d' and \
+                    native[0]['bit_map'] == '[1:0]' and \
+                    native[0]['bit_map_encoding'] == 'flat_bits' and \
+                    not native[0]['bit_map_approximate'], endpoints
+        else:
+            for bit in (2, 3):
+                endpoints = query('u.d[' + str(bit) + ']', 'drivers')
+                native = [e for e in endpoints if e['kind'] == 'expr']
+                assert len(native) == 1 and native[0]['path'] == 'vector_clip.q' and \
+                    native[0]['bit_map'] == '[' + str(bit) + ']' and \
+                    native[0]['bit_map_encoding'] == 'declared_axes' and \
+                    not native[0]['bit_map_approximate'], endpoints
+        db.unlink()
+    print(f'PASS: {checks} exact vector load and declared-bound queries cover shifted, ascending and negative axes')
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--rtl-trace', type=Path, required=True)
@@ -130,6 +203,7 @@ def main():
         verify = compile_db(binary, source, root/'verify.db', {'RTL_TRACE_CANONICAL_VERIFY': '1'})
         assert 'mismatched_lists=0' in verify.stdout
         print('PASS: canonical on/off DB bytes and VERIFY lists match')
+        check_vector_loads(binary, args.source_dir.resolve(), root)
 
 
 if __name__ == '__main__':

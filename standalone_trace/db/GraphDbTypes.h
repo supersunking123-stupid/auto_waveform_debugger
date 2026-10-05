@@ -136,6 +136,7 @@ constexpr uint32_t kDbDeclaredAxes = 0x01;
 constexpr uint32_t kDbMemberDeclaredAxes = 0x02;
 constexpr uint32_t kDbPortQueryCoverage = 0x04;
 constexpr uint32_t kDbCompactPortRoutes = 0x08;
+constexpr uint32_t kDbVectorDeclaredAxes = 0x10;
 constexpr uint32_t kCoordinatePortMappedOwner = 0x10;
 constexpr uint32_t kCoordinateUnverifiedOwnerMember = 0x20;
 constexpr uint32_t kCoordinateUnsupported = 0x02;

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise immutable DB snapshots, compatibility, and bounds before mapped access."""
 import argparse
+import json
 import os
 import select
 import struct
@@ -45,6 +46,21 @@ def run(binary, args, expected=0):
 
 def query(binary, db, args):
     return run(binary, [args[0], '--db', db, *args[1:]])
+
+
+def compare_historical(got, want, command):
+    assert got.returncode == want.returncode and got.stderr == want.stderr, command
+    if command == QUERIES[3]:
+        candidate, historical = json.loads(got.stdout), json.loads(want.stdout)
+        terminals = [e for e in candidate['endpoints'] if e['kind'] == 'port']
+        assert {e['path'] for e in terminals} == {'mapped_top.u_axes.y', 'mapped_top.y'}, terminals
+        assert len(terminals) == 2 and all(e['direction'] == 'output' and
+                                         not e['bit_map_approximate'] for e in terminals), terminals
+        candidate['endpoints'] = [e for e in candidate['endpoints'] if e['kind'] != 'port']
+        candidate['summary']['count'] -= 2
+        assert candidate == historical, (command, candidate, historical)
+    else:
+        assert got.stdout == want.stdout, (command, got.stdout, want.stdout)
 
 
 def compile_db(binary, db, source):
@@ -177,7 +193,7 @@ def main():
             got = query(binary, reference_db, command)
             if reference:
                 want = query(reference, reference_db, command)
-                assert (got.returncode, got.stdout, got.stderr) == (want.returncode, want.stdout, want.stderr)
+                compare_historical(got, want, command)
         for version in (1, 2, 3, 4, 5):
             compat = root / f'compat_v{version}.db'
             compat.write_bytes(legacy_bytes(compatibility, compatibility_sections, version))
@@ -185,9 +201,18 @@ def main():
                 got = query(binary, compat, command)
                 if reference:
                     want = query(reference, compat, command)
-                    assert (got.stdout, got.stderr) == (want.stdout, want.stderr), (version, command)
+                    compare_historical(got, want, command)
                 elif command[0] in ('find', 'trace', 'hier'):
-                    assert got.stdout == query(binary, db, command).stdout, (version, command)
+                    fresh = query(binary, db, command).stdout
+                    if command[0] == 'trace':
+                        old_body, fresh_body = json.loads(got.stdout), json.loads(fresh)
+                        # Legacy DBs have no universal vector declarations.
+                        for body in (old_body, fresh_body):
+                            body.pop('coordinate_encoding', None)
+                            body.pop('declared_axes', None)
+                        assert old_body == fresh_body, (version, command)
+                    else:
+                        assert got.stdout == fresh, (version, command)
         print('PASS: v1-v6 queries, empty v6 footer and unaligned mapped sections')
         multidim = root / 'axes.sv'
         multidim.write_text('module mapped_top(input logic [3:0][1:0] p, output logic y); assign y=p[2][1]; endmodule\n')
@@ -198,8 +223,7 @@ def main():
             got = query(binary, axes_db, command)
             if reference:
                 old_axes = root/'axes_feature3.db'
-                old_data = bytearray(axes_db.read_bytes()); struct.pack_into('<I', old_data, 20, 3)
-                old_axes.write_bytes(old_data)
+                compile_db(reference, old_axes, multidim)
                 want = query(reference, old_axes, command)
                 assert (got.stdout, got.stderr) == (want.stdout, want.stderr)
         axes_data = axes_db.read_bytes()

@@ -14,10 +14,10 @@ HEADER = struct.Struct('<16sII15Q')
 ENDPOINT = struct.Struct('<11I4B')
 
 
-def run(binary, arguments, env=None):
+def run(binary, arguments, env=None, expected=0):
     proc = subprocess.run([str(binary), *map(str, arguments)], capture_output=True, text=True,
                           timeout=45, env=None if env is None else {**os.environ, **env})
-    assert proc.returncode == 0, (arguments, proc.returncode, proc.stdout, proc.stderr)
+    assert proc.returncode == expected, (arguments, proc.returncode, proc.stdout, proc.stderr)
     return proc
 
 
@@ -38,7 +38,7 @@ def trace(binary, db, signal, extra=(), mode='drivers'):
 
 def layout(data):
     header = list(HEADER.unpack_from(data))
-    assert header[1] == 6 and header[2] in (1, 3, 15)
+    assert header[1] == 6 and header[2] in (1, 3, 15, 31)
     strings_count, blob_size, signals_count, endpoints_count = header[3:7]
     blob_start = HEADER.size + 4 * (strings_count + 1)
     offsets = struct.unpack_from('<' + 'I' * (strings_count + 1), data, HEADER.size)
@@ -218,8 +218,9 @@ def main():
             assert {e['bit_map'] for e in selected(result, lines['root_merged'])} == {bitmap}, result
             text = run(binary, ['trace', '--db', db, *trace_args(root_signal + suffix, fmt='text')[1:]]).stdout
             assert re.search(r'\bbits\s+' + re.escape(bitmap), text), text
-        disjoint = trace(binary, db, root_signal + '[20]')
-        assert not disjoint['endpoints'] and any(s['reason'] == 'bit_filter' for s in disjoint['stops'])
+        disjoint = json.loads(run(binary, ['trace', '--db', db,
+                              *trace_args(root_signal + '[20]')[1:]], expected=1).stdout)
+        assert not disjoint['endpoints'] and disjoint['diagnostics'][-1]['code'] == 'axis_out_of_bounds'
         cone = trace(binary, db, root_signal + '[2]', ('--cone-level', '3'))
         assert {e['bit_map'] for e in selected(cone, lines['root_merged'])} == {'[2]'}
         assert {e['bit_map'] for e in selected(cone, lines['deeper_merged'])} == {'[15:8]'}, cone
@@ -246,8 +247,8 @@ def main():
         print('PASS: repeated concat slice and single slice retain identical unmerged coordinates and full refs')
         print('PASS: merged 0x01, logical 0x02/0x03; root intersections; cone/port/member/logical/unmerged exclusions')
 
-        # Synthetic exact scalar coordinates cover orientations and full int32 bounds
-        # independently of the unchanged legacy frontend selector normalization.
+        # Synthetic legacy scalar coordinates cover orientations and int32 bounds
+        # independently of current declaration-bound checks.
         for label, original, suffix, expected in (
                 ('ascending', '[0:7]', '[6:3]', '[3:6]'),
                 ('signed', '[-1:-8]', '[-4:-2]', '[-2:-4]'),
@@ -257,6 +258,7 @@ def main():
             patched = root / (label + '.db')
             patched.write_bytes(db.read_bytes())
             patch_records(patched, lambda e, _: e[4] == lines['root_merged'], bitmap=original)
+            remove_coordinates(patched, root_signal)
             got = trace(binary, patched, root_signal + suffix)
             assert {e['bit_map'] for e in selected(got, lines['root_merged'])} == {expected}, got
         approximate = root / 'approximate.db'

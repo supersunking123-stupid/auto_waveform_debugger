@@ -96,7 +96,8 @@ inline bool ReadCacheHeader(int fd, GraphDbFileHeader &header, uint64_t &size) {
   }
   return std::memcmp(header.magic, kGraphDbMagic, sizeof(header.magic)) == 0 &&
          header.version >= 1 && header.version <= 6 &&
-         (header.version != 6 || header.reserved == 1 || header.reserved == 3 || header.reserved == 15);
+         (header.version != 6 || header.reserved == 1 || header.reserved == 3 ||
+          header.reserved == 15 || header.reserved == 31);
 }
 inline std::string CacheEnvelope(const GraphDbFileHeader &header, uint64_t size) {
   static constexpr char hex[] = "0123456789abcdef";
