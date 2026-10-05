@@ -382,9 +382,6 @@ pass their diagnostic requirements. The frozen ALLOW_IFACE negative-control mism
 not reproduced because existing collectors omit direct hierarchical interface references.
 The pure path test covers substitutions; end-to-end interface-reference coverage remains open.
 
-Full evidence/report: `/tmp/auto_waveform_item4_codex_report_2026-09-30.md`.
-
-
 ### Task B symbol-ID hint experiment — discarded
 
 The experiment passed a stack-local frame/representative-ID/actual-ID hint through endpoint
@@ -410,8 +407,7 @@ third baseline. All three pairs are included in this decision.
 The experiment passed CTest 4/4, test-case suite 27/27 and both six-variant sweeps 246/246.
 All Lumion timing DBs and metadata pass exact comparisons. B VERIFY also checks 3,798,275
 signals with zero mismatched lists. Restoring Task A leaves its
-validated implementation intact. The experiment patch and measurements are retained in
-`/tmp/item4_taskB_hint.patch` and `/tmp/item4_taskB_metrics.json`.
+validated implementation intact.
 
 
 ### Review fixes after Task A measurements
@@ -438,15 +434,9 @@ uniform between A and B. Thus the retention-rule result does not establish that 
 ineffective. A user-approved rerun would need a uniform predeclared contamination policy and
 three quiet-host alternating pairs after this fix. No hint was reapplied or rerun.
 
-Follow-up evidence: `/tmp/item4_fix_ctest.log`, `/tmp/item4_fix_testcases.log`,
-`/tmp/item4_fix_canon/summary.txt`, `/tmp/item4_fix_ab/summary.txt`,
-`/tmp/item4_fix_diagnostics.log`, and `/tmp/codex_item4_oracle_rerun/validation_summary.txt`.
-
 ### Item-5 experimental measurements (2026-10-01)
 
-These are isolated prototypes on the `item5-e2` and `item5-e3a` branches, not merged code.
-The full report and raw medians/min-max are in
-`/tmp/auto_waveform_item5_codex_report_20260930.md` and `/tmp/item5_logs/`.
+These measurements compare the original `item5-e2` and `item5-e3a` prototypes.
 
 Compile comparisons, as medians of candidate − base over 6 alternating pairs. The host carried
 1–4 cores of background load throughout, so the original 0.5-core quiet rule admitted no pairs.
@@ -478,16 +468,11 @@ threshold. Serve metrics stayed within the allowed regression. All 48 saved
 artifacts matched, including every serve repetition and assignment text.
 The host monitor recorded 27 samples with only desktop activity and no external
 batch job. Worker builds and tests were held during the confirmation.
-Evidence: `/tmp/item5_q_e3a_sourcecwd_warm_confirm2`,
-`/tmp/item5_logs/query_measured_summary.json` (`sourcecwd_warm_confirmation2`), and
-`/tmp/item5_logs/query_sourcecwd_warm2_noise_summary.json`.
-
 Earlier query runs from the repository root lacked assignment text because the DB
 stores relative source paths. Those timings are superseded by this confirmation.
 The source-correct cold pair and full-corpus T0 timings are diagnostic only:
 external Python jobs were present in their host records. Their output checks
-remain valid. Future full-corpus checks use the immutable patched source snapshot
-at `/tmp/item5_corpus/lumion_source_snapshot`.
+remain valid. Future full-corpus checks use the matching immutable patched source snapshot.
 
 These first-round measurements are historical. Round 3 closes the publication and
 locking fixes below. Integration into main remains with the user. The E3b indexing
@@ -496,8 +481,7 @@ experiment is closed; v6 now stores coordinate data for item 5, not a query inde
 
 ### Item-5 round 3 and item 6 (2026-10-01–02)
 
-Raw results: `/tmp/item5_round3_logs/`. These branches are stacked for review.
-No merge into main was performed. Each compile comparison uses three alternating
+These measurements preceded main integration. Each compile comparison uses three alternating
 base-first pairs with `MAX_OTHER_CPU=99`. Other host work is recorded, without a
 quiet-host exclusion rule. The limits are +5 s wall and +0.5 GiB peak RSS.
 Every timing DB is checked against its verified oracle and deleted after the check.
@@ -521,8 +505,7 @@ assignment text is populated. All nine comparisons match. The table uses medians
 from the saved query measurements. These samples ran on a loaded host; the
 1.334 s A trace median is not a quiet-host result. Claude retimed the same stack
 on a quieter host: main 1.83 s, phase 1 1.80 s, A 0.77–0.89 s, item 6
-0.63–0.77 s, and A literal find 0.19 s. These independent timings are recorded in
-`/tmp/auto_waveform_item5_round3_claude_review_2026-10-02.md`; the historical table
+0.63–0.77 s, and A literal find 0.19 s. The historical table
 below remains the measured loaded-host series.
 
 | Operation | Phase 1 wall s | A wall s | Phase 1 RSS KiB | A RSS KiB |
@@ -552,9 +535,8 @@ RSS -0.8712 GiB. Both regression limits pass. No fourth pair was needed.
 The item-6 DB is 2,356,488,063 bytes, 213,249,125 bytes smaller than A.
 Endpoints change 18,631,517 → 15,346,587 (net -3,284,930).
 Reference occurrences change 45,112,203 → 37,683,121 (net -7,429,082).
-Normal cost runs all match the verified DB and metadata hashes. Raw:
-`phase3_compile_pairs/` under the round-3 log root. VERIFY, audit, and untimed
-follow-up checks are excluded from these six samples.
+Normal cost runs all match the verified DB and metadata hashes. VERIFY, audit,
+and untimed follow-up checks are excluded from these six samples.
 
 The final 60-query comparison has one expected change in both one-shot and
 serve modes. q050 loses 48 inactive pipe-mux endpoints and 16 resulting cycle
@@ -570,12 +552,10 @@ review explains narrowed active ranges, changed reference unions, leaf fallback
 and newly exposed active paths. The final finite check finds all 4,658 unique archived coordinate keys absent
 (representing all 4,898 old archive records). It also checks the exact st_get5
 line-215 endpoints at STARTPTR_WD=2. This untimed check does not add a paired
-cost sample. Raw: `final_scalar_check/`.
+cost sample.
 
 The generic machine status remains UNRESOLVED;
 it is not a claim that each full-design replacement was independently proved.
-See `phase3_light_final/delta_accounting/` and
-`accounting/full_light_addendum/README.md` for counts and limits.
 
 The first exhaustive logger exceeded the /tmp reserve and was stopped. Its
 incomplete large files were removed after small samples were kept. A repeat
@@ -610,5 +590,68 @@ removals (q050), and removal of an intermediate output-port endpoint (q052); its
 Normal and clean-PATH runtime suites each pass 27/27; Python passes 387 with
 zero skips; CTest passes 17/17; canonical sweep passes 330/330.
 
-Final report: `/tmp/auto_waveform_item5_round4_report_20261002.md`.
-Raw evidence: `local_test_design/bench_out/item5_round4_20261002/`.
+### Item6 round5 epoch16, query reference repair (2026-10-03)
+
+The final reader candidate is source `c28f6e924b` and binary `64ebaf8645101f44`.
+The query reference identity repair changes no stored DB bytes or compile epoch.
+Exactly three base-first A/candidate Lumion pairs were measured. Each DB/meta
+matched the prior full epoch16 compile identity. All six new DBs
+were checked and deleted. No fourth pair or outlier rerun was taken.
+
+| Pair | A wall s | Item6 wall s | Paired wall delta s | A peak RSS GiB | Item6 peak RSS GiB |
+|---|---:|---:|---:|---:|---:|
+| 1 | 55.01 | 59.65 | +4.64 | 14.0267 | 13.3867 |
+| 2 | 53.95 | 59.19 | +5.24 | 14.0772 | 13.3839 |
+| 3 | 53.57 | 59.37 | +5.80 | 14.0875 | 13.3732 |
+
+Median paired delta: wall **+5.24 s**, build_graph +4.867 s, peak RSS
+-0.6933 GiB. Flag the wall increase because it exceeds +5 s. Memory does not
+exceed the +0.5 GiB threshold. Other CPU load is informational: 0.75 to 1.70
+cores across the six samples. No quiet-host rule changed the sample set.
+
+Frozen A/candidate hashes were monitored from the second baseline onward.
+The final four running executables were observed through `/proc`; hashes stayed
+unchanged. The first pair is bound by the prelaunch freeze, fixed paths and
+DB/meta identities. Its candidate callback also records the final binary hash. The first
+candidate also passes six live retention queries: all 40 active clock and 20
+active async-reset targets are retained for whole, bit0 and range0 selections.
+These post-compile queries are outside the recorded compile timing.
+
+The source-proof comparison oracle checks additions and removals against active
+source and mapped connection ranges. Compile identity and query correctness are
+separate checks. These round-5 measurements remain historical; round 6 replaces source-proof acceptance and requires
+one cost pair after the mapping and compile-cache fixes.
+
+
+### Item 6 round 6, epoch 18 (2026-10-05)
+
+The final candidate retains active input declarations beside mapped writers.
+Stored endpoint lists change, so epoch 18 forces a rebuild. The format stays v6
+with feature field 15. The finish guidance replaces source-proof acceptance
+with existing checks and reviewer sampling. No new oracle is required.
+
+The single cost pair uses the historical frozen A/main baseline. A took 61.11 s
+and 14,703,824 KiB peak RSS. The candidate took 66.54 s and 14,050,880 KiB.
+The measured delta is +5.43 s and -652,944 KiB (-0.623 GiB). Build-graph time
+changed from 34.428 s to 40.837 s. No timing reruns or noise investigation
+were made. VERIFY is a separate compile and is excluded from this cost pair.
+
+CTest passes 22/22. Normal and clean-environment runtime suites each pass 27/27.
+The Python suite passes 387 tests, with no skips. Reviewer regressions cover
+188 queries, including 28 fallback cases, in both canonical modes. The existing
+round-6 fixture regression covers 202 queries.
+
+Lumion VERIFY checks 3,798,275 signals with zero mismatched lists. All three
+compile runs have map_fail=0. The 72-query corpus matches round 5 byte for byte.
+Against frozen A, 22 queries change coordinate metadata; q050 removes inactive
+pipe-mux endpoints and q052 removes a child output-port terminal while retaining
+the filtered consumer stop. These are unchanged round-5 answers. The layer-4
+child query returns l_index_atop[4] at lines 413 and 415.
+
+The unchanged legacy differential scan completes 8,000 lists, with 3,496
+differences and zero query errors. Its old stop-loss heuristic flags 8 lists
+and returns exit 1; the raw result is retained for reviewer source checking.
+Thirty samples retain both complete endpoint lists. The 51,858-query scan was
+skipped because its unchanged code requires source-oracle work. Source captures
+and indexes and obsolete binaries are removed; final evidence stays below
+200 MB. The report records the retained sample and metric paths.

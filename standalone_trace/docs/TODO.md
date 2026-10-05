@@ -5,7 +5,7 @@ Current numbers and how to reproduce them: `COMPILE_BENCHMARK.md` and `BENCHMARK
 Any change to the compile path must produce a DB that is `cmp`-identical to the previous one
 (or come with an explicit, documented DB change).
 
-Items 5 and 6 are stacked for review. Main integration remains with the user.
+Items 5 visible and A are merged into main. Item 6 remains on its review branch.
 
 ## 2. Endpoint merge — done, option A (see "Done / dropped")
 
@@ -185,12 +185,10 @@ Verified: small-design sweep (33 designs × 6 variants) default vs `=0` 198/198 
 `test_cases/run_all_tests.sh` 27/27; `semantic_regression.py` (canonical block now compares the
 default against `=0`).
 
-## 5. Item-5 experiments — fixes complete, integration pending (2026-10-01)
+## 5. Item-5 experiments — merged into main
 
-The accepted stack is `item5-visible`, then `item5-e3a`, then item 6 below.
-The user will merge it. The round-3 report is
-`/tmp/auto_waveform_item5_round3_report_20261002.md`; raw results are in
-`/tmp/item5_round3_logs/`. Earlier reports remain historical evidence.
+Items `item5-visible` and `item5-e3a` are merged into main. Item 6 remains
+on its review branch.
 
 - **E1 retained:** all 27 test scripts use the project Python runtime.
 - **E2 discarded on Lumion:** eight tracing threads cost +6.4 s wall and
@@ -232,56 +230,40 @@ Phase 2 passes 12 CTests and the same runtime suites. Its Lumion DB is identical
 to phase 1, and the full corpus matches in one-shot and serve modes. The paired
 compile wall delta is +0.10 s; query timings are in COMPILE_BENCHMARK.md.
 
-## 6. Skip uninstantiated generate blocks — implemented, ready for review (2026-10-02)
+## 6. Inactive generate blocks and port mapping — ready for review
 
-Disabled generate branches used to contribute drivers and loads even though the
-hierarchy omitted their scopes. `BodyTraceIndexBuilder` now skips inactive
-blocks and visits generate-array entries through the same guard. Other body
-visitors already have that guard. Parameter values are part of slang's canonical
-body key, so enabled and disabled instances use separate representatives.
-The compile semantics epoch is 9; the DB format remains v6.
+The compiler skips uninstantiated generate branches. Canonical and actual-body
+builds must agree. Generate parameters remain part of the canonical body key.
+Procedural if/case behavior is unchanged.
 
-Fixtures cover if/case generates, zero-iteration loops, nested branches, child
-ports, active siblings, and repeated instances with different parameters.
-Canonical and actual-body builds must match. Procedural if/case behavior stays
-unchanged. The optional `RTL_TRACE_INACTIVE_SCOPES` manifest walks actual
-instances for the Lumion removal check. Source intervals with ambiguous macro
-or logical filename namespaces cannot supply witnesses.
+Port mapping separates native source coordinates from owner coverage. Exact
+selects, indexed selects, concatenations and verified member offsets translate
+between the child formal and the parent actual. Compact ports use sparse R1
+routes; Q1 records carry connected-domain coverage. Constants have no driver.
+The query key includes ordered public LHS/RHS references so generated contexts
+with a shared source line stay distinct.
 
-Verified: 13 CTests, normal and clean-PATH suites 27/27 each, and 383 Python
-tests, with no runtime skips. The 306-case canonical sweep matches exactly.
-The adjacent sweep accounts for 24 changed DBs and the epoch metadata change.
-The Lumion DB has 3,284,930 fewer endpoints and 7,429,082 fewer reference
-occurrences. Every removed old serialized record has an inactive source/scope
-candidate. Records with shared loop intervals or line-only locations retain
-origin limits; the generic machine status stays UNRESOLVED. Reference-set
-replacements, narrowed merged ranges and changed first-contributor order are
-reported explicitly. The brief source review found no wrong result; it does
-not claim exhaustive proof of all replacements.
+Round 6 covers non-ANSI internal port expressions, signed output widening,
+approximate A fallback for unproven mappings, and declared indices of unpacked
+scalar elements. Unknown mappings must retain A's endpoints for the hop and
+report the parent connection text and source location. The reviewed candidate retains active input declarations beside mapped writers.
+The compile semantics epoch is 18; the format remains v6. The round-6 finish
+uses existing regressions, runtime checks, Lumion VERIFY, corpus comparison,
+and a plain differential scan. Source checking remains with the reviewer.
 
-The g_dma examples at lines 4720, 4742 and 4803 are absent when
-IS_DMA_SUPPORTED is 0. The st_get5 scope is inactive when STARTPTR_WD is 2.
-Physical OOB records fall from 9,366 to 2,004. All 4,898 archived B records map
-to 4,658 unique source/path/coordinate keys; none of those keys remains in the
-new DB. This is exact key absence, not 4,898 distinct physical IDs after dedup. The 60-query corpus changes only
-q050: 48 inactive pipe-mux endpoints and 16 resulting cycle stops disappear.
-Compile wall improves by 6.94 s and peak RSS by 0.8712 GiB over three pairs.
-See COMPILE_BENCHMARK.md and the report for the accounting and disk limits.
+Remaining work outside item 6:
 
-Round-4 blockers fixed (2026-10-02): struct-member loads now filter sibling
-members before approximate bitmap matching. Inactive-only child ports now follow
-parent connections without a reverse-reference dependency. The stored port
-traversal change takes semantics epoch 12. Experimental epochs 10 and 11 were
-written during round 4. Epoch 12 follows parent routes when the port has no
-local expression that supplies a reverse bridge. It also handles wrappers
-whose only uses or drivers are forwarded child connections. Real local
-expressions retain compact fanout. The raw MCP serve tool reports
-error-severity diagnostics as errors. Regression and full-stack results are in
-`/tmp/auto_waveform_item5_round4_report_20261002.md`.
-
-Known low-impact bug, deferred: the nested select chain
-`[..][N-1:0]][2:0]` at `tl_tx_credit_reserve_req_to_ack.vp:80` can leak a selector
-between steps. It predates items 5 and 6 and is outside this fix.
+- Loads of a vector with a nonzero LSB can display `[0]` instead of its declared
+  index, for example `p_stage_wctrl_par_o[1:1]` at line 345.
+- Register drivers can collapse to a global clock or reset source, for example
+  `link_sm_mod.tx_eq_rx_preset_hint` returning only `core_rst_n_int`.
+- Whole-concatenation port loads can omit dangling one-bit port endpoints,
+  for example `sel0_hls_stage_r.m_data`.
+- A query through a parent part-select can report the whole LHS slice. The site
+  is correct; narrowing the displayed bitmap is optional work.
+- A nested select chain can carry a selector into the next step, for example
+  `[..][N-1:0]][2:0]` at `tl_tx_credit_reserve_req_to_ack.vp:80`. This remains
+  deferred work.
 
 ## Done / dropped
 
@@ -331,6 +313,6 @@ between steps. It predates items 5 and 6 and is outside this fix.
   `tests/fixtures/endpoint_merge.sv` updated. Agent-visible effect: per-bit assignments and
   generate loops show as one range (`bits [7:0]` instead of eight endpoints).
 - `--incremental` no longer reuses DBs built with older compile semantics: the compile fingerprint
-  carries a `SEMANTICS_EPOCH` line (now 12; item 6 restores missing parent-port bridges and skips inactive generate branches), and a `.meta` without
+  carries a `SEMANTICS_EPOCH` line (now 18; item 6 maps selected connection ranges through compact ports and skips inactive generate branches), and a `.meta` without
   it or with an older epoch triggers a full rebuild (f8cd024). Bump `kCompileSemanticsEpoch` in
   `db/GraphDb.cc` whenever the same sources and arguments start producing a different DB.

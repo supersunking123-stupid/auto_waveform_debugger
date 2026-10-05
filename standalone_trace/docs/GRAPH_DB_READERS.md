@@ -5,8 +5,11 @@ are copied with memcpy because section offsets may be unaligned. Version 6
 coordinates and declared axes use mapped views with the same eager validation:
 sorted unique signal IDs, contiguous axes, known flags, bounded counts and exact
 footer EOF. Versions 1-4 retain their small record conversions. The compiler
-keeps owned vectors and writes exactly the visible stack's v6 bytes, including
-member declaration coverage (header feature bits 3).
+keeps owned vectors. Header feature bits 1 and 2 describe declared coordinates
+and member coverage. Feature bit 4 stores port query coverage. Feature bit 8 stores exact compact
+port routes. The current compiler writes feature field 15 at semantics epoch 18.
+Readers reject the abandoned feature field 7. Older
+readers reject unknown features.
 
 Writers use an exclusive lock on the resolved DB path plus .lock. They prepare
 private staging files in the destination directory before parsing/elaboration.
@@ -55,3 +58,63 @@ boundaries. These do not guarantee protection against a concurrent in-place
 truncate during a query. Mixed legacy and atomic compile writers are unsupported:
 a legacy writer can lock an old inode and then reopen/truncate a new path inode.
 An unchanged inode's cooperating legacy writer waits for the reader lease.
+
+Port mapping keeps source bitmaps in their native coordinate frame. A constrained
+reverse-hop result may clip a copied native access. Selected mapped identity
+expressions may retain separate source accesses instead of a merged bitmap.
+A flagged endpoint stores
+its separate owner coverage in an interned `Q1;lo:hi[;lo:hi...]|native-bitmap`
+envelope. The query reader removes that envelope before returning the endpoint.
+Endpoint flags 0x04, 0x08 and 0x10 mean owner coverage, constant connection and
+unresolved connection mapping. Constant and unresolved markers carry no fake
+source assignment. A separate marker can retain the actual connection source
+range for stop detail. Compact R1 ports keep their declaration location.
+Unproven mapping results retain the legacy hop answer marked approximate.
+Readers reject unknown flags, conflicting markers, missing
+feature bits and malformed or overflowing coverage intervals. Coverage also
+participates in compile deduplication and canonical VERIFY comparisons. Query
+output deduplication uses native endpoint identity after coverage filtering.
+
+Q1 stores connected owner-domain unions. It does not store a source-to-owner
+bit pair. Exact routes on standalone compact ports preserve bit pairing.
+Q1 remains available for source coverage and explicit terminal markers.
+
+An exact compact Port uses flag `0x20`, coverage flag `0x04`, and header feature
+field 15. Its hidden envelope is
+`R1;childLo:childHi:targetPathStringId:targetLo[;...]|`.
+Each piece maps equal-width child and parent intervals in physical owner order.
+Original bound pieces must fit their selected packed rows. Adjacent pieces with
+the same target and affine translation may merge across verified contiguous
+rows after flattening. The reader checks full-root bounds for that merged range.
+The parent target uses verified full-owner ordinals, including fixed unpacked
+prefixes. The public endpoint keeps its native source coordinates. The query
+intersects the selected child domain and follows each exact parent domain.
+It does not infer bit pairing from Q1 coverage or equal native span widths.
+
+R1 has 1 to 256 sorted pieces. They cover the complete integral formal without
+overlap. Target names must identify existing root signals with verified layouts.
+Readers reject bad tokens, overflow, unknown targets, invalid bounds, incomplete
+coverage, conflicting flags, source references, and nonempty native payloads.
+Only input-driver and output-load lists may carry these routes. Both owned and
+mapped readers validate them before use. Header and endpoint POD sizes stay
+unchanged. Old readers reject feature 15. Genuine feature-1/3 coordinate and
+route behavior is unchanged. Rebuild caches from older experimental mapping
+semantics with the current compiler.
+
+The query identity repair includes ordered public LHS and RHS path vectors in
+the endpoint key. Fields and vectors use count and length framing. Different
+generated timing contexts must not collapse when their source location and
+native bitmap match. Identical full records still deduplicate. Hidden Q1/R1
+fields and numeric string IDs are not public query identity. This reader fix
+applies to all supported formats. It changes no stored bytes or compile epoch.
+Ordinary queries can expose distinct references that a refs-omitting key
+suppressed. The query key does not change the compiled DB layout.
+
+Root input queries can retain an active declaration beside a mapped writer.
+For an unused plain input, the exact connection and selected owner coverage
+control this compatibility record. A 32-bit ANSI packed-struct input uses
+a complete checked formal map with exact signal or constant pieces. Its
+constant-connected bits keep the active declaration and the constant stop.
+The retained port keeps its original public native bitmap. Q1 coverage filters
+the queried owner domain separately. A connected writer alone does not prove
+that an active port declaration can be removed.
