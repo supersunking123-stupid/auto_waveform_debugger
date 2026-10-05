@@ -431,6 +431,25 @@ struct BodyTraceIndex {
   slang::flat_hash_map<const slang::ast::Symbol *, std::vector<TraceResult>> loads;
 };
 
+struct StructBoundaryMapKey {
+  const slang::ast::PortSymbol *representative_port;
+  const slang::ast::PortSymbol *actual_port;
+  const slang::ast::InstanceSymbol *actual_instance;
+  const slang::ast::Expression *actual_expression;
+  bool operator==(const StructBoundaryMapKey &) const = default;
+};
+struct StructBoundaryMapKeyHash {
+  size_t operator()(const StructBoundaryMapKey &key) const {
+    size_t hash = 0;
+    for (const void *p : {static_cast<const void *>(key.representative_port),
+                         static_cast<const void *>(key.actual_port),
+                         static_cast<const void *>(key.actual_instance),
+                         static_cast<const void *>(key.actual_expression)})
+      hash ^= std::hash<const void *>{}(p) + size_t(0x9e3779b9) + (hash << 6) + (hash >> 2);
+    return hash;
+  }
+};
+
 struct PerBodyTraceCache {
   slang::flat_hash_map<const slang::ast::AssignmentExpression *, SymbolRefList>
       assignment_lhs_signals;
@@ -443,6 +462,9 @@ struct PerBodyTraceCache {
   slang::flat_hash_map<const slang::ast::Symbol *, uint8_t> native_certificates;
   // Bounded by the same per-body LRU as indexes; no all-design connection map.
   slang::flat_hash_map<const slang::ast::Expression *, std::vector<PortMapPiece>> port_maps;
+  slang::flat_hash_map<const slang::ast::PortSymbol *, bool> unused_input_boundaries;
+  slang::flat_hash_map<const slang::ast::PortSymbol *, bool> struct_input_boundaries;
+  std::unordered_map<StructBoundaryMapKey, bool, StructBoundaryMapKeyHash> struct_input_maps;
   bool body_trace_index_ready = false;
   std::list<const slang::ast::InstanceBodySymbol *>::iterator lru_it;  // position in TraceCompileCache::lru_order
 };
@@ -1187,6 +1209,100 @@ std::vector<TraceResult> ComputeLegacyTraceResults(const slang::ast::Symbol *sym
   return out;
 }
 
+// Compatibility retention only: no indexed active reads is not an inactivity
+// theorem. Eligibility is cached in the existing per-body LRU; connection and
+// selected owner coverage still come from the ordinary exact mapping path.
+bool RetainUnusedInputBoundary(const slang::ast::PortSymbol &port,
+                               const slang::ast::Symbol *sym,
+                               const BodyTraceIndex &index, TraceCompileCache &cache) {
+  const auto *body = GetContainingInstance(sym);
+  if (!body) return false;
+  auto &certificates = GetOrCreateBodyTraceCache(*body, cache).unused_input_boundaries;
+  if (auto it = certificates.find(&port); it != certificates.end()) return it->second;
+  const auto loads = index.loads.find(sym);
+  const bool result = port.direction == slang::ast::ArgumentDirection::In &&
+      port.internalSymbol == sym && PortInternalIsIdentity(port) &&
+      port.getType().isSimpleBitVector() &&
+      (loads == index.loads.end() || loads->second.empty());
+  certificates.emplace(&port, result);
+  return result;
+}
+
+// Eligibility belongs to the immutable representative port. Map validity
+// belongs to the actual compiler connection and its evaluation context.
+bool RetainStructInputBoundary(const slang::ast::PortSymbol &port,
+                               const slang::ast::Symbol *sym,
+                               const slang::ast::PortSymbol &actual_port,
+                               const slang::ast::InstanceSymbol &actual_instance,
+                               const slang::ast::Expression &actual_expression,
+                               const std::vector<PortMapPiece> &map, TraceCompileCache &cache) {
+  const auto *body = GetContainingInstance(sym);
+  if (!body) return false;
+  auto &eligibility = GetOrCreateBodyTraceCache(*body, cache).struct_input_boundaries;
+  const auto &type = port.getType().getCanonicalType();
+  const int64_t width = type.getBitWidth();
+  auto eligible = eligibility.find(&port);
+  if (eligible == eligibility.end())
+    eligible = eligibility.emplace(&port,
+        port.isAnsiPort && port.direction == slang::ast::ArgumentDirection::In &&
+        port.internalSymbol == sym && PortInternalIsIdentity(port) &&
+        type.kind == slang::ast::SymbolKind::PackedStructType && width == 32).first;
+  if (!eligible->second) return false;
+  // Same LRU ownership as the existing actual connection-map cache. The
+  // certificate depends only on these AST identities, never traversal frames.
+  auto &certificates = GetOrCreateBodyTraceCache(actual_instance.body, cache).struct_input_maps;
+  const StructBoundaryMapKey key{&port, &actual_port, &actual_instance, &actual_expression};
+  if (auto it = certificates.find(key); it != certificates.end()) return it->second;
+  bool valid = actual_port.isAnsiPort && actual_port.direction == port.direction &&
+      PortInternalIsIdentity(actual_port) && actual_port.getType().isMatching(type) &&
+      PortActualConnection(actual_instance, actual_port) == &actual_expression &&
+      !map.empty() && map.size() <= kPortMapMaxPieces;
+  std::vector<std::pair<int64_t, int64_t>> intervals;
+  if (valid) for (const auto &piece : map) {
+    if (piece.width <= 0 || piece.owner_low < 0 || piece.owner_low > width ||
+        piece.width > width - piece.owner_low ||
+        (piece.kind != PortMapPiece::Exact && piece.kind != PortMapPiece::Constant)) {
+      valid = false; break;
+    }
+    if (piece.kind == PortMapPiece::Exact) {
+      if (!piece.source || piece.source_low < 0) { valid = false; break; }
+    } else {
+      if (!piece.expr || piece.source) { valid = false; break; }
+      slang::ast::EvalContext context(actual_instance);
+      const auto constant = piece.expr->eval(context);
+      if (!constant || !constant.isInteger() || constant.integer().hasUnknown()) {
+        valid = false; break;
+      }
+    }
+    intervals.emplace_back(piece.owner_low, piece.owner_low + piece.width);
+  }
+  if (valid) {
+    std::sort(intervals.begin(), intervals.end());
+    int64_t next = 0;
+    for (const auto &[low, high] : intervals) {
+      if (low != next) { valid = false; break; }
+      next = high;
+    }
+    valid = valid && next == width;
+  }
+  certificates.emplace(key, valid);
+  return valid;
+}
+
+bool NonconstantInputBoundaryResult(const TraceResult &result) {
+  if (const auto *mapped = std::get_if<MappedPortTraceResult>(&result))
+    return !mapped->constant && !mapped->unresolved && !mapped->approximate;
+  if (const auto *expr = std::get_if<ExprTraceResult>(&result)) return !expr->mapping_approximate;
+  if (const auto *port = std::get_if<const slang::ast::PortSymbol *>(&result)) return *port != nullptr;
+  if (const auto *compact = std::get_if<CompactPortTraceResult>(&result)) {
+    // Compact records are constructed only from exact, nonconstant pieces.
+    return compact->port != nullptr && !compact->routes.empty() &&
+        std::all_of(compact->routes.begin(), compact->routes.end(),
+                    [](const auto &route) { return route.target != nullptr; });
+  }
+  return false;  // New result alternatives require an explicit certificate.
+}
+
 template <bool DRIVERS>
 std::vector<TraceResult> ComputeIndexedTraceResults(
     const slang::ast::Symbol *sym, TraceCompileCache &cache,
@@ -1241,6 +1357,12 @@ std::vector<TraceResult> ComputeIndexedTraceResults(
           }
           auto routes = PortComposeUp(formal, map);
           if (routes.size() > kPortMapMaxPieces) { fallback(initial, *port); continue; }
+          const bool retain_boundary = DRIVERS && !following_parent && !projection &&
+              RetainUnusedInputBoundary(**port, sym, index, cache) &&
+              std::all_of(map.begin(), map.end(), [](const auto &p) { return p.kind == PortMapPiece::Exact; });
+          const bool retain_struct = DRIVERS && !following_parent && !projection &&
+              RetainStructInputBoundary(**port, sym, **port, *instance, *connection, map, cache);
+          PortCoverage boundary_coverage = retain_struct ? PortProjectionCoverage(formal) : PortCoverage{};
           for (auto &route : routes) {
             const auto &piece = route.pieces.front();
             if (piece.kind != PortMapPiece::Exact) {
@@ -1252,9 +1374,16 @@ std::vector<TraceResult> ComputeIndexedTraceResults(
             if (!branch_visited.insert(piece.source).second) { fallback(route, *port); continue; }
             auto nested = ComputeIndexedTraceResults<DRIVERS>(piece.source, cache, branch_visited, true, &route, map_depth + 1);
             // An exact parent with no indexed endpoint is an ordinary boundary.
+            if (retain_boundary && !nested.empty() &&
+                std::all_of(nested.begin(), nested.end(), NonconstantInputBoundaryResult)) {
+              auto selected = PortProjectionCoverage(route);
+              boundary_coverage.insert(boundary_coverage.end(), selected.begin(), selected.end());
+            }
             if (nested.empty()) out.push_back(PortMappingMarker(route, *port, false, false));
             else out.insert(out.end(), std::make_move_iterator(nested.begin()), std::make_move_iterator(nested.end()));
           }
+          PortNormalizeCoverage(boundary_coverage);
+          if (!boundary_coverage.empty()) out.push_back(MappedPortTraceResult{*port, std::move(boundary_coverage)});
           continue;
         }
       }
@@ -5054,7 +5183,8 @@ bool ParseDefinesPlus(std::string_view tok, std::vector<std::string> &out) {
 // Epoch13: project packed port connections with separate owner coverage.
 // Epoch14: fixed-owner prefixes, Boolean dependencies and constrained reverse routes.
 // Epoch15: compact port bridges require full usable local formal coverage.
-constexpr int kCompileSemanticsEpoch = 17;
+// Epoch18: retain active input declarations beside exact mapped writers.
+constexpr int kCompileSemanticsEpoch = 18;
 
 std::string ComputeCompileFingerprint(const std::vector<std::string> &passthrough_args) {
   std::vector<std::string> parts;

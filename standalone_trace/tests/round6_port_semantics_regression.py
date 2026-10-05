@@ -60,7 +60,7 @@ def main():
                 compiled = run(binary, ['compile', '--db', db, '--single-unit', fixtures/(name+'.sv'), '--top', top],
                                {'RTL_TRACE_CANONICAL_BODIES': canonical, 'RTL_TRACE_CANONICAL_VERIFY': '1',
                                 'RTL_TRACE_BODY_CACHE': '1'})
-                assert 'SEMANTICS_EPOCH:17\n' in Path(str(db)+'.meta').read_text()
+                assert 'SEMANTICS_EPOCH:18\n' in Path(str(db)+'.meta').read_text()
                 if canonical == '1':
                     assert 'mismatched_lists=0' in compiled.stdout, compiled.stdout
                     assert 'map_fail=' in compiled.stdout, compiled.stdout
@@ -72,7 +72,8 @@ def main():
                 elif name == 'owide':
                     checks = [('drivers','w8[1]',[2]),('drivers','w8[3]',[3]),('drivers','w8[6]',[]),
                               ('drivers','w4[3]',[6]),('drivers','ws[7]',[10]),('drivers','ws[1]',[10]),
-                              ('drivers','wc[7]',[2]),('drivers','wc[1]',[3]),('drivers','wc[3]',[])]
+                              ('drivers','wc[7]',[2]),('drivers','wc[6]',[2]),
+                              ('drivers','wc[1]',[3]),('drivers','wc[3]',[])]
                 elif name == 'dyn':
                     checks = [('drivers','u.d',[6]),('drivers','u.d[0]',[6]),('drivers','u2.d',[10,12]),
                               ('drivers','u2.d[1]',[10,12]),('drivers','u3.d',[16])]
@@ -207,7 +208,7 @@ def main():
                     assert all(not e['bit_map_approximate'] for e in responses[0]['endpoints']),responses[0]
                     assert responses[2]==body, responses[2]
             assert dbs[0].read_bytes() == dbs[1].read_bytes(), name
-        print(f'PASS: {count} round6 queries, exact and approximate source contracts; canonical identity, VERIFY, cache1, epoch17')
+        print(f'PASS: {count} round6 queries, exact and approximate source contracts; canonical identity, VERIFY, cache1, epoch18')
         if args.baseline_bin:
             print('PASS: frozen-main generated-fallback endpoint dictionaries retained with only approximate=true')
 

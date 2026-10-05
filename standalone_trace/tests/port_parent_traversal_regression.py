@@ -1,10 +1,42 @@
 """Actual parent traversal for input drivers and output loads without local uses."""
 import argparse
+import hashlib
 import json
 import re
+import subprocess
 import tempfile
 from pathlib import Path
 from endpoint_dedup_regression import read_db, run
+
+
+def source_valid_input_boundary(source, owner, driver, signal, decoded, stored, payload):
+    """Exact active declarations and literal eight-bit parent connections only."""
+    known = {'u_direct0': 'x0', 'u_direct1': 'x1',
+             'u_nested0.u_leaf': 'x0', 'u_nested1.u_leaf': 'x1'}
+    assert known.get(owner) == driver, ('unknown Input addition', owner, driver)
+    assert signal == 'port_parent_top.' + owner + '.d'
+    assert hashlib.sha256(source.read_bytes()).hexdigest() == \
+        '7f25f681bd34642f084a4668abfa12ff2d7422a1168ebdca6a3c295d244b47f6'
+    # The pinned declaration at line 2 precedes if(EN). Each listed instance
+    # uses default EN=0; that excludes the consumer, not the Input declaration.
+    # Nested u_leaf.d -> wrapper.d -> x0/x1 are full-width identity connections.
+    pairs = [(bit, ('port_parent_top.' + driver, bit)) for bit in range(8)]
+    assert len(pairs) == 8 and {bit for bit, _ in pairs} == set(range(8))
+    assert payload['declared_axes'] == [dict(left=7, right=0, fixed=True, packed=True)]
+    assert len(stored) == 1, (signal, stored)
+    entry = stored[0]
+    assert decoded['strings'][entry[0]] == signal
+    assert Path(decoded['strings'][entry[1]]).resolve() == source
+    assert decoded['strings'][entry[2]] == 'input'
+    assert decoded['strings'][entry[3]] == 'Q1;0:7|', (signal, decoded['strings'][entry[3]])
+    assert entry[4:] == (2, 0, 0, 1, 0, 0, 4, (), ()), (signal, entry)
+    ports = [endpoint for endpoint in payload['endpoints'] if endpoint['path'] == signal]
+    assert len(ports) == 1, (signal, ports)
+    expected = dict(kind='port', path=signal, file=ports[0]['file'], line=2,
+                    direction='input', bit_map='', bit_map_encoding='unrestricted',
+                    bit_map_approximate=False, assignment='', lhs=[], rhs=[])
+    assert ports[0] == expected and Path(ports[0]['file']).resolve() == source
+    return pairs, expected
 
 
 def compile_db(binary, source, db, env=None, incremental=False):
@@ -37,15 +69,36 @@ def main():
                 # Check the stored directional list, not only a query that might
                 # recover the route through reverse refs from another signal.
                 entries = decoded['lists'][signal][0 if mode == 'drivers' else 1]
-                assert len(entries) == 1, (signal, mode, entries)
-                entry = entries[0]
+                boundary = [entry for entry in entries if decoded['strings'][entry[0]] == signal]
+                writers = [entry for entry in entries if entry not in boundary]
+                if mode != 'drivers':
+                    assert not boundary, (signal, mode, boundary)
+                assert len(writers) == 1, (signal, mode, entries)
+                entry = writers[0]
                 assert decoded['strings'][entry[0]] == 'port_parent_top.'+path, (signal, entry)
                 assert entry[4] == labels[label] and entry[7] == 0 and entry[9] == 1, (signal, entry)
                 payload = json.loads(run(binary, ['trace', '--db', db, '--signal', signal,
                     '--mode', mode, '--format', 'json']).stdout)
-                assert len(payload['endpoints']) == 1 and payload['endpoints'][0]['kind'] == 'expr', payload
-                assert payload['endpoints'][0]['line'] == labels[label], payload
-                assert payload['endpoints'][0]['assignment'], payload
+                public_writers = [e for e in payload['endpoints'] if e['path'] != signal]
+                assert len(public_writers) == 1 and public_writers[0]['kind'] == 'expr', payload
+                assert public_writers[0]['line'] == labels[label], payload
+                assert public_writers[0]['assignment'], payload
+                if mode == 'drivers':
+                    pairs, expected = source_valid_input_boundary(
+                        source, owner, driver, signal, decoded, boundary, payload)
+                    for selected in (0, 7):
+                        assert dict(pairs)[selected] == ('port_parent_top.' + driver, selected)
+                        selected_payload = json.loads(run(binary, ['trace', '--db', db,
+                            '--signal', signal + f'[{selected}]', '--mode', mode,
+                            '--format', 'json']).stdout)
+                        assert [e for e in selected_payload['endpoints'] if e['path'] == signal] == [expected]
+                    outside = subprocess.run([str(binary), 'trace', '--db', str(db),
+                        '--signal', signal + '[8]', '--mode', mode, '--format', 'json'],
+                        capture_output=True, text=True, timeout=45)
+                    assert outside.returncode == 1
+                    outside_payload = json.loads(outside.stdout)
+                    assert not outside_payload['endpoints'] and \
+                        outside_payload['diagnostics'][0]['code'] == 'axis_out_of_bounds'
                 assert not any(stop['reason'] in ('depth_limit', 'node_limit') for stop in payload['stops']), payload
         for field, mode, label in [('d', 'drivers', 'drive_x0'), ('q', 'loads', 'use_r4')]:
             signal = 'port_parent_top.u_active.'+field
@@ -72,15 +125,15 @@ def main():
         print('PASS: distinct parent connections across canonical duplicate instances; canonical on/off bytes and VERIFY match')
 
         meta = Path(str(db)+'.meta')
-        assert 'SEMANTICS_EPOCH:17\n' in meta.read_text()
-        meta.write_text(meta.read_text().replace('SEMANTICS_EPOCH:17\n', 'SEMANTICS_EPOCH:11\n'))
+        assert 'SEMANTICS_EPOCH:18\n' in meta.read_text()
+        meta.write_text(meta.read_text().replace('SEMANTICS_EPOCH:18\n', 'SEMANTICS_EPOCH:11\n'))
         rebuilt = compile_db(binary, source, db, incremental=True)
         assert 'incremental-cache-hit' not in rebuilt.stdout
         assert db.read_bytes() == off.read_bytes()
-        assert 'SEMANTICS_EPOCH:17\n' in meta.read_text()
+        assert 'SEMANTICS_EPOCH:18\n' in meta.read_text()
         hit = compile_db(binary, source, db, incremental=True)
         assert 'incremental-cache-hit' in hit.stdout
-        print('PASS: epoch 11 fingerprint forces epoch 17 rebuild, then cache hit')
+        print('PASS: epoch 11 fingerprint forces epoch 18 rebuild, then cache hit')
 
 
 if __name__ == '__main__':

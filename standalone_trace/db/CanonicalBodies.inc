@@ -694,6 +694,12 @@ class CanonicalTracer {
             }
             auto routes = PortComposeUp(formal, map);
             if (routes.size() > kPortMapMaxPieces) { fallback(initial, *port); continue; }
+            const bool retain_boundary = DRIVERS && !following_parent && !projection &&
+                RetainUnusedInputBoundary(**port, sym, index, cache_) &&
+                std::all_of(map.begin(), map.end(), [](const auto &p) { return p.kind == PortMapPiece::Exact; });
+            const bool retain_struct = DRIVERS && !following_parent && !projection &&
+                RetainStructInputBoundary(**port, sym, *actual_port, *escape.instance, *escape.expr, map, cache_);
+            PortCoverage boundary_coverage = retain_struct ? PortProjectionCoverage(formal) : PortCoverage{};
             for (auto &route : routes) {
               const auto &piece = route.pieces.front();
               if (piece.kind != PortMapPiece::Exact) {
@@ -705,8 +711,15 @@ class CanonicalTracer {
               if (!branch_visited.insert({piece.source, escape.frame}).second) { fallback(route, *port); continue; }
               const size_t before = out.size();
               Compute<DRIVERS>(piece.source, escape.frame, branch_visited, out, true, &route, map_depth + 1);
+              if (retain_boundary && out.size() > before &&
+                  std::all_of(out.begin() + before, out.end(), [](const Res &r) { return NonconstantInputBoundaryResult(r.result); })) {
+                auto selected = PortProjectionCoverage(route);
+                boundary_coverage.insert(boundary_coverage.end(), selected.begin(), selected.end());
+              }
               if (out.size() == before) marker(route, *port, false, false);
             }
+            PortNormalizeCoverage(boundary_coverage);
+            if (!boundary_coverage.empty()) out.push_back(Res{MappedPortTraceResult{*port, std::move(boundary_coverage)}, f});
             continue;
           }
         }

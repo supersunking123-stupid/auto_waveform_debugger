@@ -1,5 +1,6 @@
 """Connection-domain filtering, native coordinates, and strict feature4 readers."""
 import argparse
+import hashlib
 import json
 import struct
 import subprocess
@@ -9,10 +10,51 @@ from endpoint_dedup_regression import run, read_db
 from graph_db_mapping_regression import layout
 
 
+def source_valid_fixture_port(source, name, target, body, retained):
+    """Independent finite literal mappings; no production resolver reuse."""
+    if name != 'mapping_cases': return False
+    owner = target.split('.')[1]
+    if owner == 'nested_u': owner = 'nested_u.u'
+    # Each tuple is a declared formal index -> exact physical source atom.
+    table = {
+        'concat': (7,0,[(i,('x',8+i)) for i in range(4)]+[(i+4,('x',i)) for i in range(4)]),
+        'repeat_u': (7,0,[(i,('x',8+i%4)) for i in range(8)]),
+        'asc_owner': (0,7,[(i,('ascending',i)) for i in range(8)]),
+        'nonzero': (11,8,[(i,('indexed',i+4)) for i in range(8,12)]),
+        'plus_sel': (3,0,[(i,('indexed',8+i)) for i in range(4)]),
+        'array_u': (3,0,[(i,('arrays',1,4+i)) for i in range(4)]),
+        'nested_u.u': (7,0,[(i,('x',i)) for i in range(4)]+[(i+4,('x',8+i)) for i in range(4)])}
+    if owner not in table: return False
+    assert hashlib.sha256(source.read_bytes()).hexdigest()=='3ceca923c5ad28c8403658de218ebe4e56cd6176abc9b35bb7a5fdfa0d20b5f0'
+    text=source.read_text()
+    assert 'parameter L=7, R=0)(input logic [L:R] d' in text and 'if (0) begin : disabled' in text
+    # The full pinned source includes exact instance overrides, concat/repeat,
+    # declared ascending/indexed bounds and fixed row1, plus both nested swaps.
+    left,right,pairs=table[owner]
+    assert body['declared_axes']==[dict(left=left,right=right,fixed=True,packed=True)]
+    assert len(pairs)==abs(left-right)+1 and len({i for i,_ in pairs})==len(pairs)
+    root=target.rsplit('[',1)[0] if target.endswith(']') else target
+    selected=int(target.rsplit('[',1)[1][:-1]) if target.endswith(']') else None
+    selected_pairs=[atom for i,atom in pairs if selected is None or i==selected]
+    assert selected_pairs
+    for atom in selected_pairs:
+        if atom[0]=='x':assert 0<=atom[1]<16
+        elif atom[0]=='ascending':assert 0<=atom[1]<=7  # preserve declared ascending index
+        elif atom[0]=='indexed':assert 8<=atom[1]<=15
+        elif atom[0]=='arrays':assert atom[1]==1 and 4<=atom[2]<=7 # logical fixed row, no flatten
+        else:raise AssertionError(atom)
+    assert len(retained)==1 and retained[0]==dict(kind='port',path=root,file=retained[0]['file'],
+        line=2,direction='input',bit_map='',bit_map_encoding='unrestricted',
+        bit_map_approximate=False,assignment='',lhs=[],rhs=[])
+    assert Path(retained[0]['file']).resolve()==source
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--rtl-trace', type=Path, required=True)
     parser.add_argument('--source-dir', type=Path, required=True)
+    parser.add_argument('--baseline-bin', type=Path)
     args = parser.parse_args()
     binary = args.rtl_trace.resolve()
     fixtures = args.source_dir.resolve()/'tests/fixtures/port_connection_mapping'
@@ -24,6 +66,7 @@ def main():
                       ('loads','top.L[2].u.q[0]', ['o2 = w[11:8]'])],
         'fi_swap': [('drivers','top.u_sm.d.a', ['s.b = r'])],
     }
+    unknown_additions = []
     with tempfile.TemporaryDirectory(prefix='rtl_port_mapping_') as directory:
         root = Path(directory)
         count = 0
@@ -117,6 +160,10 @@ def main():
                            ('drivers','row_repeat_u.d[0]',['row_zero_driver']),
                            ('drivers','row_repeat_u.d[8]',['row_zero_driver'])]
                 checks=[(mode,'compact_port_routes.'+target,want) for mode,target,want in checks]
+            baseline_db = None
+            if args.baseline_bin:
+                baseline_db = root/(name+'baseline.db')
+                run(args.baseline_bin.resolve(), ['compile','--db',baseline_db,'--single-unit',source,'--top',top])
             dbs=[]
             for canonical in ('0','1'):
                 db = root/(name+canonical+'.db'); dbs.append(db)
@@ -124,11 +171,59 @@ def main():
                              {'RTL_TRACE_CANONICAL_BODIES':canonical,'RTL_TRACE_CANONICAL_VERIFY':'1'})
                 if canonical == '1':
                     assert 'mismatched_lists=0' in compiled.stdout
-                assert 'SEMANTICS_EPOCH:17\n' in Path(str(db)+'.meta').read_text()
+                assert 'SEMANTICS_EPOCH:18\n' in Path(str(db)+'.meta').read_text()
                 for mode,target,want in checks:
                     body=json.loads(run(binary,['trace','--db',db,'--signal',target,
                                                 '--mode',mode,'--format','json']).stdout)
                     endpoints=body['endpoints']
+                    # An exact unused active Input boundary is additive. Never
+                    # hide unrelated/fallback ports from the existing checks.
+                    root_target = target.rsplit('[',1)[0] if target.endswith(']') else target
+                    retained = [e for e in endpoints if mode=='drivers' and e['kind']=='port'
+                                and e['path']==root_target and not e['bit_map_approximate']]
+                    if retained:
+                        old = {'endpoints': []}
+                        if baseline_db is not None:
+                            old=json.loads(run(args.baseline_bin.resolve(),['trace','--db',baseline_db,
+                                '--signal',target,'--mode',mode,'--format','json']).stdout)
+                        authentic=[e for e in old['endpoints'] if e['kind']=='port' and e['path']==root_target]
+                        if retained != authentic:
+                            if name=='fe_bitsel' and target=='top.L[3].u.d[1]':
+                                # Independently reviewed literal SourceValid:
+                                # active ANSI d[3:0], EN=0 body, g=3 x[12+:4].
+                                assert hashlib.sha256(source.read_bytes()).hexdigest()=='8c1b2bb98a93f89b66f0b6102c8c953adf95343a174ea6692dc4964025656cdc'
+                                assert 'parameter EN = 0' in source.read_text()
+                                assert 'input logic [3:0] d' in source.read_text()
+                                assert 'if (EN) begin : g_on' in source.read_text()
+                                assert '.d(x[g*4+:4])' in source.read_text()
+                                selected_parent = 3*4+1
+                                assert selected_parent==13 and selected_parent in range(12,16)
+                                assert len(retained)==1 and retained[0]==dict(kind='port',path=root_target,
+                                    file=retained[0]['file'],line=1,direction='input',bit_map='',
+                                    bit_map_encoding='unrestricted',bit_map_approximate=False,
+                                    assignment='',lhs=[],rhs=[])
+                                assert Path(retained[0]['file']).resolve()==source
+                                outside_process=subprocess.run([str(binary),'trace','--db',str(db),'--signal',root_target+'[4]',
+                                    '--mode',mode,'--format','json'],capture_output=True,text=True,timeout=45)
+                                assert outside_process.returncode==1
+                                outside=json.loads(outside_process.stdout)
+                                assert outside['diagnostics'][0]['code']=='axis_out_of_bounds'
+                                assert not any(e['path']==root_target for e in outside['endpoints']),outside
+                            elif source_valid_fixture_port(source,name,target,body,retained):
+                                axis=body['declared_axes'][0]
+                                invalid=max(axis['left'],axis['right'])+1
+                                outside_process=subprocess.run([str(binary),'trace','--db',str(db),
+                                    '--signal',root_target+f'[{invalid}]','--mode',mode,'--format','json'],
+                                    capture_output=True,text=True,timeout=45)
+                                assert outside_process.returncode==1
+                                outside=json.loads(outside_process.stdout)
+                                assert outside['diagnostics'][0]['code']=='axis_out_of_bounds' and not outside['endpoints']
+                            else:
+                                unknown_additions.append((name,canonical,target,retained))
+                        assert all(e['direction']=='input' and e['bit_map']=='' and
+                            e['bit_map_encoding']=='unrestricted' and e['assignment']=='' and
+                            e['lhs']==e['rhs']==[] for e in retained),retained
+                        endpoints=[e for e in endpoints if e not in retained]
                     if labels:
                         fallback_case = name=='mapping_cases' and (target.startswith('mapping_cases.mixed_u.d') or target=='mapping_cases.signed_u.d[7]') or name=='fixed_owner_cases' and target=='fixed_owner_cases.boolean_u.en'
                         if fallback_case:
@@ -211,7 +306,8 @@ endmodule
             count+=1
         from query_reference_identity_regression import check as check_query_refs
         count += check_query_refs(binary, fixtures, root)
-        print(f'PASS: {count} exact/constant/unsupported/array/context queries; canonical bytes, VERIFY, epoch17 and strict envelopes')
+        assert not unknown_additions, ('unreviewed new Input SourceValid cases',unknown_additions)
+        print(f'PASS: {count} exact/constant/unsupported/array/context queries; canonical bytes, VERIFY, epoch18 and strict envelopes')
 
 
 def malformed_envelopes(binary,db,root):

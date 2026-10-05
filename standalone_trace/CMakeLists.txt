@@ -193,12 +193,18 @@ add_test(
           --rtl-trace $<TARGET_FILE:rtl_trace>
           --source-dir ${CMAKE_CURRENT_SOURCE_DIR}
 )
+set(RTL_TRACE_ACTIVE_BOUNDARY_BASELINE_BIN "" CACHE FILEPATH "Optional exact frozen Main for active-boundary public parity")
+set(RTL_TRACE_ACTIVE_BOUNDARY_BASELINE_ARGS)
+if(RTL_TRACE_ACTIVE_BOUNDARY_BASELINE_BIN)
+  list(APPEND RTL_TRACE_ACTIVE_BOUNDARY_BASELINE_ARGS --baseline-bin "${RTL_TRACE_ACTIVE_BOUNDARY_BASELINE_BIN}")
+endif()
 add_test(
   NAME port_connection_mapping_regression
   COMMAND ${Python3_EXECUTABLE}
           ${CMAKE_CURRENT_SOURCE_DIR}/tests/port_connection_mapping_regression.py
           --rtl-trace $<TARGET_FILE:rtl_trace>
           --source-dir ${CMAKE_CURRENT_SOURCE_DIR}
+          ${RTL_TRACE_ACTIVE_BOUNDARY_BASELINE_ARGS}
 )
 
 add_test(
@@ -208,3 +214,25 @@ add_test(
           --rtl-trace $<TARGET_FILE:rtl_trace>
           --source-dir ${CMAKE_CURRENT_SOURCE_DIR}
 )
+
+add_test(
+  NAME reviewer_round5_6_regression
+  COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/reviewer_round5_6_regression.py
+          --rtl-trace $<TARGET_FILE:rtl_trace>
+          --source-dir ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+add_test(NAME active_boundary_retention_regression
+  COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/active_boundary_retention_regression.py
+          --rtl-trace $<TARGET_FILE:rtl_trace>
+          --source-dir ${CMAKE_CURRENT_SOURCE_DIR}
+          ${RTL_TRACE_ACTIVE_BOUNDARY_BASELINE_ARGS})
+
+add_test(NAME struct_boundary_retention_regression
+  COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/struct_boundary_retention_regression.py
+          --rtl-trace $<TARGET_FILE:rtl_trace>
+          --source-dir ${CMAKE_CURRENT_SOURCE_DIR}
+          ${RTL_TRACE_ACTIVE_BOUNDARY_BASELINE_ARGS})
