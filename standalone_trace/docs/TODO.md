@@ -285,36 +285,49 @@ a regression test with the exact expected answer.
    Whole load results now retain unexpanded exact terminal ports. Crossed ports
    keep their existing handling. A small concatenation fixture checks exact whole
    and bit answers.
-### Round 2 (planned 2026-10-05, on main f74f499)
+### Round 2 fixes (2026-10-05)
 
-Rechecked on main with small repros in `/tmp/bugfix_repros/` (`misc.sv`,
-`dyn.sv`, `st.sv`, `nest.sv`, `gclk.sv`).
+6. **Fixed: inout port drivers reach the parent side.** Child and parent
+   whole/bit queries return both assignments once and exactly. Both compile
+   paths follow inout boundaries and skip reverse cycles. Inout connections
+   use ordinary traversal because compact port records support input/output.
+7. **Fixed: packed-array element member connections retain their writers.**
+   `drivers dyn.u4.d` returns exact line 20; `drivers dyn.m.l.d` returns exact
+   line 19. `loads dyn.pa` includes the line-22 connection and the `m` site.
+   Static element/member offsets also work with nonzero and ascending indices.
+8. **Fixed: failed load hops no longer duplicate settled root sites.**
+   `loads misc.i0[1]` returns lines 10, 18, 19, 26 and 28 once each. Bit 0
+   also reaches line 12 and `u_and.d`. Failed connection coverage keeps known
+   source-read bounds. Unknown mappings retain their approximate fallback.
+   Settlement applies to the root pass; other route domains stay conservative.
+9. **Fixed: ordinary packed union member paths are queryable.**
+   `st.un.p.l` returns line 13; `st.un.p.h` returns line 12; `st.un.w` returns
+   both; `st.un.w[5]` returns line 12. All four answers are exact. Existing
+   struct rows stay unchanged. Tagged/soft unions and union arrays stay outside
+   this round.
+10. **Fixed with the allowed fallback: selected compact global loads.**
+    Compact records contain sink paths without a source-bit map. Bit queries
+    return all sinks marked approximate, with an `unresolved_connection_mapping`
+    stop that explains the missing map. Whole-net answers stay exact. Compile
+    compaction and the shared clock/reset matcher are unchanged.
 
-**Fix (missing or noisy answers):**
+Stored records change for inout traversal, packed members, failed-hop coverage
+and union member rows. The format remains v6; the semantics epoch is 20.
+Existing incremental checks require a rebuild from epoch 19, then a cache hit.
 
-6. **Inout port drivers miss the parent side.** `drivers misc.u_io.b` returns
-   only the child `b = en ? o : 'z` (line 2). It should also return the parent
-   `io = !en ? i0 : 'z` (line 10). `drivers misc.io` is already correct.
-7. **A member of a packed-array element gives only the port.** For
-   `.d(pa[0].b)`, `drivers dyn.u4.d` returns the port with no source. It should
-   return `pa[0].b = i1` (line 20). An approximate `pa` superset is acceptable.
-   `loads dyn.pa` also misses `u4`.
-8. **Load queries list sites twice, and add other bits.** `loads misc.i0[1]`
-   returns most sites twice, once exact and once approximate. It also adds
-   `arr[0] = i0[0]` (line 12) and `u_and.d` as approximate, although they read
-   only `i0[0]`. Each site should appear once. An approximate fallback should not
-   re-add a site that the exact pass already answered or filtered out.
-9. **Union member paths are not queryable.** `st.un.p.l` and `st.un.w` give
-   "Signal not found", while packed-struct member paths work. Expected: the
-   same answers as the matching bit slice of `st.un`.
-
-10. **A bit query on a compact global clock/reset net returns every bit's sinks.**
-    The loads fast path ignores the select. On Lumion,
-    `loads pcs_msg_blk_i.core_clk_i[3]`, `core_clk_i[0]` and `core_clk_i` each
-    return the same 24,672 `global-clock-sink` endpoints for all 16 lanes.
-    These are not marked approximate. The lane-3 port alone has 734 loads.
-    Repro: `gclk.sv`; `loads gclk.clk_v[0]` returns all 1,200 sinks, including
-    the 600 on `clk_v[1]`.
+Round-2 acceptance passed: 22 CTests, both 27-case runtime suites, and 387
+Python tests. Clean-PATH runtime skipped seven optional VCS syntax steps;
+normal runtime skipped none. The reviewer harness retains 32 existing excluded
+query checks. Three optional historical baseline groups were not run; counts
+and reasons are in the round-2 report. Available generated-fallback and hot
+struct baseline checks passed separately.
+Lumion VERIFY covered 3,798,275 signals with zero mismatched lists. Wall time
+was 100.29 s; peak RSS was 18,011,048 KiB. All 72 corpus queries match round 1
+in one-shot and serve modes. The selected `core_clk_i[3]` query returns 24,672
+approximate sinks with an explicit stop; the lane-3 reference returns 734 exact
+loads. Whole `core_clk_i` remains 24,672 exact sinks. Existing compaction policy
+is unchanged; corrected records change the global-net count from 342 to 346.
+Evidence: `local_test_design/bench_out/item7_round2_20261005` in the main checkout.
 
 **Checked on Lumion by Claude (main f74f499); dropped as fixed or not reproducing:**
 - Expression connections: `.enable_in(!pop_empty)` (`async_fifo.vp:119`) now
@@ -410,6 +423,6 @@ new verification tooling.
   `tests/fixtures/endpoint_merge.sv` updated. Agent-visible effect: per-bit assignments and
   generate loops show as one range (`bits [7:0]` instead of eight endpoints).
 - `--incremental` no longer reuses DBs built with older compile semantics: the compile fingerprint
-  carries a `SEMANTICS_EPOCH` line (now 19; item 7 retains ordinary vector bounds and declared load indices), and a `.meta` without
+  carries a `SEMANTICS_EPOCH` line (now 20; item 7 round 2 fixes inout, packed-member and failed-hop records), and a `.meta` without
   it or with an older epoch triggers a full rebuild (f8cd024). Bump `kCompileSemanticsEpoch` in
   `db/GraphDb.cc` whenever the same sources and arguments start producing a different DB.
