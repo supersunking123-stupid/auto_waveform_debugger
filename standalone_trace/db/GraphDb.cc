@@ -5206,7 +5206,7 @@ bool ParseDefinesPlus(std::string_view tok, std::vector<std::string> &out) {
 // Epoch14: fixed-owner prefixes, Boolean dependencies and constrained reverse routes.
 // Epoch15: compact port bridges require full usable local formal coverage.
 // Epoch18: retain active input declarations beside exact mapped writers.
-constexpr int kCompileSemanticsEpoch = 18;
+constexpr int kCompileSemanticsEpoch = 19;
 
 std::string ComputeCompileFingerprint(const std::vector<std::string> &passthrough_args) {
   std::vector<std::string> parts;

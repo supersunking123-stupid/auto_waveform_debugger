@@ -60,7 +60,7 @@ def main():
                 compiled = run(binary, ['compile', '--db', db, '--single-unit', fixtures/(name+'.sv'), '--top', top],
                                {'RTL_TRACE_CANONICAL_BODIES': canonical, 'RTL_TRACE_CANONICAL_VERIFY': '1',
                                 'RTL_TRACE_BODY_CACHE': '1'})
-                assert 'SEMANTICS_EPOCH:18\n' in Path(str(db)+'.meta').read_text()
+                assert 'SEMANTICS_EPOCH:19\n' in Path(str(db)+'.meta').read_text()
                 if canonical == '1':
                     assert 'mismatched_lists=0' in compiled.stdout, compiled.stdout
                     assert 'map_fail=' in compiled.stdout, compiled.stdout
