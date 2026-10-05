@@ -3,12 +3,38 @@ import argparse,json,tempfile,subprocess
 from pathlib import Path
 from endpoint_dedup_regression import run
 
+def check_packed_union(binary, source_dir, tmp, query):
+ source=(source_dir/'tests/fixtures/struct_boundaries/packed_union.sv').resolve()
+ expected={'st.u_un.d':{12},'st.u_un2.d':{13},'st.un':{12,13}}
+ assignments={12:'un.p.h = i3',13:'un.p.l = i0'}
+ count=0
+ for canon in ('0','1'):
+  for cache in ('0','1'):
+   db=tmp/f'packed_union{canon}{cache}.db'
+   compiled=run(binary,['compile','--db',db,'--single-unit',source,'--top','st'],
+                {'RTL_TRACE_CANONICAL_BODIES':canon,'RTL_TRACE_BODY_CACHE':cache,'RTL_TRACE_CANONICAL_VERIFY':'1'})
+   if canon=='1':assert 'mismatched_lists=0' in compiled.stdout and ' map_fail=0 ' in compiled.stdout,compiled.stdout
+   for signal,lines in expected.items():
+    result=query(binary,db,signal)
+    endpoints=result['endpoints']
+    assert len(endpoints)==len(lines) and {e['line'] for e in endpoints}==lines,(canon,cache,signal,result)
+    assert not result['diagnostics'],result
+    assert all(stop['reason']=='cone_limit' for stop in result['stops']),result
+    for endpoint in endpoints:
+     assert endpoint['kind']=='expr' and endpoint['path']==('st.un.p.h' if endpoint['line']==12 else 'st.un.p.l') and not endpoint['bit_map_approximate'],result
+     assert endpoint['bit_map']==('[7:4]' if endpoint['line']==12 else '[3:0]') and endpoint['bit_map_encoding']=='flat_bits',result
+     assert endpoint['assignment']==assignments[endpoint['line']],result
+     assert endpoint['lhs']==['st.un'] and endpoint['rhs']==['st.i3' if endpoint['line']==12 else 'st.i0'],result
+    count+=1
+ return count
+
 def main():
  p=argparse.ArgumentParser();p.add_argument('--rtl-trace',type=Path,required=True);p.add_argument('--source-dir',type=Path,required=True);p.add_argument('--baseline-bin',type=Path);p.add_argument('--previous-bin',type=Path);a=p.parse_args()
  source=(a.source_dir/'tests/fixtures/struct_boundaries/struct_boundary.sv').resolve();binary=a.rtl_trace.resolve();root='struct_boundary_repro.sva.port_in__gen[0].in_port_dbgchk.k_controls';count=0
  with tempfile.TemporaryDirectory(prefix='struct_boundary_regression_') as tmp:
   tmp=Path(tmp);baseline=None
   def query(b,db,s):return json.loads(run(b,['trace','--db',db,'--mode','drivers','--signal',s,'--format','json']).stdout)
+  union_count=check_packed_union(binary,a.source_dir,tmp,query);count+=union_count
   if a.baseline_bin:
    db=tmp/'A.db';run(a.baseline_bin.resolve(),['compile','--db',db,'--single-unit',source,'--top','struct_boundary_repro']);baseline=query(a.baseline_bin.resolve(),db,root)['endpoints']
   for canon in ('0','1'):
@@ -83,5 +109,5 @@ def main():
       assert all(e['path']==owner+'.arr' for e in writers),(i,suffix,r)
       if suffix in ('','[4]','[5]'):assert any(s['reason']=='constant_connection' for s in r['stops'])
       count+=1
- print(f'PASS {count} struct-boundary checks; hot previous parity comparisons={320 if a.previous_bin else 0}; cache cardinality not measured; no owned DB retained')
+ print(f'PASS {count} struct-boundary checks; packed union query checks={union_count}; hot previous parity comparisons={320 if a.previous_bin else 0}; cache cardinality not measured; no owned DB retained')
 if __name__=='__main__':main()

@@ -527,7 +527,8 @@ struct MemberAccessInfo {
 
 // Walks a MemberAccessExpression chain (e.g. my_struct.aw.valid) back to the
 // root traceable symbol (Net or Variable), accumulating bit offsets and member
-// names along the way.  Only handles packed struct types in Level 1.
+// names along the way. Ordinary packed unions share the same physical bit
+// offsets, with each alternative starting at bit zero.
 MemberAccessInfo ResolveStructMemberAccess(const slang::ast::MemberAccessExpression &expr) {
   MemberAccessInfo info;
 
@@ -551,10 +552,12 @@ MemberAccessInfo ResolveStructMemberAccess(const slang::ast::MemberAccessExpress
   if (nve == nullptr) return info;
   if (!IsTraceable(&nve->symbol)) return info;
 
-  // Verify root is a packed struct type.
+  // Verify root is a packed struct or an ordinary untagged packed union.
   const slang::ast::Type &root_type = nve->symbol.as_if<slang::ast::ValueSymbol>()->getType();
   const slang::ast::Type &canonical = root_type.getCanonicalType();
-  if (canonical.kind != slang::ast::SymbolKind::PackedStructType) return info;
+  const auto *packed_union = canonical.as_if<slang::ast::PackedUnionType>();
+  if (canonical.kind != slang::ast::SymbolKind::PackedStructType &&
+      (!packed_union || packed_union->isTagged || packed_union->isSoft)) return info;
 
   // Reverse: fields are [valid, aw] (outer first), we need [aw, valid] for
   // correct bit-offset accumulation (outer-to-inner in source order).
