@@ -60,7 +60,7 @@ def main():
                 compiled = run(binary, ['compile', '--db', db, '--single-unit', fixtures/(name+'.sv'), '--top', top],
                                {'RTL_TRACE_CANONICAL_BODIES': canonical, 'RTL_TRACE_CANONICAL_VERIFY': '1',
                                 'RTL_TRACE_BODY_CACHE': '1'})
-                assert 'SEMANTICS_EPOCH:19\n' in Path(str(db)+'.meta').read_text()
+                assert 'SEMANTICS_EPOCH:20\n' in Path(str(db)+'.meta').read_text()
                 if canonical == '1':
                     assert 'mismatched_lists=0' in compiled.stdout, compiled.stdout
                     assert 'map_fail=' in compiled.stdout, compiled.stdout
@@ -215,7 +215,7 @@ def main():
                     assert all(not e['bit_map_approximate'] for e in responses[0]['endpoints']),responses[0]
                     assert responses[2]==body, responses[2]
             assert dbs[0].read_bytes() == dbs[1].read_bytes(), name
-        print(f'PASS: {count} round6 queries, exact and approximate source contracts; canonical identity, VERIFY, cache1, epoch18')
+        print(f'PASS: {count} round6 queries, exact and approximate source contracts; canonical identity, VERIFY, cache1, epoch20')
         if args.baseline_bin:
             print('PASS: frozen-main generated-fallback endpoint dictionaries retained with only approximate=true')
 

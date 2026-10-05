@@ -77,7 +77,7 @@ def main():
         assert Path(str(off)+'.meta').read_bytes() == Path(str(db)+'.meta').read_bytes()
         verified = compile_db(binary, source, root/'verify.db', {'RTL_TRACE_CANONICAL_VERIFY':'1'})
         assert 'mismatched_lists=0' in verified.stdout
-        assert 'SEMANTICS_EPOCH:19\n' in Path(str(db)+'.meta').read_text()
+        assert 'SEMANTICS_EPOCH:20\n' in Path(str(db)+'.meta').read_text()
         print('PASS: two copies of each parameter class redirect canonically; canonical on/off bytes and VERIFY lists match')
 
         if args.parent_bin:
@@ -90,7 +90,7 @@ def main():
             assert inherited.read_bytes() == db.read_bytes()
             hit = compile_db(binary, source, inherited, incremental=True)
             assert 'incremental-cache-hit' in hit.stdout
-            print(f'PASS: real epoch {old_epoch} parent forces epoch 18 rebuild then cache hit')
+            print(f'PASS: real epoch {old_epoch} parent forces epoch 20 rebuild then cache hit')
         else:
             print('SKIP: actual pre-epoch-18 parent rebuild comparison (--parent-bin missing)')
 
