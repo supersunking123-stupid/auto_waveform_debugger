@@ -754,6 +754,24 @@ class CanonicalTracer {
         const auto conversion = PortInspectOutput(*child, *port);
         if (initial.pieces.empty() || internal.empty() || map.empty() || PortHasUnprovedDependency(map, sym) || conversion.signed_widening || conversion.unsupported ||
             std::any_of(internal.begin(), internal.end(), [](const auto &p) { return p.kind != PortMapPiece::Exact; })) {
+          // Match the native source-read bound in the noncanonical tracer.
+          if constexpr (!DRIVERS) if (const auto read = PortLocalCoverage(initial, *expr, cache_);
+              read && !initial.pieces.empty() &&
+              std::all_of(initial.pieces.begin(), initial.pieces.end(),
+                          [](const auto &p) { return p.kind == PortMapPiece::Exact; })) {
+            std::vector<PortMapPiece> selected;
+            for (const auto &piece : initial.pieces) for (const auto &[lo, hi] : *read) {
+              const int64_t low = std::max<int64_t>(piece.owner_low, lo);
+              const int64_t high = std::min<int64_t>(piece.owner_low + piece.width, int64_t(hi) + 1);
+              if (low >= high) continue;
+              auto copy = piece;
+              copy.source_low += low - piece.owner_low;
+              copy.owner_low = low; copy.width = high - low;
+              selected.push_back(std::move(copy));
+            }
+            initial.pieces = std::move(selected);
+            if (initial.pieces.empty()) continue;
+          }
           fallback(initial, port); followed = true;
         } else {
           auto formal = PortComposeDown(initial, map, port);

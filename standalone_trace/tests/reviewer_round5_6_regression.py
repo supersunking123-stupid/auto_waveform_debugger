@@ -96,8 +96,32 @@ def main():
             for db in dbs:
                 db.unlink()
                 Path(str(db) + '.meta').unlink()
+
+        source = args.source_dir.resolve() / 'tests/fixtures/load_fallback_misc.sv'
+        for canonical in ('0', '1'):
+            db = root / f'load_fallback{canonical}.db'
+            compiled = run(binary, ['compile', '--db', db, '--single-unit', source, '--top', 'misc'],
+                           {'RTL_TRACE_CANONICAL_BODIES': canonical,
+                            'RTL_TRACE_CANONICAL_VERIFY': '1'})
+            if canonical == '1':
+                assert 'mismatched_lists=0' in compiled.stdout, compiled.stdout
+            for bit in (0, 1):
+                target = f'misc.i0[{bit}]'
+                body = json.loads(run(binary, ['trace', '--db', db, '--mode', 'loads',
+                                               '--signal', target, '--format', 'json']).stdout)
+                assert not body['diagnostics'], (target, body)
+                expected_lines = [10, 18, 19, 26, 28] + ([12] if bit == 0 else [])
+                native = [e for e in body['endpoints'] if e['kind'] == 'expr' and e['path'] == 'misc.i0']
+                assert sorted(e['line'] for e in native) == sorted(expected_lines), (target, body)
+                assert all(not e['bit_map_approximate'] for e in native), (target, body)
+                child = [e for e in body['endpoints'] if e['path'] == 'misc.u_and.d']
+                assert len(child) == (1 if bit == 0 else 0), (target, body)
+                assert all(e['line'] == 6 and e['assignment'] == 'q = d' for e in child), body
+                assert len(body['endpoints']) == len(native) + len(child), (target, body)
+                count += 1
+        assert (root / 'load_fallback0.db').read_bytes() == (root / 'load_fallback1.db').read_bytes()
     print(f'PASS: {count} reviewer fixture queries ({fallback_count} fallback); '
-          '7 fixtures, canonical identity and VERIFY')
+          '8 fixtures, canonical identity and VERIFY')
 
 
 if __name__ == '__main__':

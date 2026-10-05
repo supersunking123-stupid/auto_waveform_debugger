@@ -111,6 +111,16 @@ TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
   std::vector<EndpointRecord> unresolved_ports;
   std::unordered_set<std::string> seen_logic;
   std::unordered_set<std::string> seen_ports;
+  // A failed port hop can retain a whole-owner copy of every native site.
+  // Root native sites are settled even when their bits were excluded by the
+  // query. Other routes can reach the same site through different domains.
+  std::unordered_set<std::string> settled_load_sites;
+  auto load_site_key = [&](EndpointRecord e) {
+    e.bit_map.clear();
+    e.bit_map_approximate = false;
+    e.bit_map_logical_axes = false;
+    return EndpointKey(db, e);
+  };
   using OwnerDomain = std::vector<std::pair<int32_t, int32_t>>;
   using RouteDomain = std::optional<OwnerDomain>;
   const RouteDomain root_domain = root_id && !opts.signal_select_axes.empty() ?
@@ -206,6 +216,11 @@ TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
           fallback_edges = FindFallbackDriverEndpoints(session, sig_id);
           if (!fallback_edges.empty()) active_edges = &fallback_edges;
         }
+        if (!is_drivers_mode && !approximate && !domain && sig == opts.root_signal)
+          for (const auto &e : *active_edges)
+            if (e.kind == EndpointKind::kExpr && !e.bit_map_approximate &&
+                !e.port_mapping_unresolved && !e.port_mapping_constant)
+              settled_load_sites.insert(load_site_key(e));
 
         std::string failure_connection = provenance;
         for (const auto &edge : *active_edges) if (edge.port_mapping_unresolved)
@@ -276,6 +291,8 @@ TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
         for (const EndpointRecord &stored : *active_edges) {
           auto e = stored;
           edge_approximate = approximate || (failed_proof && e.bit_map_approximate);
+          if (!is_drivers_mode && edge_approximate && e.kind == EndpointKind::kExpr &&
+              settled_load_sites.contains(load_site_key(e))) continue;
           if (edge_approximate) {
             e.bit_map_approximate = true;
             SessionRestoreLegacyScalarUnpackedNative(session, e);
@@ -430,8 +447,11 @@ TraceRunResult RunTraceQuery(TraceSession &session, const TraceOptions &opts) {
   if (!logic_endpoints.empty()) for (const auto &port : unresolved_ports)
     // Exact load ports are terminal sinks, even when another concatenation
     // chunk reaches logic. Ports crossed during traversal were not collected.
+    // An approximate root input boundary is the source, not another load.
     if ((!is_drivers_mode && !port.bit_map_approximate) ||
-        (port.bit_map_approximate && (!fallback_port_sources_known ||
+        (port.bit_map_approximate && (is_drivers_mode || EndpointPath(db,port) != opts.root_signal ||
+        port.direction != "input") &&
+        (!fallback_port_sources_known ||
         fallback_root_ports.contains(EndpointPath(db,port)) ||
         fallback_port_sources.contains(EndpointPath(db,port))))) result.endpoints.push_back(port);
   std::sort(result.endpoints.begin(), result.endpoints.end(),
