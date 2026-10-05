@@ -356,6 +356,30 @@ modules, a regression with the exact answer per bug, one Lumion VERIFY, and the
 72-query corpus with each difference explained in a line. No new verification
 tooling.
 
+### Found by the post-round-2 Lumion check (2026-10-05, main 01290e9)
+
+About 45 Lumion queries on the fixed constructs were checked against the RTL
+with no wrong answers. The design has no `inout` ports and no
+`.x(arr[i].field)` connections, so #6/#7 are covered only by fixtures. Two
+older bugs were found:
+
+11. **A suffix after `[N].` in a signal path is ignored.** `loads top.v[9].foo`
+    (`v.sv`) silently returns all loads of `v`, as do `top.v[3].foo` and, on
+    Lumion, `data_prev_sig[9].foo` and `hls2tl_posted_tlp_decoded[0].compl.tag`.
+    It should fail like `top.v.foo` does. `ResolveSignalQuery`
+    (`query/TraceQuery.cc` ~640) ignores the parsed base name; `ParseSignalQuery`
+    (`db/GraphDb.cc` ~4996) checks only the last leaf.
+12. **Nested packed-struct members get the outer struct's field names.** In
+    `st.sv`, `find 'st\.s\..*'` lists `st.s.i.c` and `st.s.i.i` (which do not
+    exist), while the real `st.s.i.x` gives "Signal not found". On Lumion this
+    hits `in_port_cntl_decoded.flags.*` (SVA code). `DecomposePackedStructFields`
+    (`db/GraphDb.cc` ~2785) re-reads the top variable's type when recursing on a
+    struct field; 374493c fixed this only for unions.
+
+Regression corpus: `local_test_design/bench_out/corpus_v2/corpus.txt` (the
+72 old queries plus 12 for the item-7 fixes) with its baseline answers from
+main 01290e9 in `corpus_v2/baseline_01290e9/main`. Use it for future rounds.
+
 ### Not planned
 
 - Unpacked structs remain unsupported; whole-signal queries still work.
