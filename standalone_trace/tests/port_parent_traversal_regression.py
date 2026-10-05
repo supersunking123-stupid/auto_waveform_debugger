@@ -135,6 +135,37 @@ def main():
         assert 'incremental-cache-hit' in hit.stdout
         print('PASS: epoch 18 fingerprint forces epoch 19 rebuild, then cache hit')
 
+        # Inout boundaries must reach both the child and parent writer.
+        inout_source = root/'inout_parent.sv'
+        inout_source.write_text('''module leafio(inout wire [3:0] b, input logic en, input logic [3:0] o);
+  assign b = en ? o : 'z;
+endmodule
+module misc(input logic en, input logic [3:0] o, i0, output wire [3:0] io);
+  leafio u_io(.b(io), .en(en), .o(o));
+  assign io = !en ? i0 : 'z;
+endmodule
+''')
+        inout_db = root/'inout.db'
+        run(binary, ['compile', '--db', inout_db, '--single-unit', inout_source, '--top', 'misc'])
+        for signal in ('misc.u_io.b', 'misc.u_io.b[1]', 'misc.io', 'misc.io[1]'):
+            payload = json.loads(run(binary, ['trace', '--db', inout_db, '--signal', signal,
+                '--mode', 'drivers', '--format', 'json']).stdout)
+            endpoints = payload['endpoints']
+            assert sorted(e['line'] for e in endpoints) == [2, 6], (signal, payload)
+            assert all(e['kind'] == 'expr' and not e['bit_map_approximate'] for e in endpoints), (signal, payload)
+            assert {e['assignment'].strip() for e in endpoints} == {
+                "b = en ? o : 'z", "io = !en ? i0 : 'z"}, (signal, payload)
+        inout_off = root/'inout_off.db'
+        run(binary, ['compile', '--db', inout_off, '--single-unit', inout_source, '--top', 'misc'],
+            {'RTL_TRACE_CANONICAL_BODIES': '0'})
+        assert inout_off.read_bytes() == inout_db.read_bytes()
+        inout_verify = run(binary, ['compile', '--db', root/'inout_verify.db', '--single-unit',
+            inout_source, '--top', 'misc'], {'RTL_TRACE_CANONICAL_VERIFY': '1'})
+        assert 'mismatched_lists=0' in inout_verify.stdout, inout_verify.stdout
+        inout_verified = re.search(r'\[Canon\] verify signals=(\d+)', inout_verify.stdout)
+        assert inout_verified and int(inout_verified.group(1)) > 0, inout_verify.stdout
+        print('PASS: inout child and parent queries each return both exact writers once')
+
 
 if __name__ == '__main__':
     main()

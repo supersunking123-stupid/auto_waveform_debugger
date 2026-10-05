@@ -1190,7 +1190,8 @@ std::vector<TraceResult> ComputeLegacyTraceResults(const slang::ast::Symbol *sym
   for (const auto &entry : it->second) {
     if (const auto *port = std::get_if<const slang::ast::PortSymbol *>(&entry)) {
       bool followed = false;
-      if ((*port)->direction == (DRIVERS ? slang::ast::ArgumentDirection::In : slang::ast::ArgumentDirection::Out)) {
+      if ((*port)->direction == (DRIVERS ? slang::ast::ArgumentDirection::In : slang::ast::ArgumentDirection::Out) ||
+          (*port)->direction == slang::ast::ArgumentDirection::InOut) {
         auto parent = CollectPortConnectionResults(**port, sym, visited);
         followed = !parent.empty();
         out.insert(out.end(), std::make_move_iterator(parent.begin()), std::make_move_iterator(parent.end()));
@@ -1333,7 +1334,8 @@ std::vector<TraceResult> ComputeIndexedTraceResults(
   if (projection && map_depth >= kPortMapMaxDepth) { fallback(*projection, nullptr); return out; }
   for (const auto &entry : it->second) {
     if (const auto *port = std::get_if<const slang::ast::PortSymbol *>(&entry)) {
-      if ((*port)->direction == (DRIVERS ? slang::ast::ArgumentDirection::In : slang::ast::ArgumentDirection::Out)) {
+      if ((*port)->direction == (DRIVERS ? slang::ast::ArgumentDirection::In : slang::ast::ArgumentDirection::Out) ||
+          (*port)->direction == slang::ast::ArgumentDirection::InOut) {
         const auto *instance = GetContainingInstanceSymbol(sym);
         const auto *connection = instance ? PortActualConnection(*instance, **port) : nullptr;
         if (connection) {
@@ -1350,7 +1352,8 @@ std::vector<TraceResult> ComputeIndexedTraceResults(
           // internal selection is proved disconnected and stays empty.
           auto formal = PortComposeDown(initial, internal, *port);
           if (formal.pieces.empty()) continue;
-          if (!following_parent && PortInternalIsIdentity(**port) &&
+          if (!following_parent && (*port)->direction != slang::ast::ArgumentDirection::InOut &&
+              PortInternalIsIdentity(**port) &&
               std::all_of(map.begin(), map.end(), [](const auto &p) { return p.kind == PortMapPiece::Exact; }) &&
               HasLocalPortBridge<DRIVERS>(index, sym, cache) && PortTargetsHaveProvedNativeAccesses<DRIVERS>(map, cache)) {
             if (projection) { out.push_back(PortMappingMarker(initial, *port, false, false)); continue; }
@@ -1374,7 +1377,12 @@ std::vector<TraceResult> ComputeIndexedTraceResults(
               continue;
             }
             auto branch_visited = visited;
-            if (!branch_visited.insert(piece.source).second) { fallback(route, *port); continue; }
+            if (!branch_visited.insert(piece.source).second) {
+              // An inout connection appears in both directions. Its reverse
+              // edge is already covered by the current branch.
+              if ((*port)->direction != slang::ast::ArgumentDirection::InOut) fallback(route, *port);
+              continue;
+            }
             auto nested = ComputeIndexedTraceResults<DRIVERS>(piece.source, cache, branch_visited, true, &route, map_depth + 1);
             // An exact parent with no indexed endpoint is an ordinary boundary.
             if (retain_boundary && !nested.empty() &&
@@ -1423,7 +1431,11 @@ std::vector<TraceResult> ComputeIndexedTraceResults(
         else for (auto &route : routes) {
           const auto *internal_sym = route.pieces.front().source;
           auto branch_visited = visited;
-          if (!internal_sym || !branch_visited.insert(internal_sym).second) { fallback(initial, port); followed = true; continue; }
+          if (!internal_sym || !branch_visited.insert(internal_sym).second) {
+            if (!internal_sym || port->direction != slang::ast::ArgumentDirection::InOut) fallback(initial, port);
+            followed = true;
+            continue;
+          }
           auto nested = ComputeIndexedTraceResults<DRIVERS>(internal_sym, cache, branch_visited, false, &route, map_depth + 1);
           followed |= !nested.empty();
           out.insert(out.end(), std::make_move_iterator(nested.begin()), std::make_move_iterator(nested.end()));

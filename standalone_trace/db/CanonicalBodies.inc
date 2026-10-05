@@ -617,7 +617,8 @@ class CanonicalTracer {
     for (const auto &entry : it->second) {
       if (const auto *port = std::get_if<const slang::ast::PortSymbol *>(&entry)) {
         const size_t before = out.size();
-        if ((*port)->direction == (DRIVERS ? slang::ast::ArgumentDirection::In : slang::ast::ArgumentDirection::Out))
+        if ((*port)->direction == (DRIVERS ? slang::ast::ArgumentDirection::In : slang::ast::ArgumentDirection::Out) ||
+            (*port)->direction == slang::ast::ArgumentDirection::InOut)
           Escape(**port, *body, f, visited, out);
         if (out.size() == before) out.push_back(Res{*port, f});
       } else if (const auto *expr = std::get_if<ExprTraceResult>(&entry)) {
@@ -669,7 +670,8 @@ class CanonicalTracer {
     if (projection && map_depth >= kPortMapMaxDepth) { fallback(*projection, nullptr); return; }
     for (const auto &entry : it->second) {
       if (const auto *port = std::get_if<const slang::ast::PortSymbol *>(&entry)) {
-        if ((*port)->direction == (DRIVERS ? slang::ast::ArgumentDirection::In : slang::ast::ArgumentDirection::Out)) {
+        if ((*port)->direction == (DRIVERS ? slang::ast::ArgumentDirection::In : slang::ast::ArgumentDirection::Out) ||
+            (*port)->direction == slang::ast::ArgumentDirection::InOut) {
           const auto escape = EscapeMapping(**port, *body, f);
           if (escape.expr) {
             auto initial = projection ? *projection : PortIdentityProjection(sym, f);
@@ -684,7 +686,8 @@ class CanonicalTracer {
             }
             auto formal = PortComposeDown(initial, internal, *port);
             if (formal.pieces.empty()) continue;
-            if (!following_parent && PortInternalIsIdentity(**port) &&
+            if (!following_parent && (*port)->direction != slang::ast::ArgumentDirection::InOut &&
+                PortInternalIsIdentity(**port) &&
                 std::all_of(map.begin(), map.end(), [](const auto &p) { return p.kind == PortMapPiece::Exact; }) &&
                 HasLocalPortBridge<DRIVERS>(index, sym, cache_) && ProvedNativeTargets<DRIVERS>(map)) {
               if (projection) { marker(initial, *port, false, false); continue; }
@@ -708,7 +711,10 @@ class CanonicalTracer {
                 continue;
               }
               auto branch_visited = visited;
-              if (!branch_visited.insert({piece.source, escape.frame}).second) { fallback(route, *port); continue; }
+              if (!branch_visited.insert({piece.source, escape.frame}).second) {
+                if ((*port)->direction != slang::ast::ArgumentDirection::InOut) fallback(route, *port);
+                continue;
+              }
               const size_t before = out.size();
               Compute<DRIVERS>(piece.source, escape.frame, branch_visited, out, true, &route, map_depth + 1);
               if (retain_boundary && out.size() > before &&
@@ -763,7 +769,11 @@ class CanonicalTracer {
               } else ++stats_.down_map_fail;
             }
             auto branch_visited = visited;
-            if (!branch_visited.insert({csym, cf}).second) { fallback(initial, port); followed = true; continue; }
+            if (!branch_visited.insert({csym, cf}).second) {
+              if (port->direction != slang::ast::ArgumentDirection::InOut) fallback(initial, port);
+              followed = true;
+              continue;
+            }
             const size_t before = out.size();
             Compute<DRIVERS>(csym, cf, branch_visited, out, false, &route, map_depth + 1);
             followed |= out.size() > before;
