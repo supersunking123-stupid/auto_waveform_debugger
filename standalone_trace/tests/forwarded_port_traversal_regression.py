@@ -64,7 +64,7 @@ def main():
         assert 'SEMANTICS_EPOCH:19\n' in Path(str(db)+'.meta').read_text()
         print('PASS: forwarded routes across distinct canonical parent connections; canonical on/off bytes, VERIFY and epoch19 match')
 
-        source = args.source_dir.resolve() / 'tests/fixtures/canonical_bodies/dangling_concat_loads.sv'
+        source = args.source_dir.resolve() / 'tests/fixtures/dangling_concat_loads.sv'
         for canonical in ('0', '1'):
             db = root / ('dangling' + canonical + '.db')
             compiled = run(binary, ['compile', '--db', db, '--single-unit', source,

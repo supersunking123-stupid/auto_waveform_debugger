@@ -319,7 +319,7 @@ def malformed_envelopes(binary,db,root):
     string_id=struct.unpack_from('<I',data,projected+12)[0]
     text_start=blob+struct.unpack_from('<I',data,offsets_start+4*string_id)[0]
     assert data[text_start:text_start+3]==b'Q1;'
-    mutations=[('missing_feature',20,'<I',3), ('unknown_feature',20,'<I',31),
+    mutations=[('missing_feature',20,'<I',3), ('unknown_feature',20,'<I',63),
                ('missing_flag',projected+47,'<B',0), ('conflicting_markers',projected+47,'<B',28),
                ('negative_range',text_start+3,'<B',ord('-')),
                ('bad_version',text_start+1,'<B',ord('2'))]
