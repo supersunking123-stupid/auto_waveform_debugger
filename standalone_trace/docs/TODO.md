@@ -288,7 +288,7 @@ a regression test with the exact expected answer.
 ### Round 2 (planned 2026-10-05, on main f74f499)
 
 Rechecked on main with small repros in `/tmp/bugfix_repros/` (`misc.sv`,
-`dyn.sv`, `st.sv`, `nest.sv`).
+`dyn.sv`, `st.sv`, `nest.sv`, `gclk.sv`).
 
 **Fix (missing or noisy answers):**
 
@@ -308,15 +308,24 @@ Rechecked on main with small repros in `/tmp/bugfix_repros/` (`misc.sv`,
    "Signal not found", while packed-struct member paths work. Expected: the
    same answers as the matching bit slice of `st.un`.
 
-**Confirm on Lumion first (Claude, one compile).** These no longer reproduce in
-small cases. Drop each one that does not reproduce on Lumion.
-- Expression connections are inconsistent: `.enable_in(!pop_empty)` stopped at
-  the expression. In small cases, `!a` and `a & b` now both give the source.
-- A concatenation connection has an empty `bit_map`: `core_clk_i[g1]` at
-  `cpcs_msg_blk_top.vp:5461`. In small cases, `u_cat.d[3]` now gives `w[5]`.
-- The child port declaration is listed beside an exact writer.
-- The nested select-chain leak at `tl_tx_credit_reserve_req_to_ack.vp:80`
-  (16 records). `nest.sv` is correct.
+10. **A bit query on a compact global clock/reset net returns every bit's sinks.**
+    The loads fast path ignores the select. On Lumion,
+    `loads pcs_msg_blk_i.core_clk_i[3]`, `core_clk_i[0]` and `core_clk_i` each
+    return the same 24,672 `global-clock-sink` endpoints for all 16 lanes.
+    These are not marked approximate. The lane-3 port alone has 734 loads.
+    Repro: `gclk.sv`; `loads gclk.clk_v[0]` returns all 1,200 sinks, including
+    the 600 on `clk_v[1]`.
+
+**Checked on Lumion by Claude (main f74f499); dropped as fixed or not reproducing:**
+- Expression connections: `.enable_in(!pop_empty)` (`async_fifo.vp:119`) now
+  gives `pop_empty` (approximate) and the port, like `&`/`|` masks.
+- Concatenation connection: `drivers MSGBLK_LANE_INST[3].u_cpcs_msg_blk.core_clk`
+  gives `core_clk_i` bit `[3]` at `cpcs_msg_blk_top.vp:5461`.
+- Port declaration beside an exact writer: not seen in the 72-query corpus or in
+  lane input-port queries.
+- Nested select chain at `tl_tx_credit_reserve_req_to_ack.vp:80`: answers for
+  `cif_for_the_request`, `cfg_tc_vc_map` and `k_vc_res_to_cif_mapping__array`
+  match the RTL, including the inactive generate branch.
 
 Fixed already: a parent part-select now gives the exact bit (`u_ps.d` gives
 `ps[2]`), and casts map exactly.
