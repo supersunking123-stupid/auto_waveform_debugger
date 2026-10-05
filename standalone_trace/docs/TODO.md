@@ -229,7 +229,7 @@ Phase 2 passes 12 CTests and the same runtime suites. Its Lumion DB is identical
 to phase 1, and the full corpus matches in one-shot and serve modes. The paired
 compile wall delta is +0.10 s; query timings are in COMPILE_BENCHMARK.md.
 
-## 6. Inactive generate blocks and port mapping — ready for review
+## 6. Inactive generate blocks and port mapping — merged into main (2026-10-05)
 
 The compiler skips uninstantiated generate branches. Canonical and actual-body
 builds must agree. Generate parameters remain part of the canonical body key.
@@ -250,34 +250,66 @@ The compile semantics epoch is 18; the format remains v6. The round-6 finish
 uses existing regressions, runtime checks, Lumion VERIFY, corpus comparison,
 and a plain differential scan. Source checking remains with the reviewer.
 
-Remaining work outside item 6:
+## 7. Bug fixes — next
 
-- Loads of a vector with a nonzero LSB can display `[0]` instead of its declared
-  index, for example `p_stage_wctrl_par_o[1:1]` at line 345.
-- Register drivers can collapse to a global clock or reset source, for example
-  `link_sm_mod.tx_eq_rx_preset_hint` returning only `core_rst_n_int`.
-- Whole-concatenation port loads can omit dangling one-bit port endpoints,
-  for example `sel0_hls_stage_r.m_data`.
-- A query through a parent part-select can report the whole LHS slice. The site
-  is correct; narrowing the displayed bitmap is optional work.
-- A nested select chain can carry a selector into the next step, for example
-  `[..][N-1:0]][2:0]` at `tl_tx_credit_reserve_req_to_ack.vp:80`. This remains
-  deferred work.
+Performance and memory are good enough (Lumion compile about 50-60 s, 13.4 GiB;
+trace about 0.7 s). This item fixes wrong or missing answers first, then
+imprecise ones. Small reproducers are in `/tmp/bugfix_repros/`. Each fix needs
+a regression test with the exact expected answer.
 
-Item 6 follow-ups (non-blocking, found in the merge review):
+### P1: wrong or missing answers
 
-- Compile cost: a single Lumion pair measured +5.4 s against main. Known
-  overhead comes from per-visit entry rescans and copies, and from linear
-  `PortActualConnection` lookup; a 57-line patch removed 50-70% of it on a
-  synthetic design.
-- The child port declaration is listed beside an exact mapped writer. Consider
-  showing it only on the fallback path.
-- Through a concatenation connection (for example `core_clk_i[g1]` at
-  `cpcs_msg_blk_top.vp:5461`), the endpoint has an empty `bit_map` and does not
-  name the lane bit.
-- Expression connections are handled inconsistently. Some (`&`/`|` masks) also
-  list deeper drivers as approximate, while `.enable_in(!pop_empty)` stops at
-  the expression.
+1. **Bit queries on a vector with a nonzero LSB return nothing.** For
+   `logic [5:2] q`, both `loads q[2]` and `loads q[5]` give 0 endpoints;
+   `logic [1:1] p` gives the same for `p[1]`. The whole-signal query reports
+   `bits [0]`. This existed before item 5. Common on Lumion, for example
+   `p_stage_wctrl_par_o[W-1:1]` at `axi_slave_w.vp:187/345`. Repro: `lsb.sv`.
+2. **An out-of-range bit on a 1-D vector returns loads silently.** `loads v[9]`
+   on `logic [7:0] v` returns `y = v` with no diagnostic. Struct members already
+   give `axis_out_of_bounds`; plain vectors should too. Repro: `v.sv`.
+3. **Register drivers can collapse to a global clock or reset source.**
+   Reported, not yet confirmed: `drivers link_sm_mod.tx_eq_rx_preset_hint`
+   (`link_sm.vp:1093`, written in a large state-machine `always` block) returns
+   only `core_rst_n_int`; `reg_top_i.first_vf_offset` returns only
+   `reg_clk_cntl`. Confirm on Lumion first, then reduce to a small repro.
+4. **Packed unions are not traced.** Drivers of a union (`un`), of a union
+   member (`un.p.h`), and of a port connected to a union member all return
+   nothing and give no stop. Before item 6 the port query at least returned the
+   port endpoint. Repro: `st.sv` (`u_un`, `u_un2`, `un`).
+5. **Whole-concatenation port loads drop dangling 1-bit port endpoints.** The
+   bit query returns them. Example: `sel0_hls_stage_r.m_data`.
+6. **A nested select chain carries a selector into the next step.** It produces
+   an extra endpoint, for example `[..][N-1:0]][2:0]` at
+   `tl_tx_credit_reserve_req_to_ack.vp:80`. Low impact.
+
+### P2: imprecise answers (a superset or a port-only fallback where an exact answer is possible)
+
+7. Inout ports: `drivers io.b` returns only the port (`misc.sv`, `leafio`).
+8. Unpacked-array port connections (`.d(arr[1:2])`, `.d('{arr[3], arr[0]})`)
+   fall back to the port (`misc.sv`, `ua`/`ub`).
+9. A member of a packed-array element (`.d(pa[0].b)`) falls back (`dyn.sv`, `u4`).
+10. Replication, streaming, cast and multi-bit `?:` connections return the whole
+    source as a superset (`sel2.sv`).
+11. Expression connections are handled inconsistently. `&`/`|` masks also list
+    deeper drivers as approximate, while `.enable_in(!pop_empty)` stops at the
+    expression.
+12. Through a concatenation connection (`core_clk_i[g1]` at
+    `cpcs_msg_blk_top.vp:5461`), the endpoint has an empty `bit_map` and does
+    not name the lane bit.
+13. Through a parent part-select, the `bit_map` shows the whole LHS slice, for
+    example `[4:0]` for bit `[2]`.
+14. The child port declaration is listed beside an exact mapped writer. Show it
+    only on the fallback path.
+
+### Not planned
+
+- Unpacked structs remain unsupported; whole-signal queries still work.
+- Compile-cost tuning (the item-6 port-mapping overhead, about +5 s) is
+  deferred, because performance is good enough now.
+
+Acceptance for every fix: existing CTest, `run_all_tests`, the Python tests, a
+new regression per bug, one Lumion VERIFY compile, and the 72-query corpus with
+each difference explained in a line. No new verification tooling.
 
 ## Done / dropped
 
