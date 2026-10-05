@@ -250,7 +250,7 @@ The compile semantics epoch is 18; the format remains v6. The round-6 finish
 uses existing regressions, runtime checks, Lumion VERIFY, corpus comparison,
 and a plain differential scan. Source checking remains with the reviewer.
 
-## 7. Bug fixes — next
+## 7. Bug fixes — P1 round 1 fixed (2026-10-05)
 
 Performance and memory are good enough (Lumion compile about 50-60 s, 13.4 GiB;
 trace about 0.7 s). This item fixes wrong or missing answers first, then
@@ -259,27 +259,32 @@ a regression test with the exact expected answer.
 
 ### P1: wrong or missing answers
 
-1. **Load bit queries on a vector with a nonzero LSB miss or mismatch.** Load
-   records store the select as an offset from bit 0 (`q[3:2]` on `logic [5:2] q`
-   is stored as `[1:0]`), but queries use declared indices. So `loads q[2]`
-   returns nothing and the out-of-range `loads q[1]` matches; `logic [1:1] p`
-   gives nothing for `p[1]`. Drivers are correct. This existed before item 5. Common on Lumion, for example
-   `p_stage_wctrl_par_o[W-1:1]` at `axi_slave_w.vp:187/345`. Repro: `lsb.sv`.
-2. **An out-of-range bit on a 1-D vector returns loads silently.** `loads v[9]`
-   on `logic [7:0] v` returns `y = v` with no diagnostic. Struct members already
-   give `axis_out_of_bounds`; plain vectors should too. Repro: `v.sv`.
-3. **Register drivers can collapse to a global clock or reset source.**
-   Reported, not yet confirmed (confirm first; drop it if it does not reproduce): `drivers link_sm_mod.tx_eq_rx_preset_hint`
-   (`link_sm.vp:1093`, written in a large state-machine `always` block) returns
-   only `core_rst_n_int`; `reg_top_i.first_vf_offset` returns only
-   `reg_clk_cntl`. Confirm on Lumion first, then reduce to a small repro.
-4. **Packed unions are not traced.** Drivers of a union (`un`), of a union
-   member (`un.p.h`), and of a port connected to a union member all return
-   nothing and give no stop. Before item 6 the port query at least returned the
-   port endpoint. Repro: `st.sv` (`u_un`, `u_un2`, `un`).
-5. **Whole-concatenation port loads drop dangling 1-bit port endpoints.** The
-   bit query returns them. Example: `sel0_hls_stage_r.m_data`. Reported; confirm
-   first.
+1. **Fixed: load bit queries on vectors with a nonzero LSB.** Native load
+   records retain declared indices. Existing v6 declaration-axis rows now cover
+   ordinary vectors. Ascending and negative-index vectors have exact regressions.
+   Port mapping records retain physical offsets. Repro: `lsb.sv`.
+2. **Fixed: out-of-range bits on 1-D vectors.** Declared bounds produce
+   `axis_out_of_bounds` with zero endpoints in both modes. Shares the declaration
+   and coordinate fix with item 1. Repro: `v.sv`.
+3. **Confirmed and fixed: register drivers collapsed to a clock/reset dependency.**
+   The unmodified Lumion baseline returned one synthetic global source for both
+   reported registers. The query fast path treated reverse dependency sinks as
+   drivers. Driver queries now use preserved assignment records: all 20 writers
+   of `tx_eq_rx_preset_hint` and both writers of `first_vf_offset` survive.
+   Compile compaction and name matching are unchanged. A compact-global fixture
+   checks these names and ordinary clock/reset names with exact writer endpoints.
+4. **Fixed: ordinary untagged packed union writers.** The member resolver accepts
+   their existing physical field offsets. `st.u_un.d` gives line 12,
+   `st.u_un2.d` gives line 13, and `st.un` gives both. All answers are exact.
+   Tagged unions, union arrays and public union-member paths remain outside this
+   round. Repro: `st.sv`.
+5. **Confirmed and fixed: whole-concatenation loads dropped dangling ports.**
+   On the baseline, the EP receive router's `i_np_axi_hls_demux.sel0_hls_stage_r.m_data`
+   bit queries [453] and [511] reached terminal `sel0_hls_user` and
+   `sel0_hls_user_chk` ports. The whole query discarded them beside valid logic.
+   Whole load results now retain unexpanded exact terminal ports. Crossed ports
+   keep their existing handling. A small concatenation fixture checks exact whole
+   and bit answers.
 6. **A nested select chain carries a selector into the next step.** It produces
    an extra endpoint, for example `[..][N-1:0]][2:0]` at
    `tl_tx_credit_reserve_req_to_ack.vp:80`. Low impact; deferred with P2.
@@ -310,6 +315,14 @@ These return a superset or a port-only fallback where an exact answer is possibl
 - Unpacked structs remain unsupported; whole-signal queries still work.
 - Compile-cost tuning (the item-6 port-mapping overhead, about +5 s) is
   deferred, because performance is good enough now.
+
+The round changes stored vector declarations and native selected load records.
+The format remains v6; feature flags 31 identify the added one-axis rows.
+The compile semantics epoch is 19, so prior caches rebuild once.
+Evidence: `local_test_design/bench_out/item7_20261005` in the main checkout.
+Required acceptance passed: 22 CTests, both 27-case runtime suites, 387 Python
+tests, Lumion VERIFY over 3,798,275 signals with zero mismatched lists, and
+all 72 corpus queries unchanged in one-shot and serve modes. No required skips.
 
 Scope of the first round: P1 #1-#5 only. Acceptance: existing CTest,
 `run_all_tests`, the Python tests, a new regression per bug, one Lumion VERIFY
@@ -364,6 +377,6 @@ new verification tooling.
   `tests/fixtures/endpoint_merge.sv` updated. Agent-visible effect: per-bit assignments and
   generate loops show as one range (`bits [7:0]` instead of eight endpoints).
 - `--incremental` no longer reuses DBs built with older compile semantics: the compile fingerprint
-  carries a `SEMANTICS_EPOCH` line (now 18; item 6 maps selected connection ranges through compact ports and skips inactive generate branches), and a `.meta` without
+  carries a `SEMANTICS_EPOCH` line (now 19; item 7 retains ordinary vector bounds and declared load indices), and a `.meta` without
   it or with an older epoch triggers a full rebuild (f8cd024). Bump `kCompileSemanticsEpoch` in
   `db/GraphDb.cc` whenever the same sources and arguments start producing a different DB.
