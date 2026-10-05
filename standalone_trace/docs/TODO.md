@@ -265,6 +265,21 @@ Remaining work outside item 6:
   `[..][N-1:0]][2:0]` at `tl_tx_credit_reserve_req_to_ack.vp:80`. This remains
   deferred work.
 
+Item 6 follow-ups (non-blocking, found in the merge review):
+
+- Compile cost: a single Lumion pair measured +5.4 s against main. Known
+  overhead comes from per-visit entry rescans and copies, and from linear
+  `PortActualConnection` lookup; a 57-line patch removed 50-70% of it on a
+  synthetic design.
+- The child port declaration is listed beside an exact mapped writer. Consider
+  showing it only on the fallback path.
+- Through a concatenation connection (for example `core_clk_i[g1]` at
+  `cpcs_msg_blk_top.vp:5461`), the endpoint has an empty `bit_map` and does not
+  name the lane bit.
+- Expression connections are handled inconsistently. Some (`&`/`|` masks) also
+  list deeper drivers as approximate, while `.enable_in(!pop_empty)` stops at
+  the expression.
+
 ## Done / dropped
 
 - ~~Zero-copy string-view trace cache~~ — dropped. `SymbolRefList` was already
