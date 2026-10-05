@@ -284,11 +284,13 @@ std::vector<PortMapPiece> PortBuildExpressionMap(const slang::ast::Expression &e
   const auto reference = PortResolveReference(expr);
   if (!reference.valid || !reference.type->isIntegral() ||
       reference.low + width > std::numeric_limits<int32_t>::max()) return marker(PortMapPiece::Unsupported);
+  // Static packed element and member selects already resolve to physical bits
+  // of their owner. Keep that exact slice for packed arrays of structs too.
   if (const auto *value = reference.symbol->as_if<slang::ast::ValueSymbol>()) {
     const auto *type = &value->getType();
     const bool packed_array = type->isPackedArray();
     while (type->isArray()) type = type->getArrayElementType();
-    if (packed_array && (type->getCanonicalType().kind == slang::ast::SymbolKind::PackedStructType || type->isPackedUnion())) return marker(PortMapPiece::Unsupported);
+    if (packed_array && type->isPackedUnion()) return marker(PortMapPiece::Unsupported);
   }
   return {{PortMapPiece::Exact, reference.symbol, &expr, 0, reference.low, width,
            reference.logical_axes}};

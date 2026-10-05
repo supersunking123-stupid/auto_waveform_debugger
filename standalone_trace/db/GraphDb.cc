@@ -547,17 +547,24 @@ MemberAccessInfo ResolveStructMemberAccess(const slang::ast::MemberAccessExpress
     current = &mae->value();
   }
 
+  // A static packed-array element is a struct base too (e.g. pa[0].b).
+  // Keep its physical offset and source indexes before resolving the owner.
+  const auto &canonical = current->type->getCanonicalType();
+  const auto *packed_union = canonical.as_if<slang::ast::PackedUnionType>();
+  if (canonical.kind != slang::ast::SymbolKind::PackedStructType &&
+      (!packed_union || packed_union->isTagged || packed_union->isSoft)) return info;
+  std::vector<const slang::ast::ElementSelectExpression *> selected_base;
+  while (const auto *select = current->as_if<slang::ast::ElementSelectExpression>()) {
+    const auto &value = select->value();
+    if (packed_union || !value.type->isIntegral() || !value.type->hasFixedRange()) return info;
+    selected_base.push_back(select);
+    current = &value;
+  }
+
   // Base must be a NamedValueExpression with a traceable symbol.
   const auto *nve = current->as_if<slang::ast::NamedValueExpression>();
   if (nve == nullptr) return info;
   if (!IsTraceable(&nve->symbol)) return info;
-
-  // Verify root is a packed struct or an ordinary untagged packed union.
-  const slang::ast::Type &root_type = nve->symbol.as_if<slang::ast::ValueSymbol>()->getType();
-  const slang::ast::Type &canonical = root_type.getCanonicalType();
-  const auto *packed_union = canonical.as_if<slang::ast::PackedUnionType>();
-  if (canonical.kind != slang::ast::SymbolKind::PackedStructType &&
-      (!packed_union || packed_union->isTagged || packed_union->isSoft)) return info;
 
   // Reverse: fields are [valid, aw] (outer first), we need [aw, valid] for
   // correct bit-offset accumulation (outer-to-inner in source order).
@@ -565,6 +572,22 @@ MemberAccessInfo ResolveStructMemberAccess(const slang::ast::MemberAccessExpress
 
   uint64_t offset = 0;
   std::string path;
+  slang::ast::EvalContext context(nve->symbol);
+  for (auto it = selected_base.rbegin(); it != selected_base.rend(); ++it) {
+    const auto *select = *it;
+    const auto selected = select->evalSelector(context, false);
+    if (!selected) return info;
+    const auto low = std::min(selected->left, selected->right);
+    const auto high = std::max(selected->left, selected->right);
+    if (low < 0 || uint64_t(high) >= select->value().type->getBitWidth() ||
+        uint64_t(low) > std::numeric_limits<uint64_t>::max() - offset) return info;
+    const auto index = select->selector().eval(context);
+    if (!index || !index.isInteger() || index.integer().hasUnknown()) return info;
+    const auto logical = index.integer().as<int32_t>();
+    if (!logical) return info;
+    offset += uint64_t(low);
+    path += "[" + std::to_string(*logical) + "]";
+  }
   for (const auto &entry : fields) {
     offset += entry.field->bitOffset;
     path += ".";
@@ -1154,7 +1177,9 @@ bool PortTargetsHaveProvedNativeAccesses(const std::vector<PortMapPiece> &map, T
     if (it != entries.end()) for (const auto &entry : it->second) {
       const auto *expr = std::get_if<ExprTraceResult>(&entry);
       if (!expr) continue;
-      if (!expr->member_path.empty() && expr->member_path.find('.', 1) != std::string::npos) { proved = false; break; }
+      const auto first_member = expr->member_path.find('.');
+      if (first_member != std::string::npos &&
+          expr->member_path.find('.', first_member + 1) != std::string::npos) { proved = false; break; }
       if (!expr->member_path.empty() && !expr->selectors.empty()) {
         const auto *type = SelectorValueType(*expr->selectors.back());
         if (type && NumericArrayAxisCount(*type) >= 2) { proved = false; break; }

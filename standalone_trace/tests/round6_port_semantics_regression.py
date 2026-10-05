@@ -47,7 +47,7 @@ def main():
     count = 0
     with tempfile.TemporaryDirectory(prefix='rtl_round6_ports_') as temporary:
         root = Path(temporary)
-        for name in ('portexpr', 'owide', 'dyn', 'gv4', 'unpk2', 'scalar_mirror', 'scalar_layers', 'fallback_contract', 'fallback_frames', 'multiple_fallbacks', 'generated_fallback'):
+        for name in ('portexpr', 'owide', 'dyn', 'packed_members', 'gv4', 'unpk2', 'scalar_mirror', 'scalar_layers', 'fallback_contract', 'fallback_frames', 'multiple_fallbacks', 'generated_fallback'):
             top = 'top' if name == 'unpk2' else name
             baseline_db = None
             if name == 'generated_fallback' and args.baseline_bin:
@@ -77,6 +77,9 @@ def main():
                 elif name == 'dyn':
                     checks = [('drivers','u.d',[6]),('drivers','u.d[0]',[6]),('drivers','u2.d',[10,12]),
                               ('drivers','u2.d[1]',[10,12]),('drivers','u3.d',[16])]
+                elif name == 'packed_members':
+                    checks = [('drivers','upper_b.d',[7]),('drivers','upper_b.d[1]',[7]),
+                              ('drivers','ascending_a.d',[9]),('drivers','ascending_a.d[1]',[9])]
                 elif name == 'gv4':
                     checks = [('loads','x',[3]),('loads','u0.d',[])]
                 elif name == 'unpk2':
@@ -107,15 +110,19 @@ def main():
                     count += 1
                 if name == 'dyn':
                     check_marker_provenance(binary,db,root)
-                    # Packed-array members remain explicitly unsupported. Keep
-                    # A's literal boundary instead of a falsely exact source.
-                    for target in ('u4.d','m.l.d'):
+                    # A static member select keeps both the packed element
+                    # offset and field offset when crossing a port boundary.
+                    for target, expected in (('u4.d',[20]),('m.l.d',[19])):
                         body = query(binary,db,'drivers',top+'.'+target)
-                        assert body['endpoints'] and all(e['bit_map_approximate'] for e in body['endpoints']), body
-                        assert any(e['kind']=='port' and e['path']==top+'.'+target for e in body['endpoints']), body
-                        assert any(s['reason']=='unresolved_connection_mapping' and 'connection ' in s['detail']
-                                   for s in body['stops']), body
+                        assert lines(body) == expected, body
+                        assert all(not e['bit_map_approximate'] for e in body['endpoints']), body
+                        assert not any(s['reason']=='unresolved_connection_mapping' for s in body['stops']), body
                         count += 1
+                    body = query(binary,db,'loads',top+'.pa')
+                    assert any(e['line']==22 and top+'.u4.d' in e['lhs'] for e in body['endpoints']), body
+                    assert any(e['path']==top+'.m.d' for e in body['endpoints']), body
+                    assert all(not e['bit_map_approximate'] for e in body['endpoints']), body
+                    count += 1
                 if name == 'gv4':
                     # Feature 7 was an experimental, rejected writer. Header
                     # rejection must be clean before exposing any endpoint.
