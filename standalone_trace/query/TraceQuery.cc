@@ -58,14 +58,21 @@ std::optional<TraceRunResult> TryRunGlobalNetFastPath(const TraceDb &db, const T
   TraceRunResult result;
   const auto it = db.global_nets.find(opts.root_signal);
   if (it == db.global_nets.end()) return std::nullopt;
+  // Compact global records retain sink names, but no source-bit relation.
+  // A selected query can only report this whole-net superset conservatively.
+  const bool selected = !opts.signal_select_axes.empty();
   result.endpoints.reserve(it->second.sinks.size());
   for (const std::string &sink : it->second.sinks) {
     EndpointRecord e;
     e.kind = EndpointKind::kExpr;
     e.path = sink;
     e.assignment_text = "global-" + it->second.category + "-sink";
+    e.bit_map_approximate = selected;
     result.endpoints.push_back(std::move(e));
   }
+  if (selected)
+    result.stops.push_back(TraceStop{opts.root_signal, "unresolved_connection_mapping",
+        "compact-global-net-has-no-source-bit-mapping; returning-whole-net-sinks", 0});
   result.visited_count = 1;
   return result;
 }

@@ -79,6 +79,30 @@ def main():
                            for e in answer['endpoints']), (signal, answer)
         print('PASS: 16 compact-global register driver queries retain exactly 32 assignment endpoints')
 
+        vector_source = args.source_dir.resolve() / 'tests/fixtures/global_clock_vector.sv'
+        vector_db = root/'clock_vector.db'
+        run(binary, ['compile', '--db', vector_db, '--single-unit', vector_source,
+                     '--top', 'gclk'])
+        expected_sinks = {f'gclk.g[{index}].u.q' for index in range(1200)}
+        for target in ('gclk.clk_v', 'gclk.clk_v[0]', 'gclk.clk_v[1]'):
+            answer = json.loads(run(binary, ['trace', '--db', vector_db, '--signal', target,
+                                             '--mode', 'loads', '--format', 'json']).stdout)
+            assert not answer['diagnostics'], (target, answer)
+            selected = target != 'gclk.clk_v'
+            endpoints = answer['endpoints']
+            assert len(endpoints) == 1200 and {e['path'] for e in endpoints} == expected_sinks, answer
+            assert all(e['assignment'] == 'global-clock-sink' and
+                       e['bit_map_approximate'] == selected for e in endpoints), answer
+            if selected:
+                assert len(answer['stops']) == 1, answer
+                stop = answer['stops'][0]
+                assert stop['reason'] == 'unresolved_connection_mapping' and \
+                    'compact-global-net-has-no-source-bit-mapping' in stop['detail'], answer
+            else:
+                assert not answer['stops'], answer
+        print('PASS: whole clock vector keeps 1,200 exact sinks; two bit queries mark '
+              'the whole-net fallback approximate and explain its missing mapping')
+
 
 if __name__ == '__main__':
     main()
