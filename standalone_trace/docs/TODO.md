@@ -378,7 +378,11 @@ older bugs were found, both fixed on 2026-10-06 (regressions in `semantic_regres
 
 Regression corpus: `local_test_design/bench_out/corpus_v2/corpus.txt` (the
 72 old queries plus 12 for the item-7 fixes) with its baseline answers from
-main 01290e9 in `corpus_v2/baseline_01290e9/main`. Use it for future rounds.
+main c8eef14 in `corpus_v2/baseline_c8eef14/main`. Use it for future rounds.
+The #12 fix changed corpus queries q064-q071: they asked for the made-up
+nested names `dl2pl_ob_cntl_decoded_nfm.flags.flags` and `flags.metadata`
+(the RTL `flags` type has `reserved`, `tl_pkt_endptr`, `tl_pkt_end`,
+`aligned_tlp`, `dllp_space`) and now correctly give "Signal not found".
 
 ### Not planned
 
