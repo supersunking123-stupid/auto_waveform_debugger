@@ -1100,11 +1100,22 @@ endmodule
             ('st.un.p.l', [13]), ('st.un.p.h', [12]),
             ('st.un.w', [12, 13]), ('st.un.w[5]', [12]),
             ('st.s.c', [8]), ('st.s.c[2]', [8]), ('st.s.i', [6, 7]),
+            # Nested struct leaves are named and sliced by the field's own type.
+            ('st.s.i.x', [6]), ('st.s.i.y', [7]), ('st.s.i.x[1]', [6]),
         ):
             payload = run_trace_json(rtl_trace, union_db, 'drivers', signal)
             endpoints = payload['endpoints']
             assert sorted(e['line'] for e in endpoints) == expected, (signal, payload)
             assert all(e['kind'] == 'expr' and not e['bit_map_approximate'] for e in endpoints), (signal, payload)
+        # Outer-struct field names under a nested struct are not members, and a
+        # member or name after an index is not a select of the indexed signal.
+        for signal in ('st.s.i.c', 'st.s.i.i', 'st.s.c[2].foo', 'st.un.w[5].bogus'):
+            missing = run_cmd([str(rtl_trace), 'trace', '--db', str(union_db), '--mode', 'drivers',
+                               '--signal', signal, '--format', 'json'], expect=2)
+            assert 'Signal not found' in missing.stdout + missing.stderr, (signal, missing.stdout, missing.stderr)
+        oob = run_cmd([str(rtl_trace), 'trace', '--db', str(union_db), '--mode', 'drivers',
+                       '--signal', 'st.s.i.x[2]', '--format', 'json'], expect=1)
+        assert 'axis_out_of_bounds' in oob.stdout + oob.stderr, (oob.stdout, oob.stderr)
         union_off = tmpdir / 'packed_union_members_off.db'
         run_cmd([str(rtl_trace), 'compile', '--db', str(union_off), '--single-unit',
                  str(union_source), '--top', 'st'], env={'RTL_TRACE_CANONICAL_BODIES': '0'})

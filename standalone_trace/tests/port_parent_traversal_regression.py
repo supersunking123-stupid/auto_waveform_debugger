@@ -125,15 +125,15 @@ def main():
         print('PASS: distinct parent connections across canonical duplicate instances; canonical on/off bytes and VERIFY match')
 
         meta = Path(str(db)+'.meta')
-        assert 'SEMANTICS_EPOCH:20\n' in meta.read_text()
-        meta.write_text(meta.read_text().replace('SEMANTICS_EPOCH:20\n', 'SEMANTICS_EPOCH:19\n'))
+        assert 'SEMANTICS_EPOCH:21\n' in meta.read_text()
+        meta.write_text(meta.read_text().replace('SEMANTICS_EPOCH:21\n', 'SEMANTICS_EPOCH:20\n'))
         rebuilt = compile_db(binary, source, db, incremental=True)
         assert 'incremental-cache-hit' not in rebuilt.stdout
         assert db.read_bytes() == off.read_bytes()
-        assert 'SEMANTICS_EPOCH:20\n' in meta.read_text()
+        assert 'SEMANTICS_EPOCH:21\n' in meta.read_text()
         hit = compile_db(binary, source, db, incremental=True)
         assert 'incremental-cache-hit' in hit.stdout
-        print('PASS: epoch 19 fingerprint forces epoch 20 rebuild, then cache hit')
+        print('PASS: epoch 20 fingerprint forces epoch 21 rebuild, then cache hit')
 
         # Inout boundaries must reach both the child and parent writer.
         inout_source = root/'inout_parent.sv'

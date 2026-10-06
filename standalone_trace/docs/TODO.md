@@ -361,15 +361,15 @@ tooling.
 About 45 Lumion queries on the fixed constructs were checked against the RTL
 with no wrong answers. The design has no `inout` ports and no
 `.x(arr[i].field)` connections, so #6/#7 are covered only by fixtures. Two
-older bugs were found:
+older bugs were found, both fixed on 2026-10-06 (regressions in `semantic_regression.py`):
 
-11. **A suffix after `[N].` in a signal path is ignored.** `loads top.v[9].foo`
+11. **Fixed (2026-10-06): a suffix after `[N].` in a signal path was ignored.** Now "Signal not found". `loads top.v[9].foo`
     (`v.sv`) silently returns all loads of `v`, as do `top.v[3].foo` and, on
     Lumion, `data_prev_sig[9].foo` and `hls2tl_posted_tlp_decoded[0].compl.tag`.
     It should fail like `top.v.foo` does. `ResolveSignalQuery`
     (`query/TraceQuery.cc` ~640) ignores the parsed base name; `ParseSignalQuery`
     (`db/GraphDb.cc` ~4996) checks only the last leaf.
-12. **Nested packed-struct members get the outer struct's field names.** In
+12. **Fixed (2026-10-06, epoch 21): nested packed-struct members got the outer struct's field names.** In
     `st.sv`, `find 'st\.s\..*'` lists `st.s.i.c` and `st.s.i.i` (which do not
     exist), while the real `st.s.i.x` gives "Signal not found". On Lumion this
     hits `in_port_cntl_decoded.flags.*` (SVA code). `DecomposePackedStructFields`
@@ -447,6 +447,6 @@ new verification tooling.
   `tests/fixtures/endpoint_merge.sv` updated. Agent-visible effect: per-bit assignments and
   generate loops show as one range (`bits [7:0]` instead of eight endpoints).
 - `--incremental` no longer reuses DBs built with older compile semantics: the compile fingerprint
-  carries a `SEMANTICS_EPOCH` line (now 20; item 7 round 2 fixes inout, packed-member and failed-hop records), and a `.meta` without
+  carries a `SEMANTICS_EPOCH` line (now 21; nested packed-struct member rows use the field type), and a `.meta` without
   it or with an older epoch triggers a full rebuild (f8cd024). Bump `kCompileSemanticsEpoch` in
   `db/GraphDb.cc` whenever the same sources and arguments start producing a different DB.

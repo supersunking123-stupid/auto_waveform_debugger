@@ -2772,7 +2772,7 @@ void DecomposePackedStructFields(std::vector<SignalCompileItem> &signals,
                                   int max_depth,
                                   int current_depth,
                                   uint64_t cumulative_offset,
-                                  const slang::ast::Type *union_member_type = nullptr) {
+                                  const slang::ast::Type *member_type = nullptr) {
   // Copy what we need from the parent instead of holding a reference into
   // `signals`: the push_back below can reallocate the vector, which would leave
   // a `const SignalCompileItem&` dangling for the next loop iteration.
@@ -2784,7 +2784,7 @@ void DecomposePackedStructFields(std::vector<SignalCompileItem> &signals,
   const auto *vs = parent_sym->as_if<slang::ast::ValueSymbol>();
   if (vs == nullptr) return;
 
-  const auto &canonical = (union_member_type ? *union_member_type : vs->getType()).getCanonicalType();
+  const auto &canonical = (member_type ? *member_type : vs->getType()).getCanonicalType();
   const auto *scope = PackedMemberScope(canonical);
   if (!scope) return;
   for (const auto &field : scope->membersOfType<slang::ast::FieldSymbol>()) {
@@ -2805,11 +2805,10 @@ void DecomposePackedStructFields(std::vector<SignalCompileItem> &signals,
     paths.push_back(parent_path + "." + std::string(field.name));
 
     if (current_depth < max_depth && PackedMemberScope(field_type)) {
-      // Union alternatives can contain structs. Walk their actual member
-      // types while keeping the existing struct decomposition rows stable.
-      const bool union_path = union_member_type || canonical.isPackedUnion() || field_type.isPackedUnion();
+      // Recurse with the field's own type; the parent symbol's type is the
+      // outermost struct or union.
       DecomposePackedStructFields(signals, paths, child_idx, max_depth, current_depth + 1, field_offset,
-                                  union_path ? &field_type : nullptr);
+                                  &field_type);
     }
   }
 }
@@ -5270,7 +5269,8 @@ bool ParseDefinesPlus(std::string_view tok, std::vector<std::string> &out) {
 // Epoch14: fixed-owner prefixes, Boolean dependencies and constrained reverse routes.
 // Epoch15: compact port bridges require full usable local formal coverage.
 // Epoch18: retain active input declarations beside exact mapped writers.
-constexpr int kCompileSemanticsEpoch = 20;
+// Epoch21: nested packed-struct member rows use the field type, not the root type.
+constexpr int kCompileSemanticsEpoch = 21;
 
 std::string ComputeCompileFingerprint(const std::vector<std::string> &passthrough_args) {
   std::vector<std::string> parts;

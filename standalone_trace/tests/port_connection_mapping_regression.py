@@ -171,7 +171,7 @@ def main():
                              {'RTL_TRACE_CANONICAL_BODIES':canonical,'RTL_TRACE_CANONICAL_VERIFY':'1'})
                 if canonical == '1':
                     assert 'mismatched_lists=0' in compiled.stdout
-                assert 'SEMANTICS_EPOCH:20\n' in Path(str(db)+'.meta').read_text()
+                assert 'SEMANTICS_EPOCH:21\n' in Path(str(db)+'.meta').read_text()
                 for mode,target,want in checks:
                     body=json.loads(run(binary,['trace','--db',db,'--signal',target,
                                                 '--mode',mode,'--format','json']).stdout)

@@ -39,7 +39,7 @@ def main():
                 if canon=='1':
                     assert 'mismatched_lists=0' in c.stdout,c.stdout
                     assert ' map_fail=0 ' in c.stdout,c.stdout
-                assert 'SEMANTICS_EPOCH:20\n' in Path(str(db)+'.meta').read_text()
+                assert 'SEMANTICS_EPOCH:21\n' in Path(str(db)+'.meta').read_text()
                 for signal in (leaf,leaf+'[0]',leaf+'[6]',leaf+'[3:1]'):
                     result=query(binary,db,signal);ports=exact_ports(result,leaf)
                     assert len(ports)==1,result
