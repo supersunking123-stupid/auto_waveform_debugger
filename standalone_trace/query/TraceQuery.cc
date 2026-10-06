@@ -641,9 +641,10 @@ std::optional<TraceOptions> ResolveSignalQuery(const TraceSession &session, cons
   while (bracket != std::string::npos) {
     const std::string prefix = parsed.signal.substr(0, bracket);
     if (LookupSignalId(session, prefix)) {
-      std::string unused;
+      // The suffix must be selectors only: `v[9].foo` is not a select of `v`.
+      std::string base;
       std::vector<std::pair<int32_t, int32_t>> axes;
-      if (ParseSignalQuery("signal" + parsed.signal.substr(bracket), unused, axes)) {
+      if (ParseSignalQuery("signal" + parsed.signal.substr(bracket), base, axes) && base == "signal") {
         resolved.root_signal = prefix;
         resolved.signal_select_axes = std::move(axes);
         resolved.signal_select.reset();
